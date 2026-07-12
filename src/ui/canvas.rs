@@ -140,6 +140,8 @@ struct State {
     dragging: Option<DragState>,
     /// Currently selected text box (page, annotation id) in move/select mode.
     selected: Option<(usize, Uuid)>,
+    /// Font size used for new text boxes (and the one being edited).
+    text_size: f64,
 }
 
 /// Where an insert/delete acts relative to the current page.
@@ -193,6 +195,7 @@ impl Canvas {
             drag_start: None,
             dragging: None,
             selected: None,
+            text_size: TEXT_SIZE,
         }));
 
         {
@@ -276,6 +279,18 @@ impl Canvas {
     /// Selects the active tool. Only `Text` has behavior for now.
     pub fn set_tool(&self, tool: Tool) {
         self.set_text_mode(tool == Tool::Text);
+    }
+
+    /// Sets the font size for new text boxes and the one currently being edited.
+    pub fn set_text_size(&self, size: f64) {
+        {
+            let mut st = self.state.borrow_mut();
+            st.text_size = size;
+            if let Some(ed) = st.editing.as_mut() {
+                ed.size = size;
+            }
+        }
+        self.area.queue_draw();
     }
 
     pub fn current_index(&self) -> usize {
@@ -512,11 +527,12 @@ impl Canvas {
         {
             let mut st = self.state.borrow_mut();
             st.selected = None;
+            let size = st.text_size;
             st.editing = Some(TextEdit {
                 page,
                 x: lx,
                 y: ly,
-                size: TEXT_SIZE,
+                size,
                 buffer: String::new(),
                 cursor: 0,
                 id: Uuid::new_v4(),

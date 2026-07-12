@@ -126,7 +126,7 @@ pub fn build(app: &adw::Application) -> WindowUi {
     let overlay = gtk::Overlay::new();
     overlay.set_child(Some(&canvas.root));
 
-    let details = build_details_panel();
+    let details = build_details_panel(&canvas);
     details.set_halign(gtk::Align::Start);
     details.set_valign(gtk::Align::Center);
     details.set_margin_start(12);
@@ -391,7 +391,7 @@ fn build_tool_strip(canvas: &Canvas, details: &gtk::Stack) -> gtk::Box {
 
 /// Left-hand details panel: a compact Rnote-style column of options per tool.
 /// The stack itself is the styled card; it is hidden when no tool is active.
-fn build_details_panel() -> gtk::Stack {
+fn build_details_panel(canvas: &Canvas) -> gtk::Stack {
     let stack = gtk::Stack::new();
     stack.add_css_class("inkpdf-panel");
     // Same width for every page (consistent panel), but height follows each page's elements.
@@ -399,7 +399,7 @@ fn build_details_panel() -> gtk::Stack {
     stack.set_vhomogeneous(false);
     stack.add_named(&page_pen(), Some("pen"));
     stack.add_named(&page_shapes(), Some("shapes"));
-    stack.add_named(&page_text(), Some("text"));
+    stack.add_named(&page_text(canvas), Some("text"));
     stack.add_named(&page_eraser(), Some("eraser"));
     stack.add_named(&page_markdown(), Some("markdown"));
     stack.set_visible_child_name("pen");
@@ -443,10 +443,19 @@ fn fmt_size(value: f64, decimals: usize) -> String {
 }
 
 /// Uniform vertical size control: +, an editable field, − (all stacked).
-/// Supports manual entry (float when `decimals > 0`); UI-only, no tool logic yet.
-fn size_stepper(default: f64, min: f64, max: f64, step: f64, decimals: usize) -> gtk::Box {
+/// Supports manual entry (float when `decimals > 0`). `on_change` is called with
+/// every new value.
+fn size_stepper(
+    default: f64,
+    min: f64,
+    max: f64,
+    step: f64,
+    decimals: usize,
+    on_change: impl Fn(f64) + 'static,
+) -> gtk::Box {
     let column = gtk::Box::new(gtk::Orientation::Vertical, 2);
     let value = Rc::new(Cell::new(default));
+    let on_change = Rc::new(on_change);
 
     let plus = flat_icon_button("list-add-symbolic", "Größer");
     let minus = flat_icon_button("list-remove-symbolic", "Kleiner");
@@ -457,14 +466,16 @@ fn size_stepper(default: f64, min: f64, max: f64, step: f64, decimals: usize) ->
         .text(fmt_size(default, decimals))
         .build();
 
-    // Parses/clamps the typed text and rewrites it in the canonical format.
+    // Parses/clamps the typed text, rewrites it, and reports the new value.
     let commit = {
         let value = value.clone();
+        let on_change = on_change.clone();
         move |entry: &gtk::Entry| {
             let parsed = entry.text().trim().replace(',', ".").parse::<f64>().unwrap_or(value.get());
             let v = parsed.clamp(min, max);
             value.set(v);
             entry.set_text(&fmt_size(v, decimals));
+            on_change(v);
         }
     };
     {
@@ -478,23 +489,24 @@ fn size_stepper(default: f64, min: f64, max: f64, step: f64, decimals: usize) ->
         focus.connect_leave(move |_| commit(&target));
         entry.add_controller(focus);
     }
-    {
+    let step_by = {
         let value = value.clone();
         let entry = entry.clone();
-        plus.connect_clicked(move |_| {
-            let v = (value.get() + step).clamp(min, max);
+        let on_change = on_change.clone();
+        move |delta: f64| {
+            let v = (value.get() + delta).clamp(min, max);
             value.set(v);
             entry.set_text(&fmt_size(v, decimals));
-        });
+            on_change(v);
+        }
+    };
+    {
+        let step_by = step_by.clone();
+        plus.connect_clicked(move |_| step_by(step));
     }
     {
-        let value = value.clone();
-        let entry = entry.clone();
-        minus.connect_clicked(move |_| {
-            let v = (value.get() - step).clamp(min, max);
-            value.set(v);
-            entry.set_text(&fmt_size(v, decimals));
-        });
+        let step_by = step_by.clone();
+        minus.connect_clicked(move |_| step_by(-step));
     }
 
     column.append(&plus);
@@ -506,7 +518,7 @@ fn size_stepper(default: f64, min: f64, max: f64, step: f64, decimals: usize) ->
 fn page_pen() -> gtk::Box {
     let page = detail_column();
     page.append(&color_button());
-    page.append(&size_stepper(3.0, 0.5, 20.0, 0.5, 1));
+    page.append(&size_stepper(3.0, 0.5, 20.0, 0.5, 1, |_| {}));
     page
 }
 
@@ -525,13 +537,14 @@ fn page_shapes() -> gtk::Box {
 
     page.append(&hsep());
     page.append(&color_button());
-    page.append(&size_stepper(3.0, 1.0, 20.0, 1.0, 0));
+    page.append(&size_stepper(3.0, 1.0, 20.0, 1.0, 0, |_| {}));
     page
 }
 
-fn page_text() -> gtk::Box {
+fn page_text(canvas: &Canvas) -> gtk::Box {
     let page = detail_column();
-    page.append(&size_stepper(16.0, 8.0, 72.0, 1.0, 0));
+    let canvas = canvas.clone();
+    page.append(&size_stepper(16.0, 8.0, 72.0, 1.0, 0, move |v| canvas.set_text_size(v)));
     page.append(&color_button());
 
     page.append(&hsep());
@@ -544,13 +557,13 @@ fn page_text() -> gtk::Box {
 
 fn page_eraser() -> gtk::Box {
     let page = detail_column();
-    page.append(&size_stepper(10.0, 1.0, 40.0, 0.5, 1));
+    page.append(&size_stepper(10.0, 1.0, 40.0, 0.5, 1, |_| {}));
     page
 }
 
 fn page_markdown() -> gtk::Box {
     let page = detail_column();
-    page.append(&size_stepper(16.0, 8.0, 72.0, 1.0, 0));
+    page.append(&size_stepper(16.0, 8.0, 72.0, 1.0, 0, |_| {}));
     page
 }
 
