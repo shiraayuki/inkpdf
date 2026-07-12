@@ -20,13 +20,17 @@ const MAX_ZOOM: f64 = 6.0;
 const ZOOM_STEP: f64 = 1.25;
 const TEXT_SIZE: f64 = 16.0;
 const TEXT_COLOR: Color = Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
+const MIN_BOX_WIDTH: f64 = 4.0;
+// Bounding-box colors (r, g, b, a).
+const BOX_ACTIVE: (f64, f64, f64, f64) = (0.20, 0.51, 0.92, 1.0);
+const BOX_ANNOTATION: (f64, f64, f64, f64) = (0.55, 0.55, 0.60, 0.9);
 
-/// An in-progress text edit: the entry widget plus the page-local baseline anchor.
-struct Editing {
-    entry: gtk::Text,
+/// A text box currently being typed. `x`/`y` are the top-left anchor in page points.
+struct TextEdit {
     page: usize,
     x: f64,
     y: f64,
+    buffer: String,
 }
 
 struct State {
@@ -35,27 +39,24 @@ struct State {
     zoom: f64,
     /// Rendered pages keyed by index; cleared on zoom or structure change.
     cache: HashMap<usize, cairo::ImageSurface>,
-    editing: Option<Editing>,
+    text_mode: bool,
+    editing: Option<TextEdit>,
 }
 
 #[derive(Clone)]
 pub struct Canvas {
     pub root: gtk::ScrolledWindow,
     area: gtk::DrawingArea,
-    layer: gtk::Fixed,
     state: Rc<RefCell<State>>,
 }
 
 impl Canvas {
     pub fn new() -> Self {
-        let area = gtk::DrawingArea::new();
-        let layer = gtk::Fixed::new();
-        layer.put(&area, 0.0, 0.0);
-
+        let area = gtk::DrawingArea::builder().focusable(true).build();
         let root = gtk::ScrolledWindow::builder()
             .hexpand(true)
             .vexpand(true)
-            .child(&layer)
+            .child(&area)
             .build();
 
         let state = Rc::new(RefCell::new(State {
@@ -63,6 +64,7 @@ impl Canvas {
             pdf: None,
             zoom: 1.0,
             cache: HashMap::new(),
+            text_mode: false,
             editing: None,
         }));
 
@@ -73,21 +75,31 @@ impl Canvas {
             });
         }
 
-        let canvas = Self { root, area, layer, state };
+        let canvas = Self { root, area, state };
         canvas.attach_input();
         canvas
     }
 
     fn attach_input(&self) {
         let click = gtk::GestureClick::new();
-        let this = self.clone();
-        click.connect_pressed(move |_, _, x, y| this.on_click(x, y));
+        {
+            let this = self.clone();
+            click.connect_pressed(move |_, _, x, y| this.on_click(x, y));
+        }
         self.area.add_controller(click);
+
+        let keys = gtk::EventControllerKey::new();
+        {
+            let this = self.clone();
+            keys.connect_key_pressed(move |_, keyval, _, _| this.on_key(keyval));
+        }
+        self.area.add_controller(keys);
     }
 
     pub fn set_open_document(&self, open: OpenDocument) {
         {
             let mut st = self.state.borrow_mut();
+            st.editing = None;
             st.doc = Some(open.model);
             st.pdf = open.pdf;
             st.zoom = 1.0;
@@ -102,19 +114,49 @@ impl Canvas {
         self.state.borrow().doc.clone()
     }
 
-    /// Appends a blank page, matching the last page's size or falling back to A4.
+    pub fn set_text_mode(&self, on: bool) {
+        if !on {
+            self.commit_editing();
+        }
+        self.state.borrow_mut().text_mode = on;
+        if on {
+            self.area.grab_focus();
+        }
+        self.area.queue_draw();
+    }
+
+    /// Inserts a blank page directly after the page currently in view.
     pub fn insert_blank_page(&self) {
+        self.cancel_editing();
+        let current = self.current_page();
         {
             let mut st = self.state.borrow_mut();
             let (w, h) = st
                 .doc
                 .as_ref()
-                .and_then(|d| d.pages.last())
+                .and_then(|d| d.pages.get(current).or_else(|| d.pages.last()))
                 .map(|p| (p.width, p.height))
                 .unwrap_or(A4);
             let doc = st.doc.get_or_insert_with(Document::new);
-            let at = doc.pages.len();
+            let at = if doc.pages.is_empty() { 0 } else { current + 1 };
             doc.insert_blank_page(at, w, h, Color::WHITE);
+            st.cache.clear();
+        }
+        self.update_layout();
+    }
+
+    /// Removes the page currently in view.
+    pub fn delete_current_page(&self) {
+        self.cancel_editing();
+        let current = self.current_page();
+        {
+            let mut st = self.state.borrow_mut();
+            match st.doc.as_mut() {
+                Some(doc) if !doc.pages.is_empty() => {
+                    doc.pages.remove(current.min(doc.pages.len() - 1));
+                }
+                _ => return,
+            }
             st.cache.clear();
         }
         self.update_layout();
@@ -146,68 +188,92 @@ impl Canvas {
         self.set_zoom(self.zoom() / ZOOM_STEP);
     }
 
+    /// Index of the page whose area contains the viewport's vertical center.
+    fn current_page(&self) -> usize {
+        let st = self.state.borrow();
+        let Some(doc) = st.doc.as_ref() else {
+            return 0;
+        };
+        if doc.pages.is_empty() {
+            return 0;
+        }
+        let z = st.zoom;
+        let adj = self.root.vadjustment();
+        let center = adj.value() + adj.page_size() / 2.0;
+
+        let mut top = PAGE_GAP;
+        for (i, page) in doc.pages.iter().enumerate() {
+            let ph = page.height * z;
+            if center < top + ph + PAGE_GAP / 2.0 {
+                return i;
+            }
+            top += ph + PAGE_GAP;
+        }
+        doc.pages.len() - 1
+    }
+
     fn on_click(&self, x: f64, y: f64) {
+        self.area.grab_focus();
+        if !self.state.borrow().text_mode {
+            return;
+        }
         self.commit_editing();
 
         let hit = {
             let st = self.state.borrow();
-            let Some(doc) = st.doc.as_ref() else {
-                return;
-            };
-            hit_test(&doc.pages, st.zoom, self.area.width() as f64, x, y)
+            match st.doc.as_ref() {
+                Some(doc) => hit_test(&doc.pages, st.zoom, self.area.width() as f64, x, y),
+                None => None,
+            }
         };
-        let Some((page, lx, ly)) = hit else {
-            return;
-        };
-
-        self.start_editing(page, lx, ly, x, y);
+        if let Some((page, lx, ly)) = hit {
+            self.state.borrow_mut().editing = Some(TextEdit { page, x: lx, y: ly, buffer: String::new() });
+            self.area.queue_draw();
+        }
     }
 
-    fn start_editing(&self, page: usize, lx: f64, ly: f64, wx: f64, wy: f64) {
-        let entry = gtk::Text::builder().width_request(220).build();
-        self.layer.put(&entry, wx, wy);
-        entry.grab_focus();
-
-        {
-            let this = self.clone();
-            entry.connect_activate(move |_| this.commit_editing());
+    fn on_key(&self, keyval: gdk::Key) -> glib::Propagation {
+        if self.state.borrow().editing.is_none() {
+            return glib::Propagation::Proceed;
         }
-        {
-            let focus = gtk::EventControllerFocus::new();
-            let this = self.clone();
-            focus.connect_leave(move |_| this.commit_editing());
-            entry.add_controller(focus);
-        }
-        {
-            let key = gtk::EventControllerKey::new();
-            let this = self.clone();
-            key.connect_key_pressed(move |_, keyval, _, _| {
-                if keyval == gdk::Key::Escape {
-                    this.cancel_editing();
-                    glib::Propagation::Stop
-                } else {
-                    glib::Propagation::Proceed
+        match keyval {
+            gdk::Key::Escape => {
+                self.cancel_editing();
+                glib::Propagation::Stop
+            }
+            gdk::Key::Return | gdk::Key::KP_Enter => {
+                self.commit_editing();
+                glib::Propagation::Stop
+            }
+            gdk::Key::BackSpace => {
+                if let Some(ed) = self.state.borrow_mut().editing.as_mut() {
+                    ed.buffer.pop();
                 }
-            });
-            entry.add_controller(key);
+                self.area.queue_draw();
+                glib::Propagation::Stop
+            }
+            _ => match keyval.to_unicode() {
+                Some(ch) if !ch.is_control() => {
+                    if let Some(ed) = self.state.borrow_mut().editing.as_mut() {
+                        ed.buffer.push(ch);
+                    }
+                    self.area.queue_draw();
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
+            },
         }
-
-        self.state.borrow_mut().editing = Some(Editing { entry, page, x: lx, y: ly });
     }
 
     fn commit_editing(&self) {
-        // Take the edit out first so re-entrant focus-leave signals become no-ops.
         let editing = self.state.borrow_mut().editing.take();
         let Some(ed) = editing else {
             return;
         };
-        let text = ed.entry.text().to_string();
-        self.layer.remove(&ed.entry);
-
-        if text.trim().is_empty() {
+        if ed.buffer.trim().is_empty() {
+            self.area.queue_draw();
             return;
         }
-
         {
             let mut st = self.state.borrow_mut();
             if let Some(page) = st.doc.as_mut().and_then(|d| d.pages.get_mut(ed.page)) {
@@ -215,9 +281,8 @@ impl Canvas {
                     id: Uuid::new_v4(),
                     kind: AnnotationKind::Text(TextAnnotation {
                         x: ed.x,
-                        // Store the baseline; the click anchors the text's top.
-                        y: ed.y + TEXT_SIZE,
-                        content: text,
+                        y: ed.y,
+                        content: ed.buffer,
                         size: TEXT_SIZE,
                         color: TEXT_COLOR,
                     }),
@@ -229,9 +294,8 @@ impl Canvas {
     }
 
     fn cancel_editing(&self) {
-        let editing = self.state.borrow_mut().editing.take();
-        if let Some(ed) = editing {
-            self.layer.remove(&ed.entry);
+        if self.state.borrow_mut().editing.take().is_some() {
+            self.area.queue_draw();
         }
     }
 
@@ -242,7 +306,6 @@ impl Canvas {
         };
         self.area.set_content_width(w as i32);
         self.area.set_content_height(h as i32);
-        self.area.set_size_request(w as i32, h as i32);
         self.area.queue_draw();
     }
 }
@@ -281,7 +344,7 @@ fn draw(state: &Rc<RefCell<State>>, ctx: &cairo::Context, width: i32) {
     let _ = ctx.paint();
 
     let mut st = state.borrow_mut();
-    let State { doc, pdf, zoom, cache, .. } = &mut *st;
+    let State { doc, pdf, zoom, cache, text_mode, editing } = &mut *st;
     let Some(doc) = doc.as_ref() else {
         return;
     };
@@ -308,6 +371,13 @@ fn draw(state: &Rc<RefCell<State>>, ctx: &cairo::Context, width: i32) {
             ctx.set_source_rgb(0.0, 0.0, 0.0);
             ctx.set_line_width(1.0);
             let _ = ctx.stroke();
+
+            // Overlay (boxes, in-progress text, caret) in page-point space.
+            let _ = ctx.save();
+            ctx.translate(x, y);
+            ctx.scale(z, z);
+            draw_overlay(ctx, page, i, z, *text_mode, editing.as_ref());
+            let _ = ctx.restore();
         }
 
         y += ph + PAGE_GAP;
@@ -350,26 +420,98 @@ fn page_surface(
                 c.scale(zoom, zoom);
             }
         }
-        // Annotations are drawn in page-point space (context is already scaled).
-        draw_annotations(&c, page);
+        for annotation in &page.annotations {
+            match &annotation.kind {
+                AnnotationKind::Text(text) => draw_text(&c, text),
+            }
+        }
     }
 
     cache.insert(index, surface.clone());
     Some(surface)
 }
 
-fn draw_annotations(c: &cairo::Context, page: &Page) {
-    for annotation in &page.annotations {
-        match &annotation.kind {
-            AnnotationKind::Text(text) => {
-                let Color { r, g, b, a } = text.color;
-                c.set_source_rgba(r, g, b, a);
-                c.set_font_size(text.size);
-                c.move_to(text.x, text.y);
-                let _ = c.show_text(&text.content);
+/// Draws a text annotation; the context must be in page-point space.
+fn draw_text(c: &cairo::Context, text: &TextAnnotation) {
+    let Color { r, g, b, a } = text.color;
+    c.set_source_rgba(r, g, b, a);
+    c.set_font_size(text.size);
+    let Ok(fe) = c.font_extents() else {
+        return;
+    };
+    c.move_to(text.x, text.y + fe.ascent());
+    let _ = c.show_text(&text.content);
+}
+
+fn draw_overlay(
+    c: &cairo::Context,
+    page: &Page,
+    index: usize,
+    zoom: f64,
+    text_mode: bool,
+    editing: Option<&TextEdit>,
+) {
+    if text_mode {
+        for annotation in &page.annotations {
+            match &annotation.kind {
+                AnnotationKind::Text(text) => {
+                    stroke_text_box(c, text.x, text.y, text.size, &text.content, zoom, BOX_ANNOTATION);
+                }
             }
         }
     }
+
+    if let Some(ed) = editing
+        && ed.page == index
+    {
+        let preview = TextAnnotation {
+            x: ed.x,
+            y: ed.y,
+            content: ed.buffer.clone(),
+            size: TEXT_SIZE,
+            color: TEXT_COLOR,
+        };
+        draw_text(c, &preview);
+        stroke_text_box(c, ed.x, ed.y, TEXT_SIZE, &ed.buffer, zoom, BOX_ACTIVE);
+        draw_caret(c, ed, zoom);
+    }
+}
+
+/// Strokes the bounding box of a piece of text (context in page-point space).
+fn stroke_text_box(
+    c: &cairo::Context,
+    x: f64,
+    y: f64,
+    size: f64,
+    content: &str,
+    zoom: f64,
+    rgba: (f64, f64, f64, f64),
+) {
+    c.set_font_size(size);
+    let Ok(fe) = c.font_extents() else {
+        return;
+    };
+    let width = c.text_extents(content).map(|e| e.x_advance()).unwrap_or(0.0).max(MIN_BOX_WIDTH);
+    let (r, g, b, a) = rgba;
+    c.set_source_rgba(r, g, b, a);
+    c.set_line_width(1.0 / zoom);
+    c.rectangle(x, y, width, fe.height());
+    let _ = c.stroke();
+}
+
+fn draw_caret(c: &cairo::Context, ed: &TextEdit, zoom: f64) {
+    c.set_font_size(TEXT_SIZE);
+    let Ok(fe) = c.font_extents() else {
+        return;
+    };
+    let width = c.text_extents(&ed.buffer).map(|e| e.x_advance()).unwrap_or(0.0);
+    let cx = ed.x + width;
+    let (r, g, b, a) = BOX_ACTIVE;
+    c.set_source_rgba(r, g, b, a);
+    c.set_line_width(1.0 / zoom);
+    c.move_to(cx, ed.y);
+    c.line_to(cx, ed.y + fe.height());
+    let _ = c.stroke();
 }
 
 #[cfg(test)]
@@ -391,16 +533,13 @@ mod tests {
         let width = A4.0 + 2.0 * PAGE_GAP; // matches content_size at zoom 1
         let left = PAGE_GAP;
 
-        // Inside first page, 10/20 from its top-left.
         let hit = hit_test(&pages, 1.0, width, left + 10.0, PAGE_GAP + 20.0);
         assert_eq!(hit, Some((0, 10.0, 20.0)));
 
-        // Inside second page (after first page + gap).
         let second_top = PAGE_GAP + A4.1 + PAGE_GAP;
         let hit2 = hit_test(&pages, 1.0, width, left + 5.0, second_top + 1.0);
         assert_eq!(hit2, Some((1, 5.0, 1.0)));
 
-        // In the margin/gap -> no hit.
         assert_eq!(hit_test(&pages, 1.0, width, 2.0, 2.0), None);
     }
 

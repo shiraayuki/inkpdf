@@ -59,11 +59,26 @@ pub fn build(app: &adw::Application) -> WindowUi {
         .build();
     let add_page_button = gtk::Button::builder()
         .icon_name("list-add-symbolic")
-        .tooltip_text("Insert blank page")
+        .tooltip_text("Insert page after current")
         .build();
+    let remove_page_button = gtk::Button::builder()
+        .icon_name("list-remove-symbolic")
+        .tooltip_text("Delete current page")
+        .build();
+    let page_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    page_box.add_css_class("linked");
+    page_box.append(&add_page_button);
+    page_box.append(&remove_page_button);
+
+    let text_button = gtk::ToggleButton::builder()
+        .icon_name("document-edit-symbolic")
+        .tooltip_text("Text mode: click a page to add text")
+        .build();
+
     header.pack_start(&open_button);
     header.pack_start(&save_button);
-    header.pack_start(&add_page_button);
+    header.pack_start(&page_box);
+    header.pack_start(&text_button);
 
     let zoom_out_button = gtk::Button::builder()
         .icon_name("zoom-out-symbolic")
@@ -135,6 +150,14 @@ pub fn build(app: &adw::Application) -> WindowUi {
                 ui.title.set_subtitle("untitled");
             }
         });
+    }
+    {
+        let ui = ui.clone();
+        remove_page_button.connect_clicked(move |_| ui.canvas.delete_current_page());
+    }
+    {
+        let ui = ui.clone();
+        text_button.connect_toggled(move |btn| ui.canvas.set_text_mode(btn.is_active()));
     }
 
     window.present();
