@@ -57,8 +57,13 @@ pub fn build(app: &adw::Application) -> WindowUi {
         .icon_name("document-save-symbolic")
         .tooltip_text("Save as inkpdf")
         .build();
+    let add_page_button = gtk::Button::builder()
+        .icon_name("list-add-symbolic")
+        .tooltip_text("Insert blank page")
+        .build();
     header.pack_start(&open_button);
     header.pack_start(&save_button);
+    header.pack_start(&add_page_button);
 
     let zoom_out_button = gtk::Button::builder()
         .icon_name("zoom-out-symbolic")
@@ -120,6 +125,16 @@ pub fn build(app: &adw::Application) -> WindowUi {
     {
         let ui = ui.clone();
         save_button.connect_clicked(move |_| save_dialog(&ui));
+    }
+    {
+        let ui = ui.clone();
+        add_page_button.connect_clicked(move |_| {
+            ui.canvas.insert_blank_page();
+            ui.stack.set_visible_child_name("canvas");
+            if ui.title.subtitle().is_empty() {
+                ui.title.set_subtitle("untitled");
+            }
+        });
     }
 
     window.present();

@@ -6,7 +6,7 @@ use gtk::cairo;
 use gtk::prelude::*;
 
 use crate::engine::OpenDocument;
-use crate::engine::document::{Color, Document, Page, PageKind};
+use crate::engine::document::{A4, Color, Document, Page, PageKind};
 use crate::engine::pdf::PdfDocument;
 
 const PAGE_GAP: f64 = 16.0;
@@ -69,6 +69,24 @@ impl Canvas {
     /// Snapshot of the current document model (for saving).
     pub fn document(&self) -> Option<Document> {
         self.state.borrow().doc.clone()
+    }
+
+    /// Appends a blank page, matching the last page's size or falling back to A4.
+    pub fn insert_blank_page(&self) {
+        {
+            let mut st = self.state.borrow_mut();
+            let (w, h) = st
+                .doc
+                .as_ref()
+                .and_then(|d| d.pages.last())
+                .map(|p| (p.width, p.height))
+                .unwrap_or(A4);
+            let doc = st.doc.get_or_insert_with(Document::new);
+            let at = doc.pages.len();
+            doc.insert_blank_page(at, w, h, Color::WHITE);
+            st.cache.clear();
+        }
+        self.update_layout();
     }
 
     pub fn zoom(&self) -> f64 {
