@@ -33,6 +33,7 @@ struct TextEdit {
     x: f64,
     y: f64,
     size: f64,
+    color: Color,
     buffer: String,
     /// Caret position as a byte offset into `buffer` (always on a char boundary).
     cursor: usize,
@@ -142,6 +143,8 @@ struct State {
     selected: Option<(usize, Uuid)>,
     /// Font size used for new text boxes (and the one being edited).
     text_size: f64,
+    /// Font color used for new text boxes (and the one being edited).
+    text_color: Color,
 }
 
 /// Where an insert/delete acts relative to the current page.
@@ -196,6 +199,7 @@ impl Canvas {
             dragging: None,
             selected: None,
             text_size: TEXT_SIZE,
+            text_color: TEXT_COLOR,
         }));
 
         {
@@ -288,6 +292,18 @@ impl Canvas {
             st.text_size = size;
             if let Some(ed) = st.editing.as_mut() {
                 ed.size = size;
+            }
+        }
+        self.area.queue_draw();
+    }
+
+    /// Sets the font color for new text boxes and the one currently being edited.
+    pub fn set_text_color(&self, color: Color) {
+        {
+            let mut st = self.state.borrow_mut();
+            st.text_color = color;
+            if let Some(ed) = st.editing.as_mut() {
+                ed.color = color;
             }
         }
         self.area.queue_draw();
@@ -528,11 +544,13 @@ impl Canvas {
             let mut st = self.state.borrow_mut();
             st.selected = None;
             let size = st.text_size;
+            let color = st.text_color;
             st.editing = Some(TextEdit {
                 page,
                 x: lx,
                 y: ly,
                 size,
+                color,
                 buffer: String::new(),
                 cursor: 0,
                 id: Uuid::new_v4(),
@@ -556,14 +574,15 @@ impl Canvas {
         let Some(annotation) = removed else {
             return;
         };
-        let (x, y, size, content, id) = match &annotation.kind {
-            AnnotationKind::Text(t) => (t.x, t.y, t.size, t.content.clone(), annotation.id),
+        let (x, y, size, color, content, id) = match &annotation.kind {
+            AnnotationKind::Text(t) => (t.x, t.y, t.size, t.color, t.content.clone(), annotation.id),
         };
         {
             let mut st = self.state.borrow_mut();
             let cursor = content.len();
             st.selected = None;
-            st.editing = Some(TextEdit { page, x, y, size, buffer: content, cursor, id, original: Some(annotation) });
+            st.editing =
+                Some(TextEdit { page, x, y, size, color, buffer: content, cursor, id, original: Some(annotation) });
             st.cache.remove(&page);
         }
         self.area.grab_focus();
@@ -633,7 +652,7 @@ impl Canvas {
                         y: ed.y,
                         content: ed.buffer,
                         size: ed.size,
-                        color: TEXT_COLOR,
+                        color: ed.color,
                     }),
                 });
             }
@@ -1034,7 +1053,7 @@ fn draw_overlay(c: &cairo::Context, page: &Page, index: usize, zoom: f64, overla
             y: ed.y,
             content: ed.buffer.clone(),
             size: ed.size,
-            color: TEXT_COLOR,
+            color: ed.color,
         };
         draw_text(c, &preview);
         stroke_text_box(c, ed.x, ed.y, ed.size, &ed.buffer, zoom, BOX_ACTIVE);
@@ -1163,6 +1182,7 @@ mod tests {
             x: 0.0,
             y: 0.0,
             size: TEXT_SIZE,
+            color: TEXT_COLOR,
             buffer: String::new(),
             cursor: 0,
             id: Uuid::new_v4(),

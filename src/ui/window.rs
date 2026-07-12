@@ -6,7 +6,7 @@ use adw::prelude::*;
 use gtk::{gdk, gio};
 
 use crate::engine::OpenDocument;
-use crate::engine::document::FILE_EXTENSION;
+use crate::engine::document::{Color, FILE_EXTENSION};
 use crate::engine::storage;
 use crate::ui::canvas::{Canvas, Relative, Tool};
 
@@ -424,6 +424,7 @@ fn flat_toggle(icon: &str, tip: &str) -> gtk::ToggleButton {
 
 fn color_button() -> gtk::ColorDialogButton {
     let button = gtk::ColorDialogButton::new(Some(gtk::ColorDialog::new()));
+    button.set_rgba(&gdk::RGBA::new(0.0, 0.0, 0.0, 1.0)); // default black everywhere
     button.set_size_request(SWATCH, SWATCH);
     button.set_halign(gtk::Align::Center);
     button.set_valign(gtk::Align::Center);
@@ -543,9 +544,25 @@ fn page_shapes() -> gtk::Box {
 
 fn page_text(canvas: &Canvas) -> gtk::Box {
     let page = detail_column();
-    let canvas = canvas.clone();
-    page.append(&size_stepper(16.0, 8.0, 72.0, 1.0, 0, move |v| canvas.set_text_size(v)));
-    page.append(&color_button());
+    {
+        let canvas = canvas.clone();
+        page.append(&size_stepper(16.0, 8.0, 72.0, 1.0, 0, move |v| canvas.set_text_size(v)));
+    }
+
+    let color = color_button();
+    {
+        let canvas = canvas.clone();
+        color.connect_rgba_notify(move |btn| {
+            let rgba = btn.rgba();
+            canvas.set_text_color(Color {
+                r: rgba.red() as f64,
+                g: rgba.green() as f64,
+                b: rgba.blue() as f64,
+                a: rgba.alpha() as f64,
+            });
+        });
+    }
+    page.append(&color);
 
     page.append(&hsep());
     page.append(&flat_toggle("format-text-bold-symbolic", "Fett"));
