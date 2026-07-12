@@ -1,0 +1,149 @@
+use std::path::Path;
+
+use adw::prelude::*;
+use gtk::gio;
+
+use crate::engine::pdf::PdfDocument;
+use crate::ui::canvas::Canvas;
+
+const DEFAULT_WIDTH: i32 = 900;
+const DEFAULT_HEIGHT: i32 = 700;
+
+#[derive(Clone)]
+pub struct WindowUi {
+    window: adw::ApplicationWindow,
+    canvas: Canvas,
+    stack: gtk::Stack,
+    title: adw::WindowTitle,
+}
+
+impl WindowUi {
+    pub fn load_path(&self, path: &Path) {
+        match PdfDocument::open(path) {
+            Ok(pdf) => {
+                self.canvas.set_document(pdf);
+                self.stack.set_visible_child_name("canvas");
+                self.title.set_subtitle(&file_label(path));
+            }
+            Err(err) => show_error(&self.window, &format!("{err:#}")),
+        }
+    }
+}
+
+pub fn build(app: &adw::Application) -> WindowUi {
+    let title = adw::WindowTitle::new("inkpdf", "");
+
+    let header = adw::HeaderBar::new();
+    header.set_title_widget(Some(&title));
+
+    let open_button = gtk::Button::builder()
+        .icon_name("document-open-symbolic")
+        .tooltip_text("Open PDF")
+        .build();
+    header.pack_start(&open_button);
+
+    let zoom_out_button = gtk::Button::builder()
+        .icon_name("zoom-out-symbolic")
+        .tooltip_text("Zoom out")
+        .build();
+    let zoom_in_button = gtk::Button::builder()
+        .icon_name("zoom-in-symbolic")
+        .tooltip_text("Zoom in")
+        .build();
+    let zoom_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    zoom_box.add_css_class("linked");
+    zoom_box.append(&zoom_out_button);
+    zoom_box.append(&zoom_in_button);
+    header.pack_end(&zoom_box);
+
+    let canvas = Canvas::new();
+
+    let placeholder = adw::StatusPage::builder()
+        .icon_name("document-open-symbolic")
+        .title("No PDF open")
+        .description("Click Open to load a PDF.")
+        .build();
+
+    let stack = gtk::Stack::new();
+    stack.add_named(&placeholder, Some("placeholder"));
+    stack.add_named(&canvas.root, Some("canvas"));
+    stack.set_visible_child_name("placeholder");
+
+    let content = adw::ToolbarView::new();
+    content.add_top_bar(&header);
+    content.set_content(Some(&stack));
+
+    let window = adw::ApplicationWindow::builder()
+        .application(app)
+        .default_width(DEFAULT_WIDTH)
+        .default_height(DEFAULT_HEIGHT)
+        .content(&content)
+        .build();
+
+    let ui = WindowUi {
+        window: window.clone(),
+        canvas: canvas.clone(),
+        stack,
+        title,
+    };
+
+    {
+        let canvas = canvas.clone();
+        zoom_in_button.connect_clicked(move |_| canvas.zoom_in());
+    }
+    {
+        let canvas = canvas.clone();
+        zoom_out_button.connect_clicked(move |_| canvas.zoom_out());
+    }
+    {
+        let ui = ui.clone();
+        open_button.connect_clicked(move |_| open_pdf_dialog(&ui));
+    }
+
+    window.present();
+    ui
+}
+
+fn open_pdf_dialog(ui: &WindowUi) {
+    let filter = gtk::FileFilter::new();
+    filter.set_name(Some("PDF files"));
+    filter.add_mime_type("application/pdf");
+    filter.add_suffix("pdf");
+
+    let filters = gio::ListStore::new::<gtk::FileFilter>();
+    filters.append(&filter);
+
+    let dialog = gtk::FileDialog::builder()
+        .title("Open PDF")
+        .filters(&filters)
+        .modal(true)
+        .build();
+
+    let ui = ui.clone();
+    let parent = ui.window.clone();
+    dialog.open(Some(&parent), gio::Cancellable::NONE, move |result| {
+        let file = match result {
+            Ok(file) => file,
+            Err(_) => return,
+        };
+        match file.path() {
+            Some(path) => ui.load_path(&path),
+            None => show_error(&ui.window, "The file has no local path."),
+        }
+    });
+}
+
+fn show_error(window: &adw::ApplicationWindow, message: &str) {
+    let dialog = gtk::AlertDialog::builder()
+        .message("Could not open PDF")
+        .detail(message)
+        .modal(true)
+        .build();
+    dialog.show(Some(window));
+}
+
+fn file_label(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
