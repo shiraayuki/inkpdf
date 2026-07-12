@@ -394,8 +394,8 @@ fn build_tool_strip(canvas: &Canvas, details: &gtk::Stack) -> gtk::Box {
 fn build_details_panel() -> gtk::Stack {
     let stack = gtk::Stack::new();
     stack.add_css_class("inkpdf-panel");
-    // Size to the visible page (not the largest), so height reflects its elements.
-    stack.set_hhomogeneous(false);
+    // Same width for every page (consistent panel), but height follows each page's elements.
+    stack.set_hhomogeneous(true);
     stack.set_vhomogeneous(false);
     stack.add_named(&page_pen(), Some("pen"));
     stack.add_named(&page_shapes(), Some("shapes"));
@@ -467,10 +467,19 @@ fn size_stepper(default: i32, min: i32, max: i32) -> gtk::Box {
     column
 }
 
+/// Float size control with manual entry and step buttons (pen/eraser width).
+fn size_spin(default: f64, min: f64, max: f64) -> gtk::SpinButton {
+    let spin = gtk::SpinButton::with_range(min, max, 0.5);
+    spin.set_digits(1);
+    spin.set_value(default);
+    spin.set_width_chars(3);
+    spin
+}
+
 fn page_pen() -> gtk::Box {
     let page = detail_column();
     page.append(&color_button());
-    page.append(&size_stepper(3, 1, 20));
+    page.append(&size_spin(3.0, 0.5, 20.0));
     page
 }
 
@@ -508,7 +517,7 @@ fn page_text() -> gtk::Box {
 
 fn page_eraser() -> gtk::Box {
     let page = detail_column();
-    page.append(&size_stepper(10, 1, 40));
+    page.append(&size_spin(10.0, 1.0, 40.0));
     page
 }
 
@@ -520,7 +529,7 @@ fn page_markdown() -> gtk::Box {
 
 const PANEL_CSS: &str = "\
 .inkpdf-panel { \
-  background-color: alpha(@window_bg_color, 0.9); \
+  background-color: @window_bg_color; \
   color: @window_fg_color; \
   border-radius: 12px; \
   padding: 6px; \
