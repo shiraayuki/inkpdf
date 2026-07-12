@@ -434,52 +434,79 @@ fn hsep() -> gtk::Separator {
     gtk::Separator::new(gtk::Orientation::Horizontal)
 }
 
-/// Compact +/value/- size stepper. Only updates its own label for now (no tool logic).
-fn size_stepper(default: i32, min: i32, max: i32) -> gtk::Box {
+fn fmt_size(value: f64, decimals: usize) -> String {
+    if decimals == 0 {
+        format!("{}", value.round() as i64)
+    } else {
+        format!("{value:.decimals$}")
+    }
+}
+
+/// Uniform vertical size control: +, an editable field, − (all stacked).
+/// Supports manual entry (float when `decimals > 0`); UI-only, no tool logic yet.
+fn size_stepper(default: f64, min: f64, max: f64, step: f64, decimals: usize) -> gtk::Box {
     let column = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    let value = Rc::new(Cell::new(default));
+
     let plus = flat_icon_button("list-add-symbolic", "Größer");
     let minus = flat_icon_button("list-remove-symbolic", "Kleiner");
-    let value = gtk::Label::new(Some(&default.to_string()));
+    let entry = gtk::Entry::builder()
+        .width_chars(3)
+        .max_width_chars(4)
+        .xalign(0.5)
+        .text(fmt_size(default, decimals))
+        .build();
 
-    let current = Rc::new(Cell::new(default));
-    {
-        let current = current.clone();
+    // Parses/clamps the typed text and rewrites it in the canonical format.
+    let commit = {
         let value = value.clone();
+        move |entry: &gtk::Entry| {
+            let parsed = entry.text().trim().replace(',', ".").parse::<f64>().unwrap_or(value.get());
+            let v = parsed.clamp(min, max);
+            value.set(v);
+            entry.set_text(&fmt_size(v, decimals));
+        }
+    };
+    {
+        let commit = commit.clone();
+        entry.connect_activate(move |entry| commit(entry));
+    }
+    {
+        let commit = commit.clone();
+        let target = entry.clone();
+        let focus = gtk::EventControllerFocus::new();
+        focus.connect_leave(move |_| commit(&target));
+        entry.add_controller(focus);
+    }
+    {
+        let value = value.clone();
+        let entry = entry.clone();
         plus.connect_clicked(move |_| {
-            let v = (current.get() + 1).min(max);
-            current.set(v);
-            value.set_text(&v.to_string());
+            let v = (value.get() + step).clamp(min, max);
+            value.set(v);
+            entry.set_text(&fmt_size(v, decimals));
         });
     }
     {
-        let current = current.clone();
         let value = value.clone();
+        let entry = entry.clone();
         minus.connect_clicked(move |_| {
-            let v = (current.get() - 1).max(min);
-            current.set(v);
-            value.set_text(&v.to_string());
+            let v = (value.get() - step).clamp(min, max);
+            value.set(v);
+            entry.set_text(&fmt_size(v, decimals));
         });
     }
 
     column.append(&plus);
-    column.append(&value);
+    column.append(&entry);
     column.append(&minus);
     column
-}
-
-/// Float size control with manual entry and step buttons (pen/eraser width).
-fn size_spin(default: f64, min: f64, max: f64) -> gtk::SpinButton {
-    let spin = gtk::SpinButton::with_range(min, max, 0.5);
-    spin.set_digits(1);
-    spin.set_value(default);
-    spin.set_width_chars(3);
-    spin
 }
 
 fn page_pen() -> gtk::Box {
     let page = detail_column();
     page.append(&color_button());
-    page.append(&size_spin(3.0, 0.5, 20.0));
+    page.append(&size_stepper(3.0, 0.5, 20.0, 0.5, 1));
     page
 }
 
@@ -498,13 +525,13 @@ fn page_shapes() -> gtk::Box {
 
     page.append(&hsep());
     page.append(&color_button());
-    page.append(&size_stepper(3, 1, 20));
+    page.append(&size_stepper(3.0, 1.0, 20.0, 1.0, 0));
     page
 }
 
 fn page_text() -> gtk::Box {
     let page = detail_column();
-    page.append(&size_stepper(16, 8, 72));
+    page.append(&size_stepper(16.0, 8.0, 72.0, 1.0, 0));
     page.append(&color_button());
 
     page.append(&hsep());
@@ -517,13 +544,13 @@ fn page_text() -> gtk::Box {
 
 fn page_eraser() -> gtk::Box {
     let page = detail_column();
-    page.append(&size_spin(10.0, 1.0, 40.0));
+    page.append(&size_stepper(10.0, 1.0, 40.0, 0.5, 1));
     page
 }
 
 fn page_markdown() -> gtk::Box {
     let page = detail_column();
-    page.append(&size_stepper(16, 8, 72));
+    page.append(&size_stepper(16.0, 8.0, 72.0, 1.0, 0));
     page
 }
 
