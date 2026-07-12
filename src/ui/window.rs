@@ -101,6 +101,23 @@ pub fn build(app: &adw::Application) -> WindowUi {
     zoom_box.append(&zoom_in_button);
     header.pack_end(&zoom_box);
 
+    // Dark/light toggle (default dark = not active).
+    let theme_button = gtk::ToggleButton::builder()
+        .icon_name("weather-clear-night-symbolic")
+        .tooltip_text("Hell/Dunkel umschalten")
+        .build();
+    theme_button.connect_toggled(|btn| {
+        let manager = adw::StyleManager::default();
+        if btn.is_active() {
+            manager.set_color_scheme(adw::ColorScheme::ForceLight);
+            btn.set_icon_name("weather-clear-symbolic");
+        } else {
+            manager.set_color_scheme(adw::ColorScheme::ForceDark);
+            btn.set_icon_name("weather-clear-night-symbolic");
+        }
+    });
+    header.pack_end(&theme_button);
+
     load_css();
 
     let canvas = Canvas::new();
@@ -510,6 +527,9 @@ fn load_css() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
+        // Default to dark mode; the header toggle can switch to light.
+        adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
+
         let Some(display) = gdk::Display::default() else {
             return;
         };
