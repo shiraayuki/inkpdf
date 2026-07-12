@@ -1,12 +1,12 @@
 use std::path::{Path, PathBuf};
 
 use adw::prelude::*;
-use gtk::gio;
+use gtk::{gdk, gio};
 
 use crate::engine::OpenDocument;
 use crate::engine::document::FILE_EXTENSION;
 use crate::engine::storage;
-use crate::ui::canvas::Canvas;
+use crate::ui::canvas::{Canvas, Relative};
 
 const DEFAULT_WIDTH: i32 = 900;
 const DEFAULT_HEIGHT: i32 = 700;
@@ -39,6 +39,14 @@ impl WindowUi {
                 self.title.set_subtitle(&file_label(path));
             }
             Err(err) => show_error(&self.window, &format!("{err:#}")),
+        }
+    }
+
+    fn insert_page(&self, rel: Relative) {
+        self.canvas.insert_blank_page(rel);
+        self.stack.set_visible_child_name("canvas");
+        if self.title.subtitle().is_empty() {
+            self.title.set_subtitle("untitled");
         }
     }
 }
@@ -143,13 +151,7 @@ pub fn build(app: &adw::Application) -> WindowUi {
     }
     {
         let ui = ui.clone();
-        add_page_button.connect_clicked(move |_| {
-            ui.canvas.insert_blank_page();
-            ui.stack.set_visible_child_name("canvas");
-            if ui.title.subtitle().is_empty() {
-                ui.title.set_subtitle("untitled");
-            }
-        });
+        add_page_button.connect_clicked(move |_| ui.insert_page(Relative::After));
     }
     {
         let ui = ui.clone();
@@ -158,6 +160,42 @@ pub fn build(app: &adw::Application) -> WindowUi {
     {
         let ui = ui.clone();
         text_button.connect_toggled(move |btn| ui.canvas.set_text_mode(btn.is_active()));
+    }
+
+    // Right-click menus for choosing before/after the current page.
+    {
+        let ui = ui.clone();
+        let anchor = add_page_button.clone();
+        add_secondary_click(&add_page_button, move || {
+            let before = ui.clone();
+            let after = ui.clone();
+            show_menu(
+                &anchor,
+                vec![
+                    ("Insert before current page", true, Box::new(move || before.insert_page(Relative::Before))),
+                    ("Insert after current page", true, Box::new(move || after.insert_page(Relative::After))),
+                ],
+            );
+        });
+    }
+    {
+        let ui = ui.clone();
+        let anchor = remove_page_button.clone();
+        add_secondary_click(&remove_page_button, move || {
+            let count = ui.canvas.page_count();
+            let current = ui.canvas.current_index();
+            let before_ok = count > 0 && current > 0;
+            let after_ok = count > 0 && current + 1 < count;
+            let before = ui.clone();
+            let after = ui.clone();
+            show_menu(
+                &anchor,
+                vec![
+                    ("Delete page before current", before_ok, Box::new(move || before.canvas.delete_page(Relative::Before))),
+                    ("Delete page after current", after_ok, Box::new(move || after.canvas.delete_page(Relative::After))),
+                ],
+            );
+        });
     }
 
     window.present();
@@ -249,4 +287,35 @@ fn file_label(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
+}
+
+/// Runs `on_press` when the widget receives a right-click.
+fn add_secondary_click(widget: &impl IsA<gtk::Widget>, on_press: impl Fn() + 'static) {
+    let gesture = gtk::GestureClick::builder().button(gdk::BUTTON_SECONDARY).build();
+    gesture.connect_pressed(move |_, _, _, _| on_press());
+    widget.add_controller(gesture);
+}
+
+type MenuItem = (&'static str, bool, Box<dyn Fn()>);
+
+/// Pops up a small menu of labelled actions anchored to `anchor`.
+fn show_menu(anchor: &impl IsA<gtk::Widget>, items: Vec<MenuItem>) {
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let popover = gtk::Popover::builder().autohide(true).build();
+
+    for (label, enabled, callback) in items {
+        let item = gtk::Button::builder().label(label).sensitive(enabled).build();
+        item.add_css_class("flat");
+        let popover = popover.clone();
+        item.connect_clicked(move |_| {
+            callback();
+            popover.popdown();
+        });
+        list.append(&item);
+    }
+
+    popover.set_child(Some(&list));
+    popover.set_parent(anchor);
+    popover.connect_closed(|p| p.unparent());
+    popover.popup();
 }

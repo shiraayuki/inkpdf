@@ -41,6 +41,15 @@ struct State {
     cache: HashMap<usize, cairo::ImageSurface>,
     text_mode: bool,
     editing: Option<TextEdit>,
+    /// Page nearest the viewport center; gets the red frame and anchors insert/delete.
+    current: usize,
+}
+
+/// Where an insert/delete acts relative to the current page.
+#[derive(Clone, Copy)]
+pub enum Relative {
+    Before,
+    After,
 }
 
 #[derive(Clone)]
@@ -66,6 +75,7 @@ impl Canvas {
             cache: HashMap::new(),
             text_mode: false,
             editing: None,
+            current: 0,
         }));
 
         {
@@ -94,6 +104,10 @@ impl Canvas {
             keys.connect_key_pressed(move |_, keyval, _, _| this.on_key(keyval));
         }
         self.area.add_controller(keys);
+
+        // Track which page is in view so the red frame follows scrolling.
+        let this = self.clone();
+        self.root.vadjustment().connect_value_changed(move |_| this.recompute_current());
     }
 
     pub fn set_open_document(&self, open: OpenDocument) {
@@ -125,10 +139,20 @@ impl Canvas {
         self.area.queue_draw();
     }
 
-    /// Inserts a blank page directly after the page currently in view.
-    pub fn insert_blank_page(&self) {
+    pub fn current_index(&self) -> usize {
+        let st = self.state.borrow();
+        let count = st.doc.as_ref().map(|d| d.pages.len()).unwrap_or(0);
+        st.current.min(count.saturating_sub(1))
+    }
+
+    pub fn page_count(&self) -> usize {
+        self.state.borrow().doc.as_ref().map(|d| d.pages.len()).unwrap_or(0)
+    }
+
+    /// Inserts a blank page before or after the current page.
+    pub fn insert_blank_page(&self, rel: Relative) {
         self.cancel_editing();
-        let current = self.current_page();
+        let current = self.current_index();
         {
             let mut st = self.state.borrow_mut();
             let (w, h) = st
@@ -138,22 +162,41 @@ impl Canvas {
                 .map(|p| (p.width, p.height))
                 .unwrap_or(A4);
             let doc = st.doc.get_or_insert_with(Document::new);
-            let at = if doc.pages.is_empty() { 0 } else { current + 1 };
+            let at = match rel {
+                _ if doc.pages.is_empty() => 0,
+                Relative::Before => current,
+                Relative::After => current + 1,
+            };
             doc.insert_blank_page(at, w, h, Color::WHITE);
             st.cache.clear();
         }
         self.update_layout();
     }
 
-    /// Removes the page currently in view.
+    /// Removes the current page.
     pub fn delete_current_page(&self) {
+        self.remove_page(self.current_index());
+    }
+
+    /// Removes the page before or after the current one, if it exists.
+    pub fn delete_page(&self, rel: Relative) {
+        let current = self.current_index();
+        let target = match rel {
+            Relative::Before => current.checked_sub(1),
+            Relative::After => Some(current + 1),
+        };
+        if let Some(index) = target {
+            self.remove_page(index);
+        }
+    }
+
+    fn remove_page(&self, index: usize) {
         self.cancel_editing();
-        let current = self.current_page();
         {
             let mut st = self.state.borrow_mut();
             match st.doc.as_mut() {
-                Some(doc) if !doc.pages.is_empty() => {
-                    doc.pages.remove(current.min(doc.pages.len() - 1));
+                Some(doc) if index < doc.pages.len() => {
+                    doc.pages.remove(index);
                 }
                 _ => return,
             }
@@ -189,7 +232,7 @@ impl Canvas {
     }
 
     /// Index of the page whose area contains the viewport's vertical center.
-    fn current_page(&self) -> usize {
+    fn compute_current(&self) -> usize {
         let st = self.state.borrow();
         let Some(doc) = st.doc.as_ref() else {
             return 0;
@@ -210,6 +253,19 @@ impl Canvas {
             top += ph + PAGE_GAP;
         }
         doc.pages.len() - 1
+    }
+
+    fn recompute_current(&self) {
+        let index = self.compute_current();
+        let changed = {
+            let mut st = self.state.borrow_mut();
+            let changed = st.current != index;
+            st.current = index;
+            changed
+        };
+        if changed {
+            self.area.queue_draw();
+        }
     }
 
     fn on_click(&self, x: f64, y: f64) {
@@ -307,6 +363,7 @@ impl Canvas {
         self.area.set_content_width(w as i32);
         self.area.set_content_height(h as i32);
         self.area.queue_draw();
+        self.recompute_current();
     }
 }
 
@@ -344,11 +401,12 @@ fn draw(state: &Rc<RefCell<State>>, ctx: &cairo::Context, width: i32) {
     let _ = ctx.paint();
 
     let mut st = state.borrow_mut();
-    let State { doc, pdf, zoom, cache, text_mode, editing } = &mut *st;
+    let State { doc, pdf, zoom, cache, text_mode, editing, current } = &mut *st;
     let Some(doc) = doc.as_ref() else {
         return;
     };
     let z = *zoom;
+    let current = *current;
 
     let (_x0, cy0, _x1, cy1) = ctx.clip_extents().unwrap_or((0.0, 0.0, f64::MAX, f64::MAX));
 
@@ -368,8 +426,13 @@ fn draw(state: &Rc<RefCell<State>>, ctx: &cairo::Context, width: i32) {
             let _ = ctx.paint();
 
             ctx.rectangle(x, y, pw, ph);
-            ctx.set_source_rgb(0.0, 0.0, 0.0);
-            ctx.set_line_width(1.0);
+            if i == current {
+                ctx.set_source_rgb(0.85, 0.15, 0.15);
+                ctx.set_line_width(3.0);
+            } else {
+                ctx.set_source_rgb(0.0, 0.0, 0.0);
+                ctx.set_line_width(1.0);
+            }
             let _ = ctx.stroke();
 
             // Overlay (boxes, in-progress text, caret) in page-point space.
