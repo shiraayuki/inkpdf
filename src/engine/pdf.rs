@@ -1,6 +1,4 @@
-use std::path::Path;
-
-use anyhow::{Context, Result};
+use anyhow::Result;
 use gtk::cairo;
 use gtk::glib;
 use poppler::Document;
@@ -12,10 +10,7 @@ pub struct PdfDocument {
 }
 
 impl PdfDocument {
-    pub fn open(path: &Path) -> Result<Self> {
-        let data = std::fs::read(path)
-            .with_context(|| format!("could not read PDF: {}", path.display()))?;
-
+    pub fn from_bytes(data: Vec<u8>) -> Result<Self> {
         let bytes = glib::Bytes::from_owned(data);
         let doc = Document::from_bytes(&bytes, None)
             .map_err(|e| anyhow::anyhow!("could not open PDF: {e}"))?;
@@ -41,10 +36,6 @@ impl PdfDocument {
         self.page_sizes[index]
     }
 
-    pub fn page_sizes(&self) -> &[(f64, f64)] {
-        &self.page_sizes
-    }
-
     /// Renders a page onto `ctx`; the caller sets the zoom via the context's transform.
     pub fn render_page(&self, index: usize, ctx: &cairo::Context) {
         if let Some(page) = self.doc.page(index as i32) {
@@ -64,7 +55,8 @@ mod tests {
             return;
         };
 
-        let pdf = PdfDocument::open(Path::new(&path)).expect("PDF should load");
+        let data = std::fs::read(&path).expect("read pdf");
+        let pdf = PdfDocument::from_bytes(data).expect("PDF should load");
         assert!(pdf.n_pages() > 0);
 
         let (w, h) = pdf.page_size(0);

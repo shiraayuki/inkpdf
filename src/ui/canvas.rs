@@ -5,6 +5,8 @@ use std::rc::Rc;
 use gtk::cairo;
 use gtk::prelude::*;
 
+use crate::engine::OpenDocument;
+use crate::engine::document::{Color, Document, Page, PageKind};
 use crate::engine::pdf::PdfDocument;
 
 const PAGE_GAP: f64 = 16.0;
@@ -13,9 +15,10 @@ const MAX_ZOOM: f64 = 6.0;
 const ZOOM_STEP: f64 = 1.25;
 
 struct State {
+    doc: Option<Document>,
     pdf: Option<PdfDocument>,
     zoom: f64,
-    /// Rendered pages keyed by index; cleared on zoom change.
+    /// Rendered pages keyed by index; cleared on zoom or structure change.
     cache: HashMap<usize, cairo::ImageSurface>,
 }
 
@@ -36,6 +39,7 @@ impl Canvas {
             .build();
 
         let state = Rc::new(RefCell::new(State {
+            doc: None,
             pdf: None,
             zoom: 1.0,
             cache: HashMap::new(),
@@ -51,14 +55,20 @@ impl Canvas {
         Self { root, area, state }
     }
 
-    pub fn set_document(&self, pdf: PdfDocument) {
+    pub fn set_open_document(&self, open: OpenDocument) {
         {
             let mut st = self.state.borrow_mut();
-            st.pdf = Some(pdf);
+            st.doc = Some(open.model);
+            st.pdf = open.pdf;
             st.zoom = 1.0;
             st.cache.clear();
         }
         self.update_layout();
+    }
+
+    /// Snapshot of the current document model (for saving).
+    pub fn document(&self) -> Option<Document> {
+        self.state.borrow().doc.clone()
     }
 
     pub fn zoom(&self) -> f64 {
@@ -98,15 +108,15 @@ impl Canvas {
 }
 
 fn content_size(st: &State) -> (f64, f64) {
-    let Some(pdf) = st.pdf.as_ref() else {
+    let Some(doc) = st.doc.as_ref() else {
         return (0.0, 0.0);
     };
     let z = st.zoom;
     let mut total_h = PAGE_GAP;
     let mut max_w = 0.0_f64;
-    for &(w, h) in pdf.page_sizes() {
-        total_h += h * z + PAGE_GAP;
-        max_w = max_w.max(w * z);
+    for page in &doc.pages {
+        total_h += page.height * z + PAGE_GAP;
+        max_w = max_w.max(page.width * z);
     }
     (max_w + 2.0 * PAGE_GAP, total_h)
 }
@@ -116,8 +126,8 @@ fn draw(state: &Rc<RefCell<State>>, ctx: &cairo::Context, width: i32) {
     let _ = ctx.paint();
 
     let mut st = state.borrow_mut();
-    let State { pdf, zoom, cache } = &mut *st;
-    let Some(pdf) = pdf.as_ref() else {
+    let State { doc, pdf, zoom, cache } = &mut *st;
+    let Some(doc) = doc.as_ref() else {
         return;
     };
     let z = *zoom;
@@ -125,17 +135,16 @@ fn draw(state: &Rc<RefCell<State>>, ctx: &cairo::Context, width: i32) {
     let (_x0, cy0, _x1, cy1) = ctx.clip_extents().unwrap_or((0.0, 0.0, f64::MAX, f64::MAX));
 
     let mut y = PAGE_GAP;
-    for i in 0..pdf.n_pages() {
-        let (pw_pt, ph_pt) = pdf.page_size(i);
-        let pw = pw_pt * z;
-        let ph = ph_pt * z;
+    for (i, page) in doc.pages.iter().enumerate() {
+        let pw = page.width * z;
+        let ph = page.height * z;
         let x = ((width as f64) - pw) / 2.0;
 
         // Cull pages outside the visible band.
         if y + ph >= cy0
             && y <= cy1
             && let Some(surface) =
-                page_surface(pdf, cache, i, z, pw.ceil() as i32, ph.ceil() as i32)
+                page_surface(pdf.as_ref(), cache, i, page, z, pw.ceil() as i32, ph.ceil() as i32)
         {
             let _ = ctx.set_source_surface(&surface, x, y);
             let _ = ctx.paint();
@@ -151,9 +160,10 @@ fn draw(state: &Rc<RefCell<State>>, ctx: &cairo::Context, width: i32) {
 }
 
 fn page_surface(
-    pdf: &PdfDocument,
+    pdf: Option<&PdfDocument>,
     cache: &mut HashMap<usize, cairo::ImageSurface>,
     index: usize,
+    page: &Page,
     zoom: f64,
     pw: i32,
     ph: i32,
@@ -168,11 +178,22 @@ fn page_surface(
     let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, pw, ph).ok()?;
     {
         let c = cairo::Context::new(&surface).ok()?;
-        // poppler draws no page background, so lay down white first.
-        c.set_source_rgb(1.0, 1.0, 1.0);
-        let _ = c.paint();
-        c.scale(zoom, zoom);
-        pdf.render_page(index, &c);
+        match &page.kind {
+            PageKind::Pdf { page_index } => {
+                // poppler draws no page background, so lay down white first.
+                c.set_source_rgb(1.0, 1.0, 1.0);
+                let _ = c.paint();
+                if let Some(pdf) = pdf {
+                    c.scale(zoom, zoom);
+                    pdf.render_page(*page_index, &c);
+                }
+            }
+            PageKind::Blank { color } => {
+                let Color { r, g, b, a } = *color;
+                c.set_source_rgba(r, g, b, a);
+                let _ = c.paint();
+            }
+        }
     }
 
     cache.insert(index, surface.clone());

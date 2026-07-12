@@ -1,9 +1,11 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use adw::prelude::*;
 use gtk::gio;
 
-use crate::engine::pdf::PdfDocument;
+use crate::engine::OpenDocument;
+use crate::engine::document::FILE_EXTENSION;
+use crate::engine::storage;
 use crate::ui::canvas::Canvas;
 
 const DEFAULT_WIDTH: i32 = 900;
@@ -18,10 +20,21 @@ pub struct WindowUi {
 }
 
 impl WindowUi {
+    /// Loads a `.pdf` or `.inkpdf` file, dispatched by extension.
     pub fn load_path(&self, path: &Path) {
-        match PdfDocument::open(path) {
-            Ok(pdf) => {
-                self.canvas.set_document(pdf);
+        let is_inkpdf = path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case(FILE_EXTENSION));
+
+        let opened = if is_inkpdf {
+            OpenDocument::from_inkpdf_path(path)
+        } else {
+            OpenDocument::from_pdf_path(path)
+        };
+
+        match opened {
+            Ok(open) => {
+                self.canvas.set_open_document(open);
                 self.stack.set_visible_child_name("canvas");
                 self.title.set_subtitle(&file_label(path));
             }
@@ -38,9 +51,14 @@ pub fn build(app: &adw::Application) -> WindowUi {
 
     let open_button = gtk::Button::builder()
         .icon_name("document-open-symbolic")
-        .tooltip_text("Open PDF")
+        .tooltip_text("Open")
+        .build();
+    let save_button = gtk::Button::builder()
+        .icon_name("document-save-symbolic")
+        .tooltip_text("Save as inkpdf")
         .build();
     header.pack_start(&open_button);
+    header.pack_start(&save_button);
 
     let zoom_out_button = gtk::Button::builder()
         .icon_name("zoom-out-symbolic")
@@ -61,7 +79,7 @@ pub fn build(app: &adw::Application) -> WindowUi {
     let placeholder = adw::StatusPage::builder()
         .icon_name("document-open-symbolic")
         .title("No PDF open")
-        .description("Click Open to load a PDF.")
+        .description("Click Open to load a PDF or inkpdf file.")
         .build();
 
     let stack = gtk::Stack::new();
@@ -97,24 +115,29 @@ pub fn build(app: &adw::Application) -> WindowUi {
     }
     {
         let ui = ui.clone();
-        open_button.connect_clicked(move |_| open_pdf_dialog(&ui));
+        open_button.connect_clicked(move |_| open_dialog(&ui));
+    }
+    {
+        let ui = ui.clone();
+        save_button.connect_clicked(move |_| save_dialog(&ui));
     }
 
     window.present();
     ui
 }
 
-fn open_pdf_dialog(ui: &WindowUi) {
+fn open_dialog(ui: &WindowUi) {
     let filter = gtk::FileFilter::new();
-    filter.set_name(Some("PDF files"));
+    filter.set_name(Some("PDF or inkpdf"));
     filter.add_mime_type("application/pdf");
     filter.add_suffix("pdf");
+    filter.add_suffix(FILE_EXTENSION);
 
     let filters = gio::ListStore::new::<gtk::FileFilter>();
     filters.append(&filter);
 
     let dialog = gtk::FileDialog::builder()
-        .title("Open PDF")
+        .title("Open")
         .filters(&filters)
         .modal(true)
         .build();
@@ -133,9 +156,51 @@ fn open_pdf_dialog(ui: &WindowUi) {
     });
 }
 
+fn save_dialog(ui: &WindowUi) {
+    let Some(model) = ui.canvas.document() else {
+        return;
+    };
+
+    let dialog = gtk::FileDialog::builder()
+        .title("Save as inkpdf")
+        .initial_name(format!("untitled.{FILE_EXTENSION}"))
+        .modal(true)
+        .build();
+
+    let ui = ui.clone();
+    let parent = ui.window.clone();
+    dialog.save(Some(&parent), gio::Cancellable::NONE, move |result| {
+        let file = match result {
+            Ok(file) => file,
+            Err(_) => return,
+        };
+        let Some(path) = file.path() else {
+            show_error(&ui.window, "The file has no local path.");
+            return;
+        };
+        let path = with_extension(path);
+
+        match storage::save(&model, &path) {
+            Ok(()) => ui.title.set_subtitle(&file_label(&path)),
+            Err(err) => show_error(&ui.window, &format!("{err:#}")),
+        }
+    });
+}
+
+/// Ensures the path ends in `.inkpdf`.
+fn with_extension(mut path: PathBuf) -> PathBuf {
+    if path
+        .extension()
+        .is_none_or(|e| !e.eq_ignore_ascii_case(FILE_EXTENSION))
+    {
+        path.set_extension(FILE_EXTENSION);
+    }
+    path
+}
+
 fn show_error(window: &adw::ApplicationWindow, message: &str) {
     let dialog = gtk::AlertDialog::builder()
-        .message("Could not open PDF")
+        .message("Something went wrong")
         .detail(message)
         .modal(true)
         .build();
