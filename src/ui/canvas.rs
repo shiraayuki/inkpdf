@@ -34,9 +34,79 @@ struct TextEdit {
     y: f64,
     size: f64,
     buffer: String,
+    /// Caret position as a byte offset into `buffer` (always on a char boundary).
+    cursor: usize,
     id: Uuid,
     /// The annotation this edit replaces, kept so Escape can restore it.
     original: Option<Annotation>,
+}
+
+impl TextEdit {
+    fn insert(&mut self, ch: char) {
+        self.buffer.insert(self.cursor, ch);
+        self.cursor += ch.len_utf8();
+    }
+
+    fn backspace(&mut self) {
+        if let Some(prev) = self.buffer[..self.cursor].chars().next_back() {
+            let start = self.cursor - prev.len_utf8();
+            self.buffer.replace_range(start..self.cursor, "");
+            self.cursor = start;
+        }
+    }
+
+    fn delete_forward(&mut self) {
+        if let Some(next) = self.buffer[self.cursor..].chars().next() {
+            let end = self.cursor + next.len_utf8();
+            self.buffer.replace_range(self.cursor..end, "");
+        }
+    }
+
+    fn move_left(&mut self) {
+        if let Some(prev) = self.buffer[..self.cursor].chars().next_back() {
+            self.cursor -= prev.len_utf8();
+        }
+    }
+
+    fn move_right(&mut self) {
+        if let Some(next) = self.buffer[self.cursor..].chars().next() {
+            self.cursor += next.len_utf8();
+        }
+    }
+
+    fn move_home(&mut self) {
+        self.cursor = self.buffer[..self.cursor].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    }
+
+    fn move_end(&mut self) {
+        self.cursor += self.buffer[self.cursor..].find('\n').unwrap_or(self.buffer.len() - self.cursor);
+    }
+
+    fn move_up(&mut self) {
+        self.move_line(-1);
+    }
+
+    fn move_down(&mut self) {
+        self.move_line(1);
+    }
+
+    /// Moves the caret one line up/down, keeping the same character column.
+    fn move_line(&mut self, dir: isize) {
+        let ranges = line_ranges(&self.buffer);
+        let cur = ranges.iter().position(|&(s, e)| self.cursor >= s && self.cursor <= e).unwrap_or(0);
+        let col = self.buffer[ranges[cur].0..self.cursor].chars().count();
+
+        let target = cur as isize + dir;
+        if target < 0 || target as usize >= ranges.len() {
+            return;
+        }
+        let (start, end) = ranges[target as usize];
+        let mut byte = start;
+        for ch in self.buffer[start..end].chars().take(col) {
+            byte += ch.len_utf8();
+        }
+        self.cursor = byte;
+    }
 }
 
 /// A text annotation lifted out of the model while being dragged.
@@ -169,9 +239,8 @@ impl Canvas {
             self.commit_editing();
         }
         self.state.borrow_mut().text_mode = on;
-        if on {
-            self.area.grab_focus();
-        }
+        // Note: focus is grabbed on click (placing/editing text), not here, so
+        // toggling the tool does not make the ScrolledWindow jump to the top.
         self.area.queue_draw();
     }
 
@@ -322,10 +391,19 @@ impl Canvas {
 
     fn on_click(&self, n_press: i32, x: f64, y: f64) {
         self.area.grab_focus();
-        let text_mode = self.state.borrow().text_mode;
 
+        // Clicking inside the box being edited just moves the caret.
+        if let Some((page, lx, ly)) = self.page_hit(x, y)
+            && self.click_in_editing(page, lx, ly)
+        {
+            return;
+        }
+
+        // Any other click finishes an active edit.
+        self.commit_editing();
+
+        let text_mode = self.state.borrow().text_mode;
         if text_mode && n_press == 1 {
-            self.commit_editing();
             if let Some((page, index)) = self.annotation_hit(x, y) {
                 self.start_edit_existing(page, index);
             } else if let Some((page, lx, ly)) = self.page_hit(x, y) {
@@ -339,6 +417,29 @@ impl Canvas {
         }
     }
 
+    /// If a box is being edited and (page, lx, ly) lands inside it, moves the caret there.
+    fn click_in_editing(&self, page: usize, lx: f64, ly: f64) -> bool {
+        let cursor = {
+            let st = self.state.borrow();
+            let Some(ed) = st.editing.as_ref() else {
+                return false;
+            };
+            if ed.page != page {
+                return false;
+            }
+            let (w, h) = measure_text(ed.size, &ed.buffer);
+            if lx < ed.x || lx > ed.x + w || ly < ed.y || ly > ed.y + h {
+                return false;
+            }
+            cursor_at(ed.size, &ed.buffer, lx - ed.x, ly - ed.y)
+        };
+        if let Some(ed) = self.state.borrow_mut().editing.as_mut() {
+            ed.cursor = cursor;
+        }
+        self.area.queue_draw();
+        true
+    }
+
     fn start_new_text(&self, page: usize, lx: f64, ly: f64) {
         self.state.borrow_mut().editing = Some(TextEdit {
             page,
@@ -346,6 +447,7 @@ impl Canvas {
             y: ly,
             size: TEXT_SIZE,
             buffer: String::new(),
+            cursor: 0,
             id: Uuid::new_v4(),
             original: None,
         });
@@ -371,10 +473,19 @@ impl Canvas {
         };
         {
             let mut st = self.state.borrow_mut();
-            st.editing = Some(TextEdit { page, x, y, size, buffer: content, id, original: Some(annotation) });
+            let cursor = content.len();
+            st.editing = Some(TextEdit { page, x, y, size, buffer: content, cursor, id, original: Some(annotation) });
             st.cache.remove(&page);
         }
         self.area.grab_focus();
+        self.area.queue_draw();
+    }
+
+    /// Mutates the active edit (if any) and requests a redraw.
+    fn edit_mut(&self, f: impl FnOnce(&mut TextEdit)) {
+        if let Some(ed) = self.state.borrow_mut().editing.as_mut() {
+            f(ed);
+        }
         self.area.queue_draw();
     }
 
@@ -383,40 +494,29 @@ impl Canvas {
             return glib::Propagation::Proceed;
         }
         match keyval {
-            gdk::Key::Escape => {
-                self.cancel_editing();
-                glib::Propagation::Stop
-            }
+            gdk::Key::Escape => self.cancel_editing(),
             // Ctrl+Enter finishes; plain Enter inserts a newline.
             gdk::Key::Return | gdk::Key::KP_Enter => {
                 if state.contains(gdk::ModifierType::CONTROL_MASK) {
                     self.commit_editing();
                 } else {
-                    if let Some(ed) = self.state.borrow_mut().editing.as_mut() {
-                        ed.buffer.push('\n');
-                    }
-                    self.area.queue_draw();
+                    self.edit_mut(|ed| ed.insert('\n'));
                 }
-                glib::Propagation::Stop
             }
-            gdk::Key::BackSpace => {
-                if let Some(ed) = self.state.borrow_mut().editing.as_mut() {
-                    ed.buffer.pop();
-                }
-                self.area.queue_draw();
-                glib::Propagation::Stop
-            }
+            gdk::Key::BackSpace => self.edit_mut(TextEdit::backspace),
+            gdk::Key::Delete | gdk::Key::KP_Delete => self.edit_mut(TextEdit::delete_forward),
+            gdk::Key::Left | gdk::Key::KP_Left => self.edit_mut(TextEdit::move_left),
+            gdk::Key::Right | gdk::Key::KP_Right => self.edit_mut(TextEdit::move_right),
+            gdk::Key::Up | gdk::Key::KP_Up => self.edit_mut(TextEdit::move_up),
+            gdk::Key::Down | gdk::Key::KP_Down => self.edit_mut(TextEdit::move_down),
+            gdk::Key::Home | gdk::Key::KP_Home => self.edit_mut(TextEdit::move_home),
+            gdk::Key::End | gdk::Key::KP_End => self.edit_mut(TextEdit::move_end),
             _ => match keyval.to_unicode() {
-                Some(ch) if !ch.is_control() => {
-                    if let Some(ed) = self.state.borrow_mut().editing.as_mut() {
-                        ed.buffer.push(ch);
-                    }
-                    self.area.queue_draw();
-                    glib::Propagation::Stop
-                }
-                _ => glib::Propagation::Proceed,
+                Some(ch) if !ch.is_control() => self.edit_mut(|ed| ed.insert(ch)),
+                _ => return glib::Propagation::Proceed,
             },
         }
+        glib::Propagation::Stop
     }
 
     fn commit_editing(&self) {
@@ -628,6 +728,48 @@ fn measure_text(size: f64, content: &str) -> (f64, f64) {
     (w, h)
 }
 
+/// Byte ranges of each line (excluding the trailing newline).
+fn line_ranges(s: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    for (i, b) in s.bytes().enumerate() {
+        if b == b'\n' {
+            ranges.push((start, i));
+            start = i + 1;
+        }
+    }
+    ranges.push((start, s.len()));
+    ranges
+}
+
+/// Byte offset in `content` nearest to a point (dx, dy) relative to the box top-left.
+fn cursor_at(size: f64, content: &str, dx: f64, dy: f64) -> usize {
+    let Ok(surface) = cairo::ImageSurface::create(cairo::Format::ARgb32, 1, 1) else {
+        return content.len();
+    };
+    let Ok(c) = cairo::Context::new(&surface) else {
+        return content.len();
+    };
+    c.set_font_size(size);
+    let line_height = c.font_extents().map(|e| e.height()).unwrap_or(size).max(1.0);
+
+    let ranges = line_ranges(content);
+    let line = ((dy / line_height).floor().max(0.0) as usize).min(ranges.len() - 1);
+    let (start, end) = ranges[line];
+
+    let mut byte = start;
+    let mut acc = 0.0;
+    for ch in content[start..end].chars() {
+        let w = c.text_extents(&ch.to_string()).map(|e| e.x_advance()).unwrap_or(0.0);
+        if dx < acc + w / 2.0 {
+            return byte;
+        }
+        acc += w;
+        byte += ch.len_utf8();
+    }
+    byte
+}
+
 fn draw(state: &Rc<RefCell<State>>, ctx: &cairo::Context, width: i32) {
     ctx.set_source_rgb(0.18, 0.18, 0.20);
     let _ = ctx.paint();
@@ -808,12 +950,14 @@ fn stroke_text_box(
 
 fn draw_caret(c: &cairo::Context, ed: &TextEdit, zoom: f64) {
     let (_, _, line_height) = text_metrics(c, ed.size, &ed.buffer);
-    let last_line = ed.buffer.rsplit('\n').next().unwrap_or("");
-    let lines = ed.buffer.split('\n').count().max(1);
-    let last_width = c.text_extents(last_line).map(|e| e.x_advance()).unwrap_or(0.0);
+    // Locate the caret from its byte offset: line index + width of the text before it.
+    let before = &ed.buffer[..ed.cursor];
+    let line = before.matches('\n').count();
+    let line_prefix = before.rsplit('\n').next().unwrap_or("");
+    let prefix_width = c.text_extents(line_prefix).map(|e| e.x_advance()).unwrap_or(0.0);
 
-    let cx = ed.x + last_width;
-    let top = ed.y + (lines as f64 - 1.0) * line_height;
+    let cx = ed.x + prefix_width;
+    let top = ed.y + line as f64 * line_height;
     let (r, g, b, a) = BOX_ACTIVE;
     c.set_source_rgba(r, g, b, a);
     c.set_line_width(1.0 / zoom);
@@ -873,6 +1017,53 @@ mod tests {
         assert_eq!(annotation_at(&page, 101.0, 201.0), Some(0));
         // Far from the box.
         assert_eq!(annotation_at(&page, 10.0, 10.0), None);
+    }
+
+    fn empty_edit() -> TextEdit {
+        TextEdit {
+            page: 0,
+            x: 0.0,
+            y: 0.0,
+            size: TEXT_SIZE,
+            buffer: String::new(),
+            cursor: 0,
+            id: Uuid::new_v4(),
+            original: None,
+        }
+    }
+
+    #[test]
+    fn text_edit_insert_delete_and_navigate() {
+        let mut ed = empty_edit();
+        for ch in "abc".chars() {
+            ed.insert(ch);
+        }
+        assert_eq!((ed.buffer.as_str(), ed.cursor), ("abc", 3));
+
+        ed.move_left();
+        ed.insert('X');
+        assert_eq!((ed.buffer.as_str(), ed.cursor), ("abXc", 3));
+
+        ed.backspace();
+        assert_eq!((ed.buffer.as_str(), ed.cursor), ("abc", 2));
+
+        ed.move_home();
+        assert_eq!(ed.cursor, 0);
+        ed.move_end();
+        assert_eq!(ed.cursor, 3);
+        ed.delete_forward(); // at end -> no-op
+        assert_eq!(ed.buffer, "abc");
+    }
+
+    #[test]
+    fn text_edit_vertical_keeps_column() {
+        let mut ed = empty_edit();
+        ed.buffer = "ab\ncd".into();
+        ed.cursor = 5; // end of "cd"
+        ed.move_up();
+        assert_eq!(ed.cursor, 2); // column 2 on line "ab"
+        ed.move_down();
+        assert_eq!(ed.cursor, 5); // back to end of "cd"
     }
 
     #[test]
