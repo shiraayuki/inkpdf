@@ -12,8 +12,7 @@ use crate::ui::canvas::{Canvas, Relative, Tool};
 
 const DEFAULT_WIDTH: i32 = 900;
 const DEFAULT_HEIGHT: i32 = 700;
-/// Shared width of the floating side panels (tool strip and details).
-const PANEL_WIDTH: i32 = 46;
+/// Side of the square color swatch in the details panel.
 const SWATCH: i32 = 30;
 
 #[derive(Clone)]
@@ -139,6 +138,14 @@ pub fn build(app: &adw::Application) -> WindowUi {
     tool_strip.set_valign(gtk::Align::Center);
     tool_strip.set_margin_end(12);
     overlay.add_overlay(&tool_strip);
+
+    // Give both side panels the same width (the wider one, i.e. the details
+    // panel whose color swatch sets its minimum width).
+    let panel_group = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
+    panel_group.add_widget(&details);
+    panel_group.add_widget(&tool_strip);
+    // Keep the group alive for the app's lifetime (widgets don't own it).
+    std::mem::forget(panel_group);
 
     let placeholder = adw::StatusPage::builder()
         .icon_name("document-open-symbolic")
@@ -326,7 +333,6 @@ fn file_label(path: &Path) -> String {
 fn build_tool_strip(canvas: &Canvas, details: &gtk::Stack) -> gtk::Box {
     let strip = gtk::Box::new(gtk::Orientation::Vertical, 4);
     strip.add_css_class("inkpdf-panel");
-    strip.set_width_request(PANEL_WIDTH);
 
     let tools: [(&str, &str, Tool, &str); 5] = [
         ("inkpdf-pen-symbolic", "Pen", Tool::Pen, "pen"),
@@ -388,7 +394,6 @@ fn build_tool_strip(canvas: &Canvas, details: &gtk::Stack) -> gtk::Box {
 fn build_details_panel() -> gtk::Stack {
     let stack = gtk::Stack::new();
     stack.add_css_class("inkpdf-panel");
-    stack.set_width_request(PANEL_WIDTH);
     // Size to the visible page (not the largest), so height reflects its elements.
     stack.set_hhomogeneous(false);
     stack.set_vhomogeneous(false);
