@@ -24,13 +24,30 @@ pub enum PageKind {
     Blank { color: Color },
 }
 
+/// A run of text sharing one color.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct TextRun {
+    pub text: String,
+    pub color: Color,
+}
+
+/// A text box: `runs` hold colored spans (so different passages can be colored).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct TextAnnotation {
     pub x: f64,
     pub y: f64,
-    pub content: String,
     pub size: f64,
-    pub color: Color,
+    pub runs: Vec<TextRun>,
+}
+
+impl TextAnnotation {
+    /// The characters with their colors, flattened across runs.
+    pub fn glyphs(&self) -> Vec<(char, Color)> {
+        self.runs
+            .iter()
+            .flat_map(|run| run.text.chars().map(|ch| (ch, run.color)))
+            .collect()
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

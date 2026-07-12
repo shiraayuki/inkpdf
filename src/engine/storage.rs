@@ -49,9 +49,11 @@ mod tests {
                         kind: AnnotationKind::Text(TextAnnotation {
                             x: 12.5,
                             y: 33.0,
-                            content: "Hällo Ümlaut".into(),
                             size: 14.0,
-                            color: Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+                            runs: vec![TextRun {
+                                text: "Hällo Ümlaut".into(),
+                                color: Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+                            }],
                         }),
                     }],
                 },

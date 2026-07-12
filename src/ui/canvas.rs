@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::engine::OpenDocument;
 use crate::engine::document::{
-    A4, Annotation, AnnotationKind, Color, Document, Page, PageKind, TextAnnotation,
+    A4, Annotation, AnnotationKind, Color, Document, Page, PageKind, TextAnnotation, TextRun,
 };
 use crate::engine::pdf::PdfDocument;
 
@@ -26,6 +26,14 @@ const DRAG_THRESHOLD_SQ: f64 = 9.0;
 // Bounding-box colors (r, g, b, a).
 const BOX_ACTIVE: (f64, f64, f64, f64) = (0.20, 0.51, 0.92, 1.0);
 const BOX_ANNOTATION: (f64, f64, f64, f64) = (0.55, 0.55, 0.60, 0.9);
+const SELECTION_FILL: (f64, f64, f64, f64) = (0.20, 0.51, 0.92, 0.30);
+
+/// A single character with its own color.
+#[derive(Clone, Copy)]
+struct Glyph {
+    ch: char,
+    color: Color,
+}
 
 /// A text box currently being typed. `x`/`y` are the top-left anchor in page points.
 struct TextEdit {
@@ -33,80 +41,169 @@ struct TextEdit {
     x: f64,
     y: f64,
     size: f64,
-    color: Color,
-    buffer: String,
-    /// Caret position as a byte offset into `buffer` (always on a char boundary).
+    glyphs: Vec<Glyph>,
+    /// Caret position as a glyph (character) index.
     cursor: usize,
+    /// Selection anchor (glyph index); the selection spans anchor..cursor.
+    anchor: Option<usize>,
     id: Uuid,
     /// The annotation this edit replaces, kept so Escape can restore it.
     original: Option<Annotation>,
 }
 
 impl TextEdit {
-    fn insert(&mut self, ch: char) {
-        self.buffer.insert(self.cursor, ch);
-        self.cursor += ch.len_utf8();
+    /// The selected glyph range, if any (non-empty).
+    fn selection(&self) -> Option<(usize, usize)> {
+        self.anchor
+            .map(|a| (a.min(self.cursor), a.max(self.cursor)))
+            .filter(|(s, e)| s != e)
+    }
+
+    fn delete_selection(&mut self) -> bool {
+        if let Some((s, e)) = self.selection() {
+            self.glyphs.drain(s..e);
+            self.cursor = s;
+            self.anchor = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn insert(&mut self, ch: char, color: Color) {
+        self.delete_selection();
+        self.glyphs.insert(self.cursor, Glyph { ch, color });
+        self.cursor += 1;
+        self.anchor = None;
     }
 
     fn backspace(&mut self) {
-        if let Some(prev) = self.buffer[..self.cursor].chars().next_back() {
-            let start = self.cursor - prev.len_utf8();
-            self.buffer.replace_range(start..self.cursor, "");
-            self.cursor = start;
+        if self.delete_selection() {
+            return;
+        }
+        if self.cursor > 0 {
+            self.glyphs.remove(self.cursor - 1);
+            self.cursor -= 1;
         }
     }
 
     fn delete_forward(&mut self) {
-        if let Some(next) = self.buffer[self.cursor..].chars().next() {
-            let end = self.cursor + next.len_utf8();
-            self.buffer.replace_range(self.cursor..end, "");
+        if self.delete_selection() {
+            return;
+        }
+        if self.cursor < self.glyphs.len() {
+            self.glyphs.remove(self.cursor);
         }
     }
 
-    fn move_left(&mut self) {
-        if let Some(prev) = self.buffer[..self.cursor].chars().next_back() {
-            self.cursor -= prev.len_utf8();
+    fn set_cursor(&mut self, pos: usize, extend: bool) {
+        if extend {
+            if self.anchor.is_none() {
+                self.anchor = Some(self.cursor);
+            }
+        } else {
+            self.anchor = None;
         }
+        self.cursor = pos.min(self.glyphs.len());
     }
 
-    fn move_right(&mut self) {
-        if let Some(next) = self.buffer[self.cursor..].chars().next() {
-            self.cursor += next.len_utf8();
+    fn line_start(&self, pos: usize) -> usize {
+        let mut i = pos;
+        while i > 0 && self.glyphs[i - 1].ch != '\n' {
+            i -= 1;
         }
+        i
     }
 
-    fn move_home(&mut self) {
-        self.cursor = self.buffer[..self.cursor].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    fn line_end(&self, pos: usize) -> usize {
+        let mut i = pos;
+        while i < self.glyphs.len() && self.glyphs[i].ch != '\n' {
+            i += 1;
+        }
+        i
     }
 
-    fn move_end(&mut self) {
-        self.cursor += self.buffer[self.cursor..].find('\n').unwrap_or(self.buffer.len() - self.cursor);
+    fn move_left(&mut self, extend: bool) {
+        let p = self.cursor.saturating_sub(1);
+        self.set_cursor(p, extend);
     }
 
-    fn move_up(&mut self) {
-        self.move_line(-1);
+    fn move_right(&mut self, extend: bool) {
+        let p = (self.cursor + 1).min(self.glyphs.len());
+        self.set_cursor(p, extend);
     }
 
-    fn move_down(&mut self) {
-        self.move_line(1);
+    fn move_home(&mut self, extend: bool) {
+        let p = self.line_start(self.cursor);
+        self.set_cursor(p, extend);
+    }
+
+    fn move_end(&mut self, extend: bool) {
+        let p = self.line_end(self.cursor);
+        self.set_cursor(p, extend);
+    }
+
+    fn move_up(&mut self, extend: bool) {
+        self.move_line(-1, extend);
+    }
+
+    fn move_down(&mut self, extend: bool) {
+        self.move_line(1, extend);
     }
 
     /// Moves the caret one line up/down, keeping the same character column.
-    fn move_line(&mut self, dir: isize) {
-        let ranges = line_ranges(&self.buffer);
-        let cur = ranges.iter().position(|&(s, e)| self.cursor >= s && self.cursor <= e).unwrap_or(0);
-        let col = self.buffer[ranges[cur].0..self.cursor].chars().count();
+    fn move_line(&mut self, dir: isize, extend: bool) {
+        let start = self.line_start(self.cursor);
+        let col = self.cursor - start;
+        if dir < 0 {
+            if start == 0 {
+                return;
+            }
+            let prev_start = self.line_start(start - 1);
+            let prev_end = start - 1; // the '\n' ending the previous line
+            self.set_cursor((prev_start + col).min(prev_end), extend);
+        } else {
+            let end = self.line_end(self.cursor);
+            if end >= self.glyphs.len() {
+                return;
+            }
+            let next_start = end + 1;
+            let next_end = self.line_end(next_start);
+            self.set_cursor((next_start + col).min(next_end), extend);
+        }
+    }
 
-        let target = cur as isize + dir;
-        if target < 0 || target as usize >= ranges.len() {
-            return;
+    fn select_all(&mut self) {
+        self.anchor = Some(0);
+        self.cursor = self.glyphs.len();
+    }
+
+    /// Applies a color to the selected glyphs; returns whether anything was colored.
+    fn color_selection(&mut self, color: Color) -> bool {
+        if let Some((s, e)) = self.selection() {
+            for g in &mut self.glyphs[s..e] {
+                g.color = color;
+            }
+            true
+        } else {
+            false
         }
-        let (start, end) = ranges[target as usize];
-        let mut byte = start;
-        for ch in self.buffer[start..end].chars().take(col) {
-            byte += ch.len_utf8();
+    }
+
+    /// Merges consecutive same-color glyphs into runs for storage.
+    fn to_runs(&self) -> Vec<TextRun> {
+        let mut runs: Vec<TextRun> = Vec::new();
+        for g in &self.glyphs {
+            match runs.last_mut() {
+                Some(last) if last.color == g.color => last.text.push(g.ch),
+                _ => runs.push(TextRun { text: g.ch.to_string(), color: g.color }),
+            }
         }
-        self.cursor = byte;
+        runs
+    }
+
+    fn is_blank(&self) -> bool {
+        self.glyphs.iter().all(|g| g.ch.is_whitespace())
     }
 }
 
@@ -136,14 +233,16 @@ struct State {
     editing: Option<TextEdit>,
     /// Page nearest the viewport center; gets the red frame and anchors insert/delete.
     current: usize,
-    /// Candidate for a drag: (page, annotation index, orig x, orig y) recorded on press.
+    /// Candidate for a box drag: (page, annotation index, orig x, orig y).
     drag_start: Option<(usize, usize, f64, f64)>,
     dragging: Option<DragState>,
+    /// Widget-space start point while drag-selecting text inside the edited box.
+    text_drag: Option<(f64, f64)>,
     /// Currently selected text box (page, annotation id) in move/select mode.
     selected: Option<(usize, Uuid)>,
-    /// Font size used for new text boxes (and the one being edited).
+    /// Font size for new text boxes (and the one being edited).
     text_size: f64,
-    /// Font color used for new text boxes (and the one being edited).
+    /// Font color for new text / new typing (and for coloring a selection).
     text_color: Color,
 }
 
@@ -197,6 +296,7 @@ impl Canvas {
             current: 0,
             drag_start: None,
             dragging: None,
+            text_drag: None,
             selected: None,
             text_size: TEXT_SIZE,
             text_color: TEXT_COLOR,
@@ -255,6 +355,7 @@ impl Canvas {
             st.editing = None;
             st.drag_start = None;
             st.dragging = None;
+            st.text_drag = None;
             st.selected = None;
             st.doc = Some(open.model);
             st.pdf = open.pdf;
@@ -275,8 +376,8 @@ impl Canvas {
             self.commit_editing();
         }
         self.state.borrow_mut().text_mode = on;
-        // Note: focus is grabbed on click (placing/editing text), not here, so
-        // toggling the tool does not make the ScrolledWindow jump to the top.
+        // Focus is grabbed on click (placing/editing text), not here, so toggling
+        // the tool does not make the ScrolledWindow jump to the top.
         self.area.queue_draw();
     }
 
@@ -297,13 +398,14 @@ impl Canvas {
         self.area.queue_draw();
     }
 
-    /// Sets the font color for new text boxes and the one currently being edited.
+    /// Sets the font color. While editing: colors the selection if there is one,
+    /// otherwise this becomes the color for newly typed characters.
     pub fn set_text_color(&self, color: Color) {
         {
             let mut st = self.state.borrow_mut();
             st.text_color = color;
             if let Some(ed) = st.editing.as_mut() {
-                ed.color = color;
+                ed.color_selection(color);
             }
         }
         self.area.queue_draw();
@@ -472,19 +574,16 @@ impl Canvas {
         let hit = self.annotation_hit(x, y);
 
         if text_mode {
-            // Text tool: click a box to edit it, or empty space to start a new one.
             if let Some((page, index)) = hit {
                 self.start_edit_existing(page, index);
             } else if let Some((page, lx, ly)) = self.page_hit(x, y) {
                 self.start_new_text(page, lx, ly);
             }
         } else if n_press == 2 {
-            // Move/select mode: double-click edits.
             if let Some((page, index)) = hit {
                 self.start_edit_existing(page, index);
             }
         } else {
-            // Move/select mode: single click selects a box or clears the selection.
             let selected = hit.and_then(|(page, index)| self.annotation_id(page, index).map(|id| (page, id)));
             self.set_selected(selected);
         }
@@ -526,14 +625,14 @@ impl Canvas {
             if ed.page != page {
                 return false;
             }
-            let (w, h) = measure_text(ed.size, &ed.buffer);
+            let (w, h) = measure_glyphs(ed.size, &ed.glyphs);
             if lx < ed.x || lx > ed.x + w || ly < ed.y || ly > ed.y + h {
                 return false;
             }
-            cursor_at(ed.size, &ed.buffer, lx - ed.x, ly - ed.y)
+            cursor_at(ed.size, &ed.glyphs, lx - ed.x, ly - ed.y)
         };
         if let Some(ed) = self.state.borrow_mut().editing.as_mut() {
-            ed.cursor = cursor;
+            ed.set_cursor(cursor, false);
         }
         self.area.queue_draw();
         true
@@ -544,15 +643,14 @@ impl Canvas {
             let mut st = self.state.borrow_mut();
             st.selected = None;
             let size = st.text_size;
-            let color = st.text_color;
             st.editing = Some(TextEdit {
                 page,
                 x: lx,
                 y: ly,
                 size,
-                color,
-                buffer: String::new(),
+                glyphs: Vec::new(),
                 cursor: 0,
+                anchor: None,
                 id: Uuid::new_v4(),
                 original: None,
             });
@@ -574,15 +672,24 @@ impl Canvas {
         let Some(annotation) = removed else {
             return;
         };
-        let (x, y, size, color, content, id) = match &annotation.kind {
-            AnnotationKind::Text(t) => (t.x, t.y, t.size, t.color, t.content.clone(), annotation.id),
+        let (x, y, size, glyphs, id) = match &annotation.kind {
+            AnnotationKind::Text(t) => (t.x, t.y, t.size, ann_glyphs(t), annotation.id),
         };
         {
             let mut st = self.state.borrow_mut();
-            let cursor = content.len();
+            let cursor = glyphs.len();
             st.selected = None;
-            st.editing =
-                Some(TextEdit { page, x, y, size, color, buffer: content, cursor, id, original: Some(annotation) });
+            st.editing = Some(TextEdit {
+                page,
+                x,
+                y,
+                size,
+                glyphs,
+                cursor,
+                anchor: None,
+                id,
+                original: Some(annotation),
+            });
             st.cache.remove(&page);
         }
         self.area.grab_focus();
@@ -608,26 +715,34 @@ impl Canvas {
             }
             return glib::Propagation::Proceed;
         }
+
+        let extend = state.contains(gdk::ModifierType::SHIFT_MASK);
+        let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
+
         match keyval {
             gdk::Key::Escape => self.cancel_editing(),
-            // Ctrl+Enter finishes; plain Enter inserts a newline.
             gdk::Key::Return | gdk::Key::KP_Enter => {
-                if state.contains(gdk::ModifierType::CONTROL_MASK) {
+                if ctrl {
                     self.commit_editing();
                 } else {
-                    self.edit_mut(|ed| ed.insert('\n'));
+                    let color = self.state.borrow().text_color;
+                    self.edit_mut(move |ed| ed.insert('\n', color));
                 }
             }
             gdk::Key::BackSpace => self.edit_mut(TextEdit::backspace),
             gdk::Key::Delete | gdk::Key::KP_Delete => self.edit_mut(TextEdit::delete_forward),
-            gdk::Key::Left | gdk::Key::KP_Left => self.edit_mut(TextEdit::move_left),
-            gdk::Key::Right | gdk::Key::KP_Right => self.edit_mut(TextEdit::move_right),
-            gdk::Key::Up | gdk::Key::KP_Up => self.edit_mut(TextEdit::move_up),
-            gdk::Key::Down | gdk::Key::KP_Down => self.edit_mut(TextEdit::move_down),
-            gdk::Key::Home | gdk::Key::KP_Home => self.edit_mut(TextEdit::move_home),
-            gdk::Key::End | gdk::Key::KP_End => self.edit_mut(TextEdit::move_end),
+            gdk::Key::Left | gdk::Key::KP_Left => self.edit_mut(move |ed| ed.move_left(extend)),
+            gdk::Key::Right | gdk::Key::KP_Right => self.edit_mut(move |ed| ed.move_right(extend)),
+            gdk::Key::Up | gdk::Key::KP_Up => self.edit_mut(move |ed| ed.move_up(extend)),
+            gdk::Key::Down | gdk::Key::KP_Down => self.edit_mut(move |ed| ed.move_down(extend)),
+            gdk::Key::Home | gdk::Key::KP_Home => self.edit_mut(move |ed| ed.move_home(extend)),
+            gdk::Key::End | gdk::Key::KP_End => self.edit_mut(move |ed| ed.move_end(extend)),
+            gdk::Key::a | gdk::Key::A if ctrl => self.edit_mut(TextEdit::select_all),
             _ => match keyval.to_unicode() {
-                Some(ch) if !ch.is_control() => self.edit_mut(|ed| ed.insert(ch)),
+                Some(ch) if !ch.is_control() => {
+                    let color = self.state.borrow().text_color;
+                    self.edit_mut(move |ed| ed.insert(ch, color));
+                }
                 _ => return glib::Propagation::Proceed,
             },
         }
@@ -642,7 +757,7 @@ impl Canvas {
         {
             let mut st = self.state.borrow_mut();
             // Non-empty text is (re)added; clearing an existing box deletes it.
-            if !ed.buffer.trim().is_empty()
+            if !ed.is_blank()
                 && let Some(page) = st.doc.as_mut().and_then(|d| d.pages.get_mut(ed.page))
             {
                 page.annotations.push(Annotation {
@@ -650,9 +765,8 @@ impl Canvas {
                     kind: AnnotationKind::Text(TextAnnotation {
                         x: ed.x,
                         y: ed.y,
-                        content: ed.buffer,
                         size: ed.size,
-                        color: ed.color,
+                        runs: ed.to_runs(),
                     }),
                 });
             }
@@ -677,9 +791,39 @@ impl Canvas {
 
     fn on_drag_begin(&self, x: f64, y: f64) {
         self.state.borrow_mut().drag_start = None;
+
         if self.state.borrow().text_mode {
-            return; // moving is only possible without a tool
+            // In text mode a drag inside the edited box selects text.
+            if let Some((page, lx, ly)) = self.page_hit(x, y) {
+                let pos = {
+                    let st = self.state.borrow();
+                    match st.editing.as_ref() {
+                        Some(ed) if ed.page == page => {
+                            let (w, h) = measure_glyphs(ed.size, &ed.glyphs);
+                            if lx >= ed.x && lx <= ed.x + w && ly >= ed.y && ly <= ed.y + h {
+                                Some(cursor_at(ed.size, &ed.glyphs, lx - ed.x, ly - ed.y))
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some(pos) = pos {
+                    let mut st = self.state.borrow_mut();
+                    if let Some(ed) = st.editing.as_mut() {
+                        ed.cursor = pos;
+                        ed.anchor = Some(pos);
+                    }
+                    st.text_drag = Some((x, y));
+                    drop(st);
+                    self.area.queue_draw();
+                }
+            }
+            return;
         }
+
+        // Otherwise a drag on a box grabs it for moving.
         if let Some((page, index)) = self.annotation_hit(x, y) {
             let info = {
                 let st = self.state.borrow();
@@ -702,11 +846,24 @@ impl Canvas {
     }
 
     fn on_drag_update(&self, offset_x: f64, offset_y: f64) {
-        if self.state.borrow().editing.is_some() {
+        // Text drag-select: extend the selection to the current point.
+        let text_drag = self.state.borrow().text_drag;
+        if let Some((sx, sy)) = text_drag {
+            if let Some((page, lx, ly)) = self.page_hit(sx + offset_x, sy + offset_y) {
+                let mut st = self.state.borrow_mut();
+                if let Some(ed) = st.editing.as_mut()
+                    && ed.page == page
+                {
+                    let pos = cursor_at(ed.size, &ed.glyphs, lx - ed.x, ly - ed.y);
+                    ed.cursor = pos;
+                }
+                drop(st);
+                self.area.queue_draw();
+            }
             return;
         }
-        let zoom = self.state.borrow().zoom;
 
+        let zoom = self.state.borrow().zoom;
         let should_lift = {
             let st = self.state.borrow();
             st.dragging.is_none()
@@ -728,7 +885,7 @@ impl Canvas {
             match &mut ds.annotation.kind {
                 AnnotationKind::Text(t) => {
                     // Keep the whole box on the page so it can't slip behind it.
-                    let (bw, bh) = measure_text(t.size, &t.content);
+                    let (bw, bh) = measure_glyphs(t.size, &ann_glyphs(t));
                     t.x = (ds.orig_x + offset_x / zoom).clamp(0.0, (pw - bw).max(0.0));
                     t.y = (ds.orig_y + offset_y / zoom).clamp(0.0, (ph - bh).max(0.0));
                 }
@@ -757,11 +914,15 @@ impl Canvas {
     }
 
     fn on_drag_end(&self) {
-        let dragging = {
+        let (dragging, was_text_drag) = {
             let mut st = self.state.borrow_mut();
             st.drag_start = None;
-            st.dragging.take()
+            let text_drag = st.text_drag.take().is_some();
+            (st.dragging.take(), text_drag)
         };
+        if was_text_drag {
+            return;
+        }
         if let Some(ds) = dragging {
             let page_index = ds.page;
             let id = ds.annotation.id;
@@ -822,7 +983,7 @@ fn annotation_at(page: &Page, lx: f64, ly: f64) -> Option<usize> {
     for (i, annotation) in page.annotations.iter().enumerate().rev() {
         match &annotation.kind {
             AnnotationKind::Text(t) => {
-                let (w, h) = measure_text(t.size, &t.content);
+                let (w, h) = measure_glyphs(t.size, &ann_glyphs(t));
                 if lx >= t.x && lx <= t.x + w && ly >= t.y && ly <= t.y + h {
                     return Some(i);
                 }
@@ -832,72 +993,87 @@ fn annotation_at(page: &Page, lx: f64, ly: f64) -> Option<usize> {
     None
 }
 
-/// Box (width, height) and line height in points, honoring newlines.
-fn text_metrics(c: &cairo::Context, size: f64, content: &str) -> (f64, f64, f64) {
-    c.set_font_size(size);
-    let line_height = c.font_extents().map(|e| e.height()).unwrap_or(size);
-    let mut width = 0.0_f64;
-    let mut lines = 0usize;
-    for line in content.split('\n') {
-        let w = c.text_extents(line).map(|e| e.x_advance()).unwrap_or(0.0);
-        width = width.max(w);
-        lines += 1;
-    }
-    (width.max(MIN_BOX_WIDTH), line_height * lines.max(1) as f64, line_height)
+fn ann_glyphs(t: &TextAnnotation) -> Vec<Glyph> {
+    t.glyphs().into_iter().map(|(ch, color)| Glyph { ch, color }).collect()
 }
 
-/// Measures a text box (width, height) in points using a scratch context.
-fn measure_text(size: f64, content: &str) -> (f64, f64) {
-    let Ok(surface) = cairo::ImageSurface::create(cairo::Format::ARgb32, 1, 1) else {
-        return (MIN_BOX_WIDTH, size);
-    };
-    let Ok(c) = cairo::Context::new(&surface) else {
-        return (MIN_BOX_WIDTH, size);
-    };
-    let (w, h, _) = text_metrics(&c, size, content);
-    (w, h)
+/// Per-caret x positions and line indices for a glyph run (index 0..=len).
+struct TextLayout {
+    positions: Vec<(f64, usize)>,
+    line_height: f64,
+    max_width: f64,
+    line_count: usize,
 }
 
-/// Byte ranges of each line (excluding the trailing newline).
-fn line_ranges(s: &str) -> Vec<(usize, usize)> {
-    let mut ranges = Vec::new();
-    let mut start = 0;
-    for (i, b) in s.bytes().enumerate() {
-        if b == b'\n' {
-            ranges.push((start, i));
-            start = i + 1;
-        }
-    }
-    ranges.push((start, s.len()));
-    ranges
-}
-
-/// Byte offset in `content` nearest to a point (dx, dy) relative to the box top-left.
-fn cursor_at(size: f64, content: &str, dx: f64, dy: f64) -> usize {
-    let Ok(surface) = cairo::ImageSurface::create(cairo::Format::ARgb32, 1, 1) else {
-        return content.len();
-    };
-    let Ok(c) = cairo::Context::new(&surface) else {
-        return content.len();
-    };
+fn layout(c: &cairo::Context, size: f64, glyphs: &[Glyph]) -> TextLayout {
     c.set_font_size(size);
     let line_height = c.font_extents().map(|e| e.height()).unwrap_or(size).max(1.0);
-
-    let ranges = line_ranges(content);
-    let line = ((dy / line_height).floor().max(0.0) as usize).min(ranges.len() - 1);
-    let (start, end) = ranges[line];
-
-    let mut byte = start;
-    let mut acc = 0.0;
-    for ch in content[start..end].chars() {
-        let w = c.text_extents(&ch.to_string()).map(|e| e.x_advance()).unwrap_or(0.0);
-        if dx < acc + w / 2.0 {
-            return byte;
+    let mut positions = Vec::with_capacity(glyphs.len() + 1);
+    let mut x = 0.0_f64;
+    let mut line = 0usize;
+    let mut max_width = 0.0_f64;
+    positions.push((0.0, 0));
+    for g in glyphs {
+        if g.ch == '\n' {
+            max_width = max_width.max(x);
+            line += 1;
+            x = 0.0;
+        } else {
+            let adv = c.text_extents(&g.ch.to_string()).map(|e| e.x_advance()).unwrap_or(0.0);
+            x += adv;
+            max_width = max_width.max(x);
         }
-        acc += w;
-        byte += ch.len_utf8();
+        positions.push((x, line));
     }
-    byte
+    TextLayout { positions, line_height, max_width, line_count: line + 1 }
+}
+
+fn with_scratch<R>(f: impl FnOnce(&cairo::Context) -> R, fallback: R) -> R {
+    let Ok(surface) = cairo::ImageSurface::create(cairo::Format::ARgb32, 1, 1) else {
+        return fallback;
+    };
+    let Ok(c) = cairo::Context::new(&surface) else {
+        return fallback;
+    };
+    f(&c)
+}
+
+/// Box (width, height) in points for a glyph run, honoring newlines.
+fn measure_glyphs(size: f64, glyphs: &[Glyph]) -> (f64, f64) {
+    with_scratch(
+        |c| {
+            let l = layout(c, size, glyphs);
+            (l.max_width.max(MIN_BOX_WIDTH), l.line_height * l.line_count as f64)
+        },
+        (MIN_BOX_WIDTH, size),
+    )
+}
+
+/// Glyph index nearest to a point (dx, dy) relative to the box top-left.
+fn cursor_at(size: f64, glyphs: &[Glyph], dx: f64, dy: f64) -> usize {
+    with_scratch(
+        |c| {
+            let l = layout(c, size, glyphs);
+            let target = ((dy / l.line_height).floor().max(0.0) as usize).min(l.line_count.saturating_sub(1));
+            let mut best = 0usize;
+            let mut best_dist = f64::MAX;
+            let mut seen = false;
+            for (i, &(x, line)) in l.positions.iter().enumerate() {
+                if line == target {
+                    let dist = (x - dx).abs();
+                    if dist < best_dist {
+                        best_dist = dist;
+                        best = i;
+                    }
+                    seen = true;
+                } else if seen {
+                    break;
+                }
+            }
+            best
+        },
+        glyphs.len(),
+    )
 }
 
 fn draw(state: &Rc<RefCell<State>>, ctx: &cairo::Context, width: i32) {
@@ -927,7 +1103,6 @@ fn draw(state: &Rc<RefCell<State>>, ctx: &cairo::Context, width: i32) {
         let ph = page.height * z;
         let x = ((width as f64) - pw) / 2.0;
 
-        // Cull pages outside the visible band.
         if y + ph >= cy0
             && y <= cy1
             && let Some(surface) =
@@ -946,7 +1121,6 @@ fn draw(state: &Rc<RefCell<State>>, ctx: &cairo::Context, width: i32) {
             }
             let _ = ctx.stroke();
 
-            // Overlay (boxes, in-progress text, dragged box) in page-point space.
             let _ = ctx.save();
             ctx.translate(x, y);
             ctx.scale(z, z);
@@ -996,7 +1170,7 @@ fn page_surface(
         }
         for annotation in &page.annotations {
             match &annotation.kind {
-                AnnotationKind::Text(text) => draw_text(&c, text),
+                AnnotationKind::Text(t) => draw_glyphs(&c, t.x, t.y, t.size, &ann_glyphs(t)),
             }
         }
     }
@@ -1005,19 +1179,23 @@ fn page_surface(
     Some(surface)
 }
 
-/// Draws a text annotation; the context must be in page-point space.
-fn draw_text(c: &cairo::Context, text: &TextAnnotation) {
-    let Color { r, g, b, a } = text.color;
-    c.set_source_rgba(r, g, b, a);
-    c.set_font_size(text.size);
+/// Draws glyphs (each with its own color), honoring newlines. Context in page-point space.
+fn draw_glyphs(c: &cairo::Context, x: f64, y: f64, size: f64, glyphs: &[Glyph]) {
+    c.set_font_size(size);
     let Ok(fe) = c.font_extents() else {
         return;
     };
-    let mut baseline = text.y + fe.ascent();
-    for line in text.content.split('\n') {
-        c.move_to(text.x, baseline);
-        let _ = c.show_text(line);
-        baseline += fe.height();
+    let mut baseline = y + fe.ascent();
+    c.move_to(x, baseline);
+    for g in glyphs {
+        if g.ch == '\n' {
+            baseline += fe.height();
+            c.move_to(x, baseline);
+            continue;
+        }
+        let Color { r, g: gg, b, a } = g.color;
+        c.set_source_rgba(r, gg, b, a);
+        let _ = c.show_text(&g.ch.to_string());
     }
 }
 
@@ -1025,22 +1203,22 @@ fn draw_overlay(c: &cairo::Context, page: &Page, index: usize, zoom: f64, overla
     if overlay.text_mode {
         for annotation in &page.annotations {
             match &annotation.kind {
-                AnnotationKind::Text(text) => {
-                    stroke_text_box(c, text.x, text.y, text.size, &text.content, zoom, BOX_ANNOTATION);
+                AnnotationKind::Text(t) => {
+                    let (w, h) = measure_glyphs(t.size, &ann_glyphs(t));
+                    stroke_box(c, t.x, t.y, w, h, zoom, BOX_ANNOTATION);
                 }
             }
         }
     }
 
-    // Selection highlight (move/select mode).
     if let Some((sel_page, id)) = overlay.selected
         && sel_page == index
         && let Some(annotation) = page.annotations.iter().find(|a| a.id == id)
     {
         match &annotation.kind {
-            AnnotationKind::Text(text) => {
-                let (w, h, _) = text_metrics(c, text.size, &text.content);
-                stroke_selection(c, text.x, text.y, w, h, zoom);
+            AnnotationKind::Text(t) => {
+                let (w, h) = measure_glyphs(t.size, &ann_glyphs(t));
+                stroke_selection_handles(c, t.x, t.y, w, h, zoom);
             }
         }
     }
@@ -1048,50 +1226,55 @@ fn draw_overlay(c: &cairo::Context, page: &Page, index: usize, zoom: f64, overla
     if let Some(ed) = overlay.editing
         && ed.page == index
     {
-        let preview = TextAnnotation {
-            x: ed.x,
-            y: ed.y,
-            content: ed.buffer.clone(),
-            size: ed.size,
-            color: ed.color,
-        };
-        draw_text(c, &preview);
-        stroke_text_box(c, ed.x, ed.y, ed.size, &ed.buffer, zoom, BOX_ACTIVE);
-        draw_caret(c, ed, zoom);
+        let l = layout(c, ed.size, &ed.glyphs);
+
+        // Highlight the selected characters.
+        if let Some((s, e)) = ed.selection() {
+            let (r, g, b, a) = SELECTION_FILL;
+            c.set_source_rgba(r, g, b, a);
+            for i in s..e {
+                if ed.glyphs[i].ch == '\n' {
+                    continue;
+                }
+                let (x0, line) = l.positions[i];
+                let (x1, _) = l.positions[i + 1];
+                let top = line as f64 * l.line_height;
+                c.rectangle(ed.x + x0, ed.y + top, x1 - x0, l.line_height);
+            }
+            let _ = c.fill();
+        }
+
+        draw_glyphs(c, ed.x, ed.y, ed.size, &ed.glyphs);
+
+        let (bw, bh) = measure_glyphs(ed.size, &ed.glyphs);
+        stroke_box(c, ed.x, ed.y, bw, bh, zoom, BOX_ACTIVE);
+        draw_caret(c, ed, &l, zoom);
     }
 
     if let Some(ds) = overlay.dragging
         && ds.page == index
     {
         match &ds.annotation.kind {
-            AnnotationKind::Text(text) => {
-                draw_text(c, text);
-                stroke_text_box(c, text.x, text.y, text.size, &text.content, zoom, BOX_ACTIVE);
+            AnnotationKind::Text(t) => {
+                draw_glyphs(c, t.x, t.y, t.size, &ann_glyphs(t));
+                let (w, h) = measure_glyphs(t.size, &ann_glyphs(t));
+                stroke_box(c, t.x, t.y, w, h, zoom, BOX_ACTIVE);
             }
         }
     }
 }
 
-/// Strokes the bounding box of a piece of text (context in page-point space).
-fn stroke_text_box(
-    c: &cairo::Context,
-    x: f64,
-    y: f64,
-    size: f64,
-    content: &str,
-    zoom: f64,
-    rgba: (f64, f64, f64, f64),
-) {
-    let (width, height, _) = text_metrics(c, size, content);
+/// Strokes a bounding box (context in page-point space).
+fn stroke_box(c: &cairo::Context, x: f64, y: f64, w: f64, h: f64, zoom: f64, rgba: (f64, f64, f64, f64)) {
     let (r, g, b, a) = rgba;
     c.set_source_rgba(r, g, b, a);
     c.set_line_width(1.0 / zoom);
-    c.rectangle(x, y, width, height);
+    c.rectangle(x, y, w, h);
     let _ = c.stroke();
 }
 
-/// Draws a selection outline with small corner handles (context in page-point space).
-fn stroke_selection(c: &cairo::Context, x: f64, y: f64, w: f64, h: f64, zoom: f64) {
+/// Selection outline with small corner handles (for move/select mode).
+fn stroke_selection_handles(c: &cairo::Context, x: f64, y: f64, w: f64, h: f64, zoom: f64) {
     let (r, g, b, _) = BOX_ACTIVE;
     c.set_source_rgba(r, g, b, 1.0);
     c.set_line_width(1.5 / zoom);
@@ -1105,21 +1288,15 @@ fn stroke_selection(c: &cairo::Context, x: f64, y: f64, w: f64, h: f64, zoom: f6
     let _ = c.fill();
 }
 
-fn draw_caret(c: &cairo::Context, ed: &TextEdit, zoom: f64) {
-    let (_, _, line_height) = text_metrics(c, ed.size, &ed.buffer);
-    // Locate the caret from its byte offset: line index + width of the text before it.
-    let before = &ed.buffer[..ed.cursor];
-    let line = before.matches('\n').count();
-    let line_prefix = before.rsplit('\n').next().unwrap_or("");
-    let prefix_width = c.text_extents(line_prefix).map(|e| e.x_advance()).unwrap_or(0.0);
-
-    let cx = ed.x + prefix_width;
-    let top = ed.y + line as f64 * line_height;
+fn draw_caret(c: &cairo::Context, ed: &TextEdit, l: &TextLayout, zoom: f64) {
+    let (x, line) = l.positions.get(ed.cursor).copied().unwrap_or((0.0, 0));
+    let cx = ed.x + x;
+    let top = ed.y + line as f64 * l.line_height;
     let (r, g, b, a) = BOX_ACTIVE;
     c.set_source_rgba(r, g, b, a);
     c.set_line_width(1.0 / zoom);
     c.move_to(cx, top);
-    c.line_to(cx, top + line_height);
+    c.line_to(cx, top + l.line_height);
     let _ = c.stroke();
 }
 
@@ -1143,18 +1320,39 @@ mod tests {
             kind: AnnotationKind::Text(TextAnnotation {
                 x,
                 y,
-                content: content.into(),
                 size: TEXT_SIZE,
-                color: TEXT_COLOR,
+                runs: vec![TextRun { text: content.into(), color: TEXT_COLOR }],
             }),
         });
         page
     }
 
+    fn glyphs_of(s: &str) -> Vec<Glyph> {
+        s.chars().map(|ch| Glyph { ch, color: TEXT_COLOR }).collect()
+    }
+
+    fn empty_edit() -> TextEdit {
+        TextEdit {
+            page: 0,
+            x: 0.0,
+            y: 0.0,
+            size: TEXT_SIZE,
+            glyphs: Vec::new(),
+            cursor: 0,
+            anchor: None,
+            id: Uuid::new_v4(),
+            original: None,
+        }
+    }
+
+    fn text_of(ed: &TextEdit) -> String {
+        ed.glyphs.iter().map(|g| g.ch).collect()
+    }
+
     #[test]
     fn hit_test_maps_click_to_page_local_point() {
         let pages = vec![a4_page(), a4_page()];
-        let width = A4.0 + 2.0 * PAGE_GAP; // matches content_size at zoom 1
+        let width = A4.0 + 2.0 * PAGE_GAP;
         let left = PAGE_GAP;
 
         let hit = hit_test(&pages, 1.0, width, left + 10.0, PAGE_GAP + 20.0);
@@ -1170,65 +1368,75 @@ mod tests {
     #[test]
     fn annotation_at_hits_inside_and_misses_outside() {
         let page = text_page(100.0, 200.0, "Hello");
-        // A point just inside the text box's top-left.
         assert_eq!(annotation_at(&page, 101.0, 201.0), Some(0));
-        // Far from the box.
         assert_eq!(annotation_at(&page, 10.0, 10.0), None);
-    }
-
-    fn empty_edit() -> TextEdit {
-        TextEdit {
-            page: 0,
-            x: 0.0,
-            y: 0.0,
-            size: TEXT_SIZE,
-            color: TEXT_COLOR,
-            buffer: String::new(),
-            cursor: 0,
-            id: Uuid::new_v4(),
-            original: None,
-        }
     }
 
     #[test]
     fn text_edit_insert_delete_and_navigate() {
         let mut ed = empty_edit();
         for ch in "abc".chars() {
-            ed.insert(ch);
+            ed.insert(ch, TEXT_COLOR);
         }
-        assert_eq!((ed.buffer.as_str(), ed.cursor), ("abc", 3));
+        assert_eq!((text_of(&ed), ed.cursor), ("abc".to_string(), 3));
 
-        ed.move_left();
-        ed.insert('X');
-        assert_eq!((ed.buffer.as_str(), ed.cursor), ("abXc", 3));
+        ed.move_left(false);
+        ed.insert('X', TEXT_COLOR);
+        assert_eq!((text_of(&ed), ed.cursor), ("abXc".to_string(), 3));
 
         ed.backspace();
-        assert_eq!((ed.buffer.as_str(), ed.cursor), ("abc", 2));
+        assert_eq!((text_of(&ed), ed.cursor), ("abc".to_string(), 2));
 
-        ed.move_home();
+        ed.move_home(false);
         assert_eq!(ed.cursor, 0);
-        ed.move_end();
+        ed.move_end(false);
         assert_eq!(ed.cursor, 3);
         ed.delete_forward(); // at end -> no-op
-        assert_eq!(ed.buffer, "abc");
+        assert_eq!(text_of(&ed), "abc");
     }
 
     #[test]
     fn text_edit_vertical_keeps_column() {
         let mut ed = empty_edit();
-        ed.buffer = "ab\ncd".into();
+        ed.glyphs = glyphs_of("ab\ncd");
         ed.cursor = 5; // end of "cd"
-        ed.move_up();
-        assert_eq!(ed.cursor, 2); // column 2 on line "ab"
-        ed.move_down();
-        assert_eq!(ed.cursor, 5); // back to end of "cd"
+        ed.move_up(false);
+        assert_eq!(ed.cursor, 2);
+        ed.move_down(false);
+        assert_eq!(ed.cursor, 5);
     }
 
     #[test]
-    fn measure_text_grows_with_newlines() {
-        let (_, one) = measure_text(TEXT_SIZE, "single line");
-        let (_, three) = measure_text(TEXT_SIZE, "line\ntwo\nthree");
-        assert!(three > one, "more lines should be taller");
+    fn shift_selects_and_color_applies_to_selection_only() {
+        let mut ed = empty_edit();
+        ed.glyphs = glyphs_of("abcd");
+        ed.cursor = 1;
+        ed.move_right(true); // select "b"
+        ed.move_right(true); // select "bc"
+        assert_eq!(ed.selection(), Some((1, 3)));
+
+        let red = Color { r: 1.0, g: 0.0, b: 0.0, a: 1.0 };
+        assert!(ed.color_selection(red));
+        assert_eq!(ed.glyphs[0].color, TEXT_COLOR);
+        assert_eq!(ed.glyphs[1].color, red);
+        assert_eq!(ed.glyphs[2].color, red);
+        assert_eq!(ed.glyphs[3].color, TEXT_COLOR);
+
+        // Runs merge same-color neighbors.
+        let runs = ed.to_runs();
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[1].text, "bc");
+    }
+
+    #[test]
+    fn typing_replaces_selection() {
+        let mut ed = empty_edit();
+        ed.glyphs = glyphs_of("abcd");
+        ed.anchor = Some(1);
+        ed.cursor = 3; // "bc" selected
+        ed.insert('X', TEXT_COLOR);
+        assert_eq!(text_of(&ed), "aXd");
+        assert_eq!(ed.cursor, 2);
     }
 
     #[test]
@@ -1237,12 +1445,18 @@ mod tests {
         let mut cache = HashMap::new();
         let (pw, ph) = (A4.0.ceil() as i32, A4.1.ceil() as i32);
         let mut surface = page_surface(None, &mut cache, 0, &page, 1.0, pw, ph).unwrap();
-        // Drop the cache so we hold the only reference (data() needs exclusive access).
         drop(cache);
         surface.flush();
 
         let data = surface.data().unwrap();
         let non_white = data.iter().filter(|&&b| b != 0xFF).count();
         assert!(non_white > 0, "text should render as dark pixels on the white page");
+    }
+
+    #[test]
+    fn measure_grows_with_newlines() {
+        let (_, one) = measure_glyphs(TEXT_SIZE, &glyphs_of("single line"));
+        let (_, three) = measure_glyphs(TEXT_SIZE, &glyphs_of("line\ntwo\nthree"));
+        assert!(three > one);
     }
 }
