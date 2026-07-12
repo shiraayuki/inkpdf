@@ -1,4 +1,6 @@
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::{gdk, gio};
@@ -6,10 +8,13 @@ use gtk::{gdk, gio};
 use crate::engine::OpenDocument;
 use crate::engine::document::FILE_EXTENSION;
 use crate::engine::storage;
-use crate::ui::canvas::{Canvas, Relative};
+use crate::ui::canvas::{Canvas, Relative, Tool};
 
 const DEFAULT_WIDTH: i32 = 900;
 const DEFAULT_HEIGHT: i32 = 700;
+/// Shared width of the floating side panels (tool strip and details).
+const PANEL_WIDTH: i32 = 46;
+const SWATCH: i32 = 30;
 
 #[derive(Clone)]
 pub struct WindowUi {
@@ -78,15 +83,9 @@ pub fn build(app: &adw::Application) -> WindowUi {
     page_box.append(&add_page_button);
     page_box.append(&remove_page_button);
 
-    let text_button = gtk::ToggleButton::builder()
-        .icon_name("document-edit-symbolic")
-        .tooltip_text("Text mode: click a page to add text")
-        .build();
-
     header.pack_start(&open_button);
     header.pack_start(&save_button);
     header.pack_start(&page_box);
-    header.pack_start(&text_button);
 
     let zoom_out_button = gtk::Button::builder()
         .icon_name("zoom-out-symbolic")
@@ -102,7 +101,27 @@ pub fn build(app: &adw::Application) -> WindowUi {
     zoom_box.append(&zoom_in_button);
     header.pack_end(&zoom_box);
 
+    load_css();
+
     let canvas = Canvas::new();
+
+    // Floating Rnote-style panels overlaid on the canvas: tools on the right,
+    // tool details on the left.
+    let overlay = gtk::Overlay::new();
+    overlay.set_child(Some(&canvas.root));
+
+    let details = build_details_panel();
+    details.set_halign(gtk::Align::Start);
+    details.set_valign(gtk::Align::Center);
+    details.set_margin_start(12);
+    details.set_visible(false); // shown only while a tool is active
+    overlay.add_overlay(&details);
+
+    let tool_strip = build_tool_strip(&canvas, &details);
+    tool_strip.set_halign(gtk::Align::End);
+    tool_strip.set_valign(gtk::Align::Center);
+    tool_strip.set_margin_end(12);
+    overlay.add_overlay(&tool_strip);
 
     let placeholder = adw::StatusPage::builder()
         .icon_name("document-open-symbolic")
@@ -112,7 +131,7 @@ pub fn build(app: &adw::Application) -> WindowUi {
 
     let stack = gtk::Stack::new();
     stack.add_named(&placeholder, Some("placeholder"));
-    stack.add_named(&canvas.root, Some("canvas"));
+    stack.add_named(&overlay, Some("canvas"));
     stack.set_visible_child_name("placeholder");
 
     let content = adw::ToolbarView::new();
@@ -156,10 +175,6 @@ pub fn build(app: &adw::Application) -> WindowUi {
     {
         let ui = ui.clone();
         remove_page_button.connect_clicked(move |_| ui.canvas.delete_current_page());
-    }
-    {
-        let ui = ui.clone();
-        text_button.connect_toggled(move |btn| ui.canvas.set_text_mode(btn.is_active()));
     }
 
     // Right-click menus for choosing before/after the current page.
@@ -287,6 +302,230 @@ fn file_label(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.display().to_string())
+}
+
+/// Right-hand tool strip: exclusive tool toggles (all off = move/select mode),
+/// then undo/redo. Selecting a tool switches the details panel to its page.
+fn build_tool_strip(canvas: &Canvas, details: &gtk::Stack) -> gtk::Box {
+    let strip = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    strip.add_css_class("inkpdf-panel");
+    strip.set_width_request(PANEL_WIDTH);
+
+    let tools: [(&str, &str, Tool, &str); 5] = [
+        ("inkpdf-pen-symbolic", "Pen", Tool::Pen, "pen"),
+        ("inkpdf-shapes-symbolic", "Shapes", Tool::Shape, "shapes"),
+        ("inkpdf-text-symbolic", "Text", Tool::Text, "text"),
+        ("inkpdf-eraser-symbolic", "Eraser", Tool::Eraser, "eraser"),
+        ("inkpdf-markdown-symbolic", "Markdown text", Tool::Markdown, "markdown"),
+    ];
+
+    let buttons: Rc<Vec<gtk::ToggleButton>> = Rc::new(
+        tools
+            .iter()
+            .map(|(icon, tip, _, _)| {
+                let button = gtk::ToggleButton::builder().icon_name(*icon).tooltip_text(*tip).build();
+                button.add_css_class("flat");
+                strip.append(&button);
+                button
+            })
+            .collect(),
+    );
+
+    for (i, button) in buttons.iter().enumerate() {
+        let canvas = canvas.clone();
+        let all = buttons.clone();
+        let details = details.clone();
+        let tool = tools[i].2;
+        let page = tools[i].3.to_string();
+        button.connect_toggled(move |btn| {
+            if btn.is_active() {
+                for other in all.iter() {
+                    if other != btn {
+                        other.set_active(false);
+                    }
+                }
+                canvas.set_tool(tool);
+                details.set_visible_child_name(&page);
+                details.set_visible(true);
+            } else if all.iter().all(|b| !b.is_active()) {
+                canvas.set_tool(Tool::Select);
+                details.set_visible(false);
+            }
+        });
+    }
+
+    strip.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+
+    // Undo/redo are placeholders for now (no history yet).
+    for (icon, tip) in [("inkpdf-undo-symbolic", "Undo"), ("inkpdf-redo-symbolic", "Redo")] {
+        let button = gtk::Button::builder().icon_name(icon).tooltip_text(tip).build();
+        button.add_css_class("flat");
+        strip.append(&button);
+    }
+
+    strip
+}
+
+/// Left-hand details panel: a compact Rnote-style column of options per tool.
+/// The stack itself is the styled card; it is hidden when no tool is active.
+fn build_details_panel() -> gtk::Stack {
+    let stack = gtk::Stack::new();
+    stack.add_css_class("inkpdf-panel");
+    stack.set_width_request(PANEL_WIDTH);
+    // Size to the visible page (not the largest), so height reflects its elements.
+    stack.set_hhomogeneous(false);
+    stack.set_vhomogeneous(false);
+    stack.add_named(&page_pen(), Some("pen"));
+    stack.add_named(&page_shapes(), Some("shapes"));
+    stack.add_named(&page_text(), Some("text"));
+    stack.add_named(&page_eraser(), Some("eraser"));
+    stack.add_named(&page_markdown(), Some("markdown"));
+    stack.set_visible_child_name("pen");
+    stack
+}
+
+fn detail_column() -> gtk::Box {
+    gtk::Box::new(gtk::Orientation::Vertical, 4)
+}
+
+fn flat_icon_button(icon: &str, tip: &str) -> gtk::Button {
+    let button = gtk::Button::builder().icon_name(icon).tooltip_text(tip).build();
+    button.add_css_class("flat");
+    button
+}
+
+fn flat_toggle(icon: &str, tip: &str) -> gtk::ToggleButton {
+    let button = gtk::ToggleButton::builder().icon_name(icon).tooltip_text(tip).build();
+    button.add_css_class("flat");
+    button
+}
+
+fn color_button() -> gtk::ColorDialogButton {
+    let button = gtk::ColorDialogButton::new(Some(gtk::ColorDialog::new()));
+    button.set_size_request(SWATCH, SWATCH);
+    button.set_halign(gtk::Align::Center);
+    button.set_valign(gtk::Align::Center);
+    button
+}
+
+fn hsep() -> gtk::Separator {
+    gtk::Separator::new(gtk::Orientation::Horizontal)
+}
+
+/// Compact +/value/- size stepper. Only updates its own label for now (no tool logic).
+fn size_stepper(default: i32, min: i32, max: i32) -> gtk::Box {
+    let column = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    let plus = flat_icon_button("list-add-symbolic", "Größer");
+    let minus = flat_icon_button("list-remove-symbolic", "Kleiner");
+    let value = gtk::Label::new(Some(&default.to_string()));
+
+    let current = Rc::new(Cell::new(default));
+    {
+        let current = current.clone();
+        let value = value.clone();
+        plus.connect_clicked(move |_| {
+            let v = (current.get() + 1).min(max);
+            current.set(v);
+            value.set_text(&v.to_string());
+        });
+    }
+    {
+        let current = current.clone();
+        let value = value.clone();
+        minus.connect_clicked(move |_| {
+            let v = (current.get() - 1).max(min);
+            current.set(v);
+            value.set_text(&v.to_string());
+        });
+    }
+
+    column.append(&plus);
+    column.append(&value);
+    column.append(&minus);
+    column
+}
+
+fn page_pen() -> gtk::Box {
+    let page = detail_column();
+    page.append(&color_button());
+    page.append(&size_stepper(3, 1, 20));
+    page
+}
+
+fn page_shapes() -> gtk::Box {
+    let page = detail_column();
+
+    let rect = flat_toggle("inkpdf-rect-symbolic", "Rechteck");
+    let ellipse = flat_toggle("inkpdf-ellipse-symbolic", "Ellipse");
+    let line = flat_toggle("inkpdf-line-symbolic", "Linie");
+    ellipse.set_group(Some(&rect));
+    line.set_group(Some(&rect));
+    rect.set_active(true);
+    page.append(&rect);
+    page.append(&ellipse);
+    page.append(&line);
+
+    page.append(&hsep());
+    page.append(&color_button());
+    page.append(&size_stepper(3, 1, 20));
+    page
+}
+
+fn page_text() -> gtk::Box {
+    let page = detail_column();
+    page.append(&size_stepper(16, 8, 72));
+    page.append(&color_button());
+
+    page.append(&hsep());
+    page.append(&flat_toggle("format-text-bold-symbolic", "Fett"));
+    page.append(&flat_toggle("format-text-italic-symbolic", "Kursiv"));
+    page.append(&flat_toggle("format-text-underline-symbolic", "Unterstrichen"));
+    page.append(&flat_toggle("format-text-strikethrough-symbolic", "Durchgestrichen"));
+    page
+}
+
+fn page_eraser() -> gtk::Box {
+    let page = detail_column();
+    page.append(&size_stepper(10, 1, 40));
+    page
+}
+
+fn page_markdown() -> gtk::Box {
+    let page = detail_column();
+    page.append(&size_stepper(16, 8, 72));
+    page
+}
+
+const PANEL_CSS: &str = "\
+.inkpdf-panel { \
+  background-color: alpha(@window_bg_color, 0.9); \
+  color: @window_fg_color; \
+  border-radius: 12px; \
+  padding: 6px; \
+  border: 1px solid alpha(@window_fg_color, 0.12); \
+}";
+
+/// Installs the panel styling and bundled tool icons once for the default display.
+fn load_css() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let Some(display) = gdk::Display::default() else {
+            return;
+        };
+
+        let provider = gtk::CssProvider::new();
+        provider.load_from_string(PANEL_CSS);
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+
+        // Bundled tool icons (under a hicolor tree, so every theme finds them).
+        let icons = concat!(env!("CARGO_MANIFEST_DIR"), "/data/icons");
+        gtk::IconTheme::for_display(&display).add_search_path(icons);
+    });
 }
 
 /// Runs `on_press` when the widget receives a right-click.

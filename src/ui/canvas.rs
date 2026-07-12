@@ -117,6 +117,14 @@ struct DragState {
     orig_y: f64,
 }
 
+/// The transient bits drawn on top of the cached page surfaces.
+struct Overlay<'a> {
+    text_mode: bool,
+    editing: Option<&'a TextEdit>,
+    dragging: Option<&'a DragState>,
+    selected: Option<(usize, Uuid)>,
+}
+
 struct State {
     doc: Option<Document>,
     pdf: Option<PdfDocument>,
@@ -130,6 +138,8 @@ struct State {
     /// Candidate for a drag: (page, annotation index, orig x, orig y) recorded on press.
     drag_start: Option<(usize, usize, f64, f64)>,
     dragging: Option<DragState>,
+    /// Currently selected text box (page, annotation id) in move/select mode.
+    selected: Option<(usize, Uuid)>,
 }
 
 /// Where an insert/delete acts relative to the current page.
@@ -137,6 +147,17 @@ struct State {
 pub enum Relative {
     Before,
     After,
+}
+
+/// The selectable tools. Only `Text` is interactive so far; the rest are placeholders.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Tool {
+    Select,
+    Text,
+    Pen,
+    Eraser,
+    Shape,
+    Markdown,
 }
 
 #[derive(Clone)]
@@ -155,6 +176,12 @@ impl Canvas {
             .child(&area)
             .build();
 
+        // Stop the ScrolledWindow from scrolling to the top whenever the canvas
+        // grabs keyboard focus (e.g. on click to place text).
+        if let Some(viewport) = root.child().and_downcast::<gtk::Viewport>() {
+            viewport.set_scroll_to_focus(false);
+        }
+
         let state = Rc::new(RefCell::new(State {
             doc: None,
             pdf: None,
@@ -165,6 +192,7 @@ impl Canvas {
             current: 0,
             drag_start: None,
             dragging: None,
+            selected: None,
         }));
 
         {
@@ -220,6 +248,7 @@ impl Canvas {
             st.editing = None;
             st.drag_start = None;
             st.dragging = None;
+            st.selected = None;
             st.doc = Some(open.model);
             st.pdf = open.pdf;
             st.zoom = 1.0;
@@ -242,6 +271,11 @@ impl Canvas {
         // Note: focus is grabbed on click (placing/editing text), not here, so
         // toggling the tool does not make the ScrolledWindow jump to the top.
         self.area.queue_draw();
+    }
+
+    /// Selects the active tool. Only `Text` has behavior for now.
+    pub fn set_tool(&self, tool: Tool) {
+        self.set_text_mode(tool == Tool::Text);
     }
 
     pub fn current_index(&self) -> usize {
@@ -305,6 +339,7 @@ impl Canvas {
                 }
                 _ => return,
             }
+            st.selected = None;
             st.cache.clear();
         }
         self.update_layout();
@@ -403,18 +438,51 @@ impl Canvas {
         self.commit_editing();
 
         let text_mode = self.state.borrow().text_mode;
-        if text_mode && n_press == 1 {
-            if let Some((page, index)) = self.annotation_hit(x, y) {
+        let hit = self.annotation_hit(x, y);
+
+        if text_mode {
+            // Text tool: click a box to edit it, or empty space to start a new one.
+            if let Some((page, index)) = hit {
                 self.start_edit_existing(page, index);
             } else if let Some((page, lx, ly)) = self.page_hit(x, y) {
                 self.start_new_text(page, lx, ly);
             }
-        } else if !text_mode
-            && n_press == 2
-            && let Some((page, index)) = self.annotation_hit(x, y)
-        {
-            self.start_edit_existing(page, index);
+        } else if n_press == 2 {
+            // Move/select mode: double-click edits.
+            if let Some((page, index)) = hit {
+                self.start_edit_existing(page, index);
+            }
+        } else {
+            // Move/select mode: single click selects a box or clears the selection.
+            let selected = hit.and_then(|(page, index)| self.annotation_id(page, index).map(|id| (page, id)));
+            self.set_selected(selected);
         }
+    }
+
+    fn set_selected(&self, selected: Option<(usize, Uuid)>) {
+        self.state.borrow_mut().selected = selected;
+        self.area.queue_draw();
+    }
+
+    fn annotation_id(&self, page: usize, index: usize) -> Option<Uuid> {
+        let st = self.state.borrow();
+        st.doc.as_ref()?.pages.get(page)?.annotations.get(index).map(|a| a.id)
+    }
+
+    fn delete_selected(&self) {
+        let selected = self.state.borrow().selected;
+        let Some((page, id)) = selected else {
+            return;
+        };
+        {
+            let mut st = self.state.borrow_mut();
+            if let Some(p) = st.doc.as_mut().and_then(|d| d.pages.get_mut(page)) {
+                p.annotations.retain(|a| a.id != id);
+            }
+            st.selected = None;
+            st.cache.remove(&page);
+        }
+        self.area.queue_draw();
     }
 
     /// If a box is being edited and (page, lx, ly) lands inside it, moves the caret there.
@@ -441,16 +509,20 @@ impl Canvas {
     }
 
     fn start_new_text(&self, page: usize, lx: f64, ly: f64) {
-        self.state.borrow_mut().editing = Some(TextEdit {
-            page,
-            x: lx,
-            y: ly,
-            size: TEXT_SIZE,
-            buffer: String::new(),
-            cursor: 0,
-            id: Uuid::new_v4(),
-            original: None,
-        });
+        {
+            let mut st = self.state.borrow_mut();
+            st.selected = None;
+            st.editing = Some(TextEdit {
+                page,
+                x: lx,
+                y: ly,
+                size: TEXT_SIZE,
+                buffer: String::new(),
+                cursor: 0,
+                id: Uuid::new_v4(),
+                original: None,
+            });
+        }
         self.area.queue_draw();
     }
 
@@ -474,6 +546,7 @@ impl Canvas {
         {
             let mut st = self.state.borrow_mut();
             let cursor = content.len();
+            st.selected = None;
             st.editing = Some(TextEdit { page, x, y, size, buffer: content, cursor, id, original: Some(annotation) });
             st.cache.remove(&page);
         }
@@ -491,6 +564,13 @@ impl Canvas {
 
     fn on_key(&self, keyval: gdk::Key, state: gdk::ModifierType) -> glib::Propagation {
         if self.state.borrow().editing.is_none() {
+            // Not editing: Delete/Backspace removes the selected box.
+            if self.state.borrow().selected.is_some()
+                && matches!(keyval, gdk::Key::Delete | gdk::Key::KP_Delete | gdk::Key::BackSpace)
+            {
+                self.delete_selected();
+                return glib::Propagation::Stop;
+            }
             return glib::Propagation::Proceed;
         }
         match keyval {
@@ -566,18 +646,22 @@ impl Canvas {
             return; // moving is only possible without a tool
         }
         if let Some((page, index)) = self.annotation_hit(x, y) {
-            let orig = {
+            let info = {
                 let st = self.state.borrow();
                 st.doc
                     .as_ref()
                     .and_then(|d| d.pages.get(page))
                     .and_then(|p| p.annotations.get(index))
                     .map(|a| match &a.kind {
-                        AnnotationKind::Text(t) => (t.x, t.y),
+                        AnnotationKind::Text(t) => (t.x, t.y, a.id),
                     })
             };
-            if let Some((ox, oy)) = orig {
-                self.state.borrow_mut().drag_start = Some((page, index, ox, oy));
+            if let Some((ox, oy, id)) = info {
+                let mut st = self.state.borrow_mut();
+                st.drag_start = Some((page, index, ox, oy));
+                st.selected = Some((page, id));
+                drop(st);
+                self.area.queue_draw();
             }
         }
     }
@@ -599,11 +683,19 @@ impl Canvas {
         }
 
         let mut st = self.state.borrow_mut();
-        if let Some(ds) = st.dragging.as_mut() {
+        let State { doc, dragging, .. } = &mut *st;
+        if let Some(ds) = dragging {
+            let (pw, ph) = doc
+                .as_ref()
+                .and_then(|d| d.pages.get(ds.page))
+                .map(|p| (p.width, p.height))
+                .unwrap_or(A4);
             match &mut ds.annotation.kind {
                 AnnotationKind::Text(t) => {
-                    t.x = ds.orig_x + offset_x / zoom;
-                    t.y = ds.orig_y + offset_y / zoom;
+                    // Keep the whole box on the page so it can't slip behind it.
+                    let (bw, bh) = measure_text(t.size, &t.content);
+                    t.x = (ds.orig_x + offset_x / zoom).clamp(0.0, (pw - bw).max(0.0));
+                    t.y = (ds.orig_y + offset_y / zoom).clamp(0.0, (ph - bh).max(0.0));
                 }
             }
             drop(st);
@@ -636,11 +728,14 @@ impl Canvas {
             st.dragging.take()
         };
         if let Some(ds) = dragging {
+            let page_index = ds.page;
+            let id = ds.annotation.id;
             let mut st = self.state.borrow_mut();
-            if let Some(page) = st.doc.as_mut().and_then(|d| d.pages.get_mut(ds.page)) {
+            if let Some(page) = st.doc.as_mut().and_then(|d| d.pages.get_mut(page_index)) {
                 page.annotations.push(ds.annotation);
             }
-            st.cache.remove(&ds.page);
+            st.selected = Some((page_index, id));
+            st.cache.remove(&page_index);
             drop(st);
             self.area.queue_draw();
         }
@@ -775,12 +870,19 @@ fn draw(state: &Rc<RefCell<State>>, ctx: &cairo::Context, width: i32) {
     let _ = ctx.paint();
 
     let mut st = state.borrow_mut();
-    let State { doc, pdf, zoom, cache, text_mode, editing, current, dragging, .. } = &mut *st;
+    let State { doc, pdf, zoom, cache, text_mode, editing, current, dragging, selected, .. } =
+        &mut *st;
     let Some(doc) = doc.as_ref() else {
         return;
     };
     let z = *zoom;
     let current = *current;
+    let overlay = Overlay {
+        text_mode: *text_mode,
+        editing: editing.as_ref(),
+        dragging: dragging.as_ref(),
+        selected: *selected,
+    };
 
     let (_x0, cy0, _x1, cy1) = ctx.clip_extents().unwrap_or((0.0, 0.0, f64::MAX, f64::MAX));
 
@@ -813,7 +915,7 @@ fn draw(state: &Rc<RefCell<State>>, ctx: &cairo::Context, width: i32) {
             let _ = ctx.save();
             ctx.translate(x, y);
             ctx.scale(z, z);
-            draw_overlay(ctx, page, i, z, *text_mode, editing.as_ref(), dragging.as_ref());
+            draw_overlay(ctx, page, i, z, &overlay);
             let _ = ctx.restore();
         }
 
@@ -884,16 +986,8 @@ fn draw_text(c: &cairo::Context, text: &TextAnnotation) {
     }
 }
 
-fn draw_overlay(
-    c: &cairo::Context,
-    page: &Page,
-    index: usize,
-    zoom: f64,
-    text_mode: bool,
-    editing: Option<&TextEdit>,
-    dragging: Option<&DragState>,
-) {
-    if text_mode {
+fn draw_overlay(c: &cairo::Context, page: &Page, index: usize, zoom: f64, overlay: &Overlay) {
+    if overlay.text_mode {
         for annotation in &page.annotations {
             match &annotation.kind {
                 AnnotationKind::Text(text) => {
@@ -903,7 +997,20 @@ fn draw_overlay(
         }
     }
 
-    if let Some(ed) = editing
+    // Selection highlight (move/select mode).
+    if let Some((sel_page, id)) = overlay.selected
+        && sel_page == index
+        && let Some(annotation) = page.annotations.iter().find(|a| a.id == id)
+    {
+        match &annotation.kind {
+            AnnotationKind::Text(text) => {
+                let (w, h, _) = text_metrics(c, text.size, &text.content);
+                stroke_selection(c, text.x, text.y, w, h, zoom);
+            }
+        }
+    }
+
+    if let Some(ed) = overlay.editing
         && ed.page == index
     {
         let preview = TextAnnotation {
@@ -918,7 +1025,7 @@ fn draw_overlay(
         draw_caret(c, ed, zoom);
     }
 
-    if let Some(ds) = dragging
+    if let Some(ds) = overlay.dragging
         && ds.page == index
     {
         match &ds.annotation.kind {
@@ -946,6 +1053,21 @@ fn stroke_text_box(
     c.set_line_width(1.0 / zoom);
     c.rectangle(x, y, width, height);
     let _ = c.stroke();
+}
+
+/// Draws a selection outline with small corner handles (context in page-point space).
+fn stroke_selection(c: &cairo::Context, x: f64, y: f64, w: f64, h: f64, zoom: f64) {
+    let (r, g, b, _) = BOX_ACTIVE;
+    c.set_source_rgba(r, g, b, 1.0);
+    c.set_line_width(1.5 / zoom);
+    c.rectangle(x, y, w, h);
+    let _ = c.stroke();
+
+    let half = 3.0 / zoom;
+    for (hx, hy) in [(x, y), (x + w, y), (x, y + h), (x + w, y + h)] {
+        c.rectangle(hx - half, hy - half, 2.0 * half, 2.0 * half);
+    }
+    let _ = c.fill();
 }
 
 fn draw_caret(c: &cairo::Context, ed: &TextEdit, zoom: f64) {
