@@ -262,6 +262,7 @@ pub enum Tool {
     Eraser,
     Shape,
     Markdown,
+    Pages,
 }
 
 #[derive(Clone)]
@@ -792,8 +793,10 @@ impl Canvas {
     fn on_drag_begin(&self, x: f64, y: f64) {
         self.state.borrow_mut().drag_start = None;
 
-        if self.state.borrow().text_mode {
-            // In text mode a drag inside the edited box selects text.
+        // A drag inside the box being edited selects text. This applies whenever
+        // an edit is active, not just with the Text tool - editing can also start
+        // from a Select-mode double-click, which never sets `text_mode`.
+        if self.state.borrow().editing.is_some() {
             if let Some((page, lx, ly)) = self.page_hit(x, y) {
                 let pos = {
                     let st = self.state.borrow();
@@ -820,6 +823,12 @@ impl Canvas {
                     self.area.queue_draw();
                 }
             }
+            return;
+        }
+
+        if self.state.borrow().text_mode {
+            // Text tool active but nothing is being edited yet (about to place a
+            // new box on click) - there is no box to drag.
             return;
         }
 

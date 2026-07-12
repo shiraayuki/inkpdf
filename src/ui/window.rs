@@ -71,36 +71,23 @@ pub fn build(app: &adw::Application) -> WindowUi {
         .tooltip_text("Save as inkpdf")
         .css_classes(["flat"])
         .build();
-    let add_page_button = gtk::Button::builder()
-        .icon_name("list-add-symbolic")
-        .tooltip_text("Insert page after current")
-        .build();
-    let remove_page_button = gtk::Button::builder()
-        .icon_name("list-remove-symbolic")
-        .tooltip_text("Delete current page")
-        .build();
-    let page_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    page_box.add_css_class("linked");
-    page_box.append(&add_page_button);
-    page_box.append(&remove_page_button);
-
     header.pack_start(&open_button);
     header.pack_start(&save_button);
-    header.pack_start(&page_box);
 
     let zoom_out_button = gtk::Button::builder()
         .icon_name("zoom-out-symbolic")
         .tooltip_text("Zoom out")
+        .css_classes(["flat"])
         .build();
     let zoom_in_button = gtk::Button::builder()
         .icon_name("zoom-in-symbolic")
         .tooltip_text("Zoom in")
+        .css_classes(["flat"])
         .build();
     let zoom_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     zoom_box.add_css_class("linked");
     zoom_box.append(&zoom_out_button);
     zoom_box.append(&zoom_in_button);
-    header.pack_end(&zoom_box);
 
     // Dark/light toggle (default dark = not active).
     let theme_button = gtk::ToggleButton::builder()
@@ -118,7 +105,24 @@ pub fn build(app: &adw::Application) -> WindowUi {
             btn.set_icon_name("weather-clear-night-symbolic");
         }
     });
-    header.pack_end(&theme_button);
+
+    // Settings menu: zoom and dark/light live behind the gear button instead of
+    // sitting in the header directly.
+    let settings_menu = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    settings_menu.set_margin_top(10);
+    settings_menu.set_margin_bottom(10);
+    settings_menu.set_margin_start(10);
+    settings_menu.set_margin_end(10);
+    settings_menu.append(&zoom_box);
+    settings_menu.append(&theme_button);
+    let settings_popover = gtk::Popover::builder().child(&settings_menu).build();
+    let settings_button = gtk::MenuButton::builder()
+        .icon_name("inkpdf-settings-symbolic")
+        .tooltip_text("Settings")
+        .css_classes(["flat"])
+        .popover(&settings_popover)
+        .build();
+    header.pack_end(&settings_button);
 
     load_css();
 
@@ -129,7 +133,7 @@ pub fn build(app: &adw::Application) -> WindowUi {
     let overlay = gtk::Overlay::new();
     overlay.set_child(Some(&canvas.root));
 
-    let details = build_details_panel(&canvas);
+    let (details, add_page_button, remove_page_button) = build_details_panel(&canvas);
     details.set_halign(gtk::Align::Start);
     details.set_valign(gtk::Align::Center);
     details.set_margin_start(16);
@@ -338,7 +342,8 @@ fn build_tool_strip(canvas: &Canvas, details: &gtk::Stack) -> gtk::Box {
     strip.add_css_class("osd");
     strip.add_css_class("inkpdf-panel");
 
-    let tools: [(&str, &str, Tool, &str); 5] = [
+    let tools: [(&str, &str, Tool, &str); 6] = [
+        ("inkpdf-pages-symbolic", "Pages", Tool::Pages, "pages"),
         ("inkpdf-pen-symbolic", "Pen", Tool::Pen, "pen"),
         ("inkpdf-shapes-symbolic", "Shapes", Tool::Shape, "shapes"),
         ("inkpdf-text-symbolic", "Text", Tool::Text, "text"),
@@ -397,20 +402,24 @@ fn build_tool_strip(canvas: &Canvas, details: &gtk::Stack) -> gtk::Box {
 
 /// Left-hand details panel: a compact Rnote-style column of options per tool.
 /// The stack itself is the styled card; it is hidden when no tool is active.
-fn build_details_panel(canvas: &Canvas) -> gtk::Stack {
+/// Returns the add/remove-page buttons too, since their click handlers can only
+/// be wired once `WindowUi` exists (see `build()`).
+fn build_details_panel(canvas: &Canvas) -> (gtk::Stack, gtk::Button, gtk::Button) {
     let stack = gtk::Stack::new();
     stack.add_css_class("osd");
     stack.add_css_class("inkpdf-panel");
     // Same width for every page (consistent panel), but height follows each page's elements.
     stack.set_hhomogeneous(true);
     stack.set_vhomogeneous(false);
+    let (pages_page, add_page_button, remove_page_button) = page_pages();
+    stack.add_named(&pages_page, Some("pages"));
     stack.add_named(&page_pen(), Some("pen"));
     stack.add_named(&page_shapes(), Some("shapes"));
     stack.add_named(&page_text(canvas), Some("text"));
     stack.add_named(&page_eraser(), Some("eraser"));
     stack.add_named(&page_markdown(), Some("markdown"));
     stack.set_visible_child_name("pen");
-    stack
+    (stack, add_page_button, remove_page_button)
 }
 
 fn detail_column() -> gtk::Box {
@@ -523,6 +532,18 @@ fn size_stepper(
     column.append(&entry);
     column.append(&minus);
     column
+}
+
+/// "Pages" tool page: insert/delete the current page. Left click acts on the
+/// current page directly; right click opens a before/after choice (wired in
+/// `build()`, once `WindowUi` exists).
+fn page_pages() -> (gtk::Box, gtk::Button, gtk::Button) {
+    let page = detail_column();
+    let add = flat_icon_button("inkpdf-page-add-symbolic", "Insert page after current");
+    let remove = flat_icon_button("inkpdf-page-remove-symbolic", "Delete current page");
+    page.append(&add);
+    page.append(&remove);
+    (page, add, remove)
 }
 
 fn page_pen() -> gtk::Box {
