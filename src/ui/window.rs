@@ -64,10 +64,12 @@ pub fn build(app: &adw::Application) -> WindowUi {
     let open_button = gtk::Button::builder()
         .icon_name("document-open-symbolic")
         .tooltip_text("Open")
+        .css_classes(["flat"])
         .build();
     let save_button = gtk::Button::builder()
         .icon_name("document-save-symbolic")
         .tooltip_text("Save as inkpdf")
+        .css_classes(["flat"])
         .build();
     let add_page_button = gtk::Button::builder()
         .icon_name("list-add-symbolic")
@@ -104,6 +106,7 @@ pub fn build(app: &adw::Application) -> WindowUi {
     let theme_button = gtk::ToggleButton::builder()
         .icon_name("weather-clear-night-symbolic")
         .tooltip_text("Hell/Dunkel umschalten")
+        .css_classes(["flat"])
         .build();
     theme_button.connect_toggled(|btn| {
         let manager = adw::StyleManager::default();
@@ -129,14 +132,14 @@ pub fn build(app: &adw::Application) -> WindowUi {
     let details = build_details_panel(&canvas);
     details.set_halign(gtk::Align::Start);
     details.set_valign(gtk::Align::Center);
-    details.set_margin_start(12);
+    details.set_margin_start(16);
     details.set_visible(false); // shown only while a tool is active
     overlay.add_overlay(&details);
 
     let tool_strip = build_tool_strip(&canvas, &details);
     tool_strip.set_halign(gtk::Align::End);
     tool_strip.set_valign(gtk::Align::Center);
-    tool_strip.set_margin_end(12);
+    tool_strip.set_margin_end(16);
     overlay.add_overlay(&tool_strip);
 
     // Give both side panels the same width (the wider one, i.e. the details
@@ -331,7 +334,8 @@ fn file_label(path: &Path) -> String {
 /// Right-hand tool strip: exclusive tool toggles (all off = move/select mode),
 /// then undo/redo. Selecting a tool switches the details panel to its page.
 fn build_tool_strip(canvas: &Canvas, details: &gtk::Stack) -> gtk::Box {
-    let strip = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    let strip = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    strip.add_css_class("osd");
     strip.add_css_class("inkpdf-panel");
 
     let tools: [(&str, &str, Tool, &str); 5] = [
@@ -348,6 +352,7 @@ fn build_tool_strip(canvas: &Canvas, details: &gtk::Stack) -> gtk::Box {
             .map(|(icon, tip, _, _)| {
                 let button = gtk::ToggleButton::builder().icon_name(*icon).tooltip_text(*tip).build();
                 button.add_css_class("flat");
+                button.add_css_class("circular");
                 strip.append(&button);
                 button
             })
@@ -383,6 +388,7 @@ fn build_tool_strip(canvas: &Canvas, details: &gtk::Stack) -> gtk::Box {
     for (icon, tip) in [("inkpdf-undo-symbolic", "Undo"), ("inkpdf-redo-symbolic", "Redo")] {
         let button = gtk::Button::builder().icon_name(icon).tooltip_text(tip).build();
         button.add_css_class("flat");
+        button.add_css_class("circular");
         strip.append(&button);
     }
 
@@ -393,6 +399,7 @@ fn build_tool_strip(canvas: &Canvas, details: &gtk::Stack) -> gtk::Box {
 /// The stack itself is the styled card; it is hidden when no tool is active.
 fn build_details_panel(canvas: &Canvas) -> gtk::Stack {
     let stack = gtk::Stack::new();
+    stack.add_css_class("osd");
     stack.add_css_class("inkpdf-panel");
     // Same width for every page (consistent panel), but height follows each page's elements.
     stack.set_hhomogeneous(true);
@@ -407,18 +414,20 @@ fn build_details_panel(canvas: &Canvas) -> gtk::Stack {
 }
 
 fn detail_column() -> gtk::Box {
-    gtk::Box::new(gtk::Orientation::Vertical, 4)
+    gtk::Box::new(gtk::Orientation::Vertical, 6)
 }
 
 fn flat_icon_button(icon: &str, tip: &str) -> gtk::Button {
     let button = gtk::Button::builder().icon_name(icon).tooltip_text(tip).build();
     button.add_css_class("flat");
+    button.add_css_class("circular");
     button
 }
 
 fn flat_toggle(icon: &str, tip: &str) -> gtk::ToggleButton {
     let button = gtk::ToggleButton::builder().icon_name(icon).tooltip_text(tip).build();
     button.add_css_class("flat");
+    button.add_css_class("circular");
     button
 }
 
@@ -586,11 +595,16 @@ fn page_markdown() -> gtk::Box {
 
 const PANEL_CSS: &str = "\
 .inkpdf-panel { \
-  background-color: @window_bg_color; \
-  color: @window_fg_color; \
-  border-radius: 12px; \
-  padding: 6px; \
-  border: 1px solid alpha(@window_fg_color, 0.12); \
+  padding: 10px 6px; \
+  border-radius: 20px; \
+}\
+.inkpdf-panel separator { \
+  background-color: alpha(@window_fg_color, 0.15); \
+  margin: 4px 10px; \
+}\
+.inkpdf-panel button:checked { \
+  background-color: @accent_bg_color; \
+  color: @accent_fg_color; \
 }";
 
 /// Installs the panel styling and bundled tool icons once for the default display.

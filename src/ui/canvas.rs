@@ -231,7 +231,7 @@ struct State {
     cache: HashMap<usize, cairo::ImageSurface>,
     text_mode: bool,
     editing: Option<TextEdit>,
-    /// Page nearest the viewport center; gets the red frame and anchors insert/delete.
+    /// Page nearest the viewport center; gets the accent frame and anchors insert/delete.
     current: usize,
     /// Candidate for a box drag: (page, annotation index, orig x, orig y).
     drag_start: Option<(usize, usize, f64, f64)>,
@@ -344,7 +344,7 @@ impl Canvas {
         }
         self.area.add_controller(drag);
 
-        // Track which page is in view so the red frame follows scrolling.
+        // Track which page is in view so the current-page frame follows scrolling.
         let this = self.clone();
         self.root.vadjustment().connect_value_changed(move |_| this.recompute_current());
     }
@@ -1113,10 +1113,11 @@ fn draw(state: &Rc<RefCell<State>>, ctx: &cairo::Context, width: i32) {
 
             ctx.rectangle(x, y, pw, ph);
             if i == current {
-                ctx.set_source_rgb(0.85, 0.15, 0.15);
-                ctx.set_line_width(3.0);
+                let (r, g, b, a) = BOX_ACTIVE;
+                ctx.set_source_rgba(r, g, b, a);
+                ctx.set_line_width(1.5);
             } else {
-                ctx.set_source_rgb(0.0, 0.0, 0.0);
+                ctx.set_source_rgba(0.0, 0.0, 0.0, 0.35);
                 ctx.set_line_width(1.0);
             }
             let _ = ctx.stroke();

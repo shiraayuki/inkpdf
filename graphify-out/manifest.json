@@ -25,9 +25,9 @@
     "semantic_hash": "7d9a75c9d4e38d2cfd996650e4027c11"
   },
   "ui/canvas.rs": {
-    "mtime": 1783885310.8234255,
-    "ast_hash": "76ebf96ee47e6cdc2f05d1b02f0073cc",
-    "semantic_hash": "76ebf96ee47e6cdc2f05d1b02f0073cc"
+    "mtime": 1783886302.63891,
+    "ast_hash": "f802845f77e33a8c07ee2b695080fae1",
+    "semantic_hash": "f802845f77e33a8c07ee2b695080fae1"
   },
   "ui/mod.rs": {
     "mtime": 1783853898.274945,
@@ -35,8 +35,8 @@
     "semantic_hash": "5a3efbaf26b25bbcd0a9838e7ccc6576"
   },
   "ui/window.rs": {
-    "mtime": 1783875125.843758,
-    "ast_hash": "815def44ce2a78bb38fbfc05359449de",
-    "semantic_hash": "815def44ce2a78bb38fbfc05359449de"
+    "mtime": 1783886288.443972,
+    "ast_hash": "9daf7f2521be7a86accd19a7ac552cdf",
+    "semantic_hash": "9daf7f2521be7a86accd19a7ac552cdf"
   }
 }
