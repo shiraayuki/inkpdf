@@ -2,3 +2,8 @@
 
 # Claude-Projektkontext (nicht committen)
 /CLAUDE.md
+
+# graphify: keep the graph outputs, ignore machine-specific state + cache
+/graphify-out/cache/
+/graphify-out/.graphify_*
+/src/graphify-out/

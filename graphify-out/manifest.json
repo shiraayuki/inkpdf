@@ -1,0 +1,42 @@
+{
+  "engine/document.rs": {
+    "mtime": 1783875556.5584548,
+    "ast_hash": "5e2288c3ed4b0224befc4b118fa201a0",
+    "semantic_hash": "5e2288c3ed4b0224befc4b118fa201a0"
+  },
+  "engine/mod.rs": {
+    "mtime": 1783854585.463261,
+    "ast_hash": "c3b1631e5d5e8dcbf7402807203ba3aa",
+    "semantic_hash": "c3b1631e5d5e8dcbf7402807203ba3aa"
+  },
+  "engine/pdf.rs": {
+    "mtime": 1783854537.3085887,
+    "ast_hash": "a034f8f2e6bee1f24f8537232cd5b539",
+    "semantic_hash": "a034f8f2e6bee1f24f8537232cd5b539"
+  },
+  "engine/storage.rs": {
+    "mtime": 1783875568.4473891,
+    "ast_hash": "c24a5abb35300ba145ca15e0128135c5",
+    "semantic_hash": "c24a5abb35300ba145ca15e0128135c5"
+  },
+  "main.rs": {
+    "mtime": 1783853955.7925522,
+    "ast_hash": "7d9a75c9d4e38d2cfd996650e4027c11",
+    "semantic_hash": "7d9a75c9d4e38d2cfd996650e4027c11"
+  },
+  "ui/canvas.rs": {
+    "mtime": 1783885310.8234255,
+    "ast_hash": "76ebf96ee47e6cdc2f05d1b02f0073cc",
+    "semantic_hash": "76ebf96ee47e6cdc2f05d1b02f0073cc"
+  },
+  "ui/mod.rs": {
+    "mtime": 1783853898.274945,
+    "ast_hash": "5a3efbaf26b25bbcd0a9838e7ccc6576",
+    "semantic_hash": "5a3efbaf26b25bbcd0a9838e7ccc6576"
+  },
+  "ui/window.rs": {
+    "mtime": 1783875125.843758,
+    "ast_hash": "815def44ce2a78bb38fbfc05359449de",
+    "semantic_hash": "815def44ce2a78bb38fbfc05359449de"
+  }
+}
