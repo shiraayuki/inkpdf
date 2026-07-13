@@ -180,6 +180,13 @@ impl WindowUi {
         self.switch_to_tab(idx);
     }
 
+    /// Opens `path` straight into a fresh tab, no replace/new-tab prompt - used
+    /// by the embedded file browser, where "pick a file" already implies "new tab".
+    pub(crate) fn open_path_in_new_tab(&self, path: &Path) {
+        self.new_tab();
+        self.load_path(path);
+    }
+
     /// Switches the canvas to a different tab, stashing the current tab's live
     /// state (document, pdf handle, zoom) back into its slot first.
     fn switch_to_tab(&self, new_idx: usize) {
@@ -457,6 +464,7 @@ pub fn build(app: &adw::Application) -> WindowUi {
     // tool details on the left.
     let overlay = gtk::Overlay::new();
     overlay.set_child(Some(&canvas.root));
+    overlay.set_hexpand(true);
 
     let (details, add_page_button, remove_page_button) = build_details_panel(&canvas);
     details.set_halign(gtk::Align::Start);
@@ -485,10 +493,15 @@ pub fn build(app: &adw::Application) -> WindowUi {
     tab_bar.set_homogeneous(true);
     tab_bar.set_hexpand(true);
 
+    // The file browser's revealer is prepended here once `ui` exists below (it
+    // needs `ui` to open files); this box is its permanent parent.
+    let main_hbox = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    main_hbox.append(&overlay);
+
     let content = adw::ToolbarView::new();
     content.add_top_bar(&header);
     content.add_top_bar(&tab_bar);
-    content.set_content(Some(&overlay));
+    content.set_content(Some(&main_hbox));
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -543,6 +556,21 @@ pub fn build(app: &adw::Application) -> WindowUi {
             glib::Propagation::Proceed
         });
     }
+
+    // Embedded file browser: slides in from the left; picking a file there
+    // opens it straight into a new tab (see FileBrowser::new / open_path_in_new_tab).
+    let file_browser = crate::ui::file_browser::FileBrowser::new(&ui);
+    main_hbox.prepend(&file_browser.revealer);
+    let browser_toggle = gtk::ToggleButton::builder()
+        .icon_name("sidebar-show-symbolic")
+        .tooltip_text("Dateien")
+        .css_classes(["flat"])
+        .build();
+    {
+        let revealer = file_browser.revealer.clone();
+        browser_toggle.connect_toggled(move |btn| revealer.set_reveal_child(btn.is_active()));
+    }
+    header.pack_start(&browser_toggle);
 
     register_shortcuts(app, &window, &ui);
 
