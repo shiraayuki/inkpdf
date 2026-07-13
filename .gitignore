@@ -7,8 +7,6 @@
 # Claude-Projektkontext (nicht committen)
 /CLAUDE.md
 
-# graphify: keep the graph outputs, ignore machine-specific state + cache
-/graphify-out/cache/
-/graphify-out/.graphify_*
-/graphify-out/20*/
+# graphify: local knowledge-graph cache for Claude, not part of the public repo
+/graphify-out/
 /src/graphify-out/
