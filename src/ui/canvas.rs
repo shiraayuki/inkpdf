@@ -449,6 +449,12 @@ struct State {
     lasso_start: Option<(usize, f64, f64)>,
     /// The in-progress Lasso gesture, once the drag has exceeded the threshold.
     lasso_op: Option<LassoOp>,
+    /// Set once a Lasso press is promoted into a real marquee/group-move (see
+    /// `start_lasso_op`). The click gesture fires for the same press/release
+    /// regardless of whether a drag happened; `on_click`'s Lasso branch checks
+    /// this so it doesn't clobber what the drag already did (e.g. collapsing a
+    /// just-moved multi-selection back down to whatever's under the cursor).
+    lasso_was_drag: bool,
 }
 
 /// Where an insert/delete acts relative to the current page.
@@ -535,6 +541,7 @@ impl Canvas {
             lasso_press: None,
             lasso_start: None,
             lasso_op: None,
+            lasso_was_drag: false,
         }));
 
         {
@@ -1248,10 +1255,16 @@ impl Canvas {
             return;
         }
 
-        // Lasso: a plain click (no real drag - that's handled in on_drag_*)
-        // either selects just the one annotation under it, or deselects.
+        // Lasso: a plain click (no real drag) either selects just the one
+        // annotation under it, or deselects. The click gesture fires for the
+        // same press/release a drag does, so if the drag already turned into
+        // a real marquee/group-move (lasso_was_drag), leave what it did alone.
         if self.state.borrow().tool == Tool::Lasso {
             self.commit_editing();
+            let was_drag = std::mem::take(&mut self.state.borrow_mut().lasso_was_drag);
+            if was_drag {
+                return;
+            }
             let hit = self.annotation_hit(x, y);
             let selected = hit.and_then(|(page, index)| self.annotation_id(page, index).map(|id| (page, vec![id])));
             self.state.borrow_mut().lasso_selected = selected;
@@ -1731,6 +1744,7 @@ impl Canvas {
         let hit = self.page_hit(x, y);
         let mut st = self.state.borrow_mut();
         st.lasso_op = None;
+        st.lasso_was_drag = false;
         st.lasso_press = Some((x, y));
         st.lasso_start = hit;
     }
@@ -1741,6 +1755,7 @@ impl Canvas {
         let Some((page, lx, ly)) = self.state.borrow().lasso_start else {
             return;
         };
+        self.state.borrow_mut().lasso_was_drag = true;
         // A press anywhere inside the current selection's combined bounding box
         // starts a group move - not just a press on one specific item's own
         // (possibly thin/small) bounds, which made moving a multi-selection

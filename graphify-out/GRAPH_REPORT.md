@@ -1,7 +1,7 @@
 # Graph Report - inkpdf  (2026-07-13)
 
 ## Corpus Check
-- 10 files · ~25,321 words
+- 10 files · ~25,419 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
@@ -10,7 +10,7 @@
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `f681b682`
+- Built from commit: `0cfb2acf`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 

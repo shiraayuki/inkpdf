@@ -1246,9 +1246,8 @@ fn page_shapes(canvas: &Canvas) -> gtk::Box {
 fn page_lasso(canvas: &Canvas) -> gtk::Box {
     let page = detail_column();
 
-    let shapes: [(&str, &str, ShapeKind); 3] = [
+    let shapes: [(&str, &str, ShapeKind); 2] = [
         ("inkpdf-rect-symbolic", "Als Rechteck", ShapeKind::Rectangle),
-        ("inkpdf-ellipse-symbolic", "Als Ellipse", ShapeKind::Ellipse),
         ("inkpdf-line-symbolic", "Als Linie", ShapeKind::Line),
     ];
     for (icon, tip, kind) in shapes {
