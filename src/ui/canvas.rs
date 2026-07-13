@@ -567,7 +567,10 @@ impl Canvas {
         let click = gtk::GestureClick::new();
         {
             let this = self.clone();
-            click.connect_pressed(move |_, n_press, x, y| this.on_click(n_press, x, y));
+            click.connect_pressed(move |gesture, n_press, x, y| {
+                let ctrl = gesture.current_event_state().contains(gdk::ModifierType::CONTROL_MASK);
+                this.on_click(n_press, x, y, ctrl);
+            });
         }
         self.area.add_controller(click);
 
@@ -1254,7 +1257,7 @@ impl Canvas {
         Some((page, index))
     }
 
-    fn on_click(&self, n_press: i32, x: f64, y: f64) {
+    fn on_click(&self, n_press: i32, x: f64, y: f64, ctrl: bool) {
         self.area.grab_focus();
 
         // Drawing/erasing tools act via the drag gesture, not clicks.
@@ -1262,10 +1265,22 @@ impl Canvas {
             return;
         }
 
-        // Lasso: a plain click (no real drag) either selects just the one
-        // annotation under it, or deselects.
+        // Lasso: a plain click either selects just the one annotation under
+        // it (replacing the selection), or deselects everything. Ctrl+click
+        // instead toggles just that one annotation in/out of the current
+        // selection, leaving the rest alone.
         if self.state.borrow().tool == Tool::Lasso {
             self.commit_editing();
+
+            if ctrl {
+                if let Some((page, index)) = self.annotation_hit(x, y)
+                    && let Some(id) = self.annotation_id(page, index)
+                {
+                    self.toggle_lasso_selected(page, id);
+                }
+                return;
+            }
+
             // The click gesture fires on *press*, before a drag gets any
             // chance to move (and so before it's known whether this press
             // will become a group move) - so if it landed inside the current
@@ -1805,6 +1820,28 @@ impl Canvas {
             let (bx, by, bw, bh) = union_bounds(&kinds);
             lx >= bx && lx <= bx + bw && ly >= by && ly <= by + bh
         })
+    }
+
+    /// Adds `id` to the Lasso selection, or removes it if already selected
+    /// (Ctrl+click). Starts a fresh single-item selection if nothing on
+    /// `page` was selected yet, or the existing selection was on another page.
+    fn toggle_lasso_selected(&self, page: usize, id: Uuid) {
+        let mut st = self.state.borrow_mut();
+        match &mut st.lasso_selected {
+            Some((sel_page, ids)) if *sel_page == page => {
+                if let Some(pos) = ids.iter().position(|existing| *existing == id) {
+                    ids.remove(pos);
+                    if ids.is_empty() {
+                        st.lasso_selected = None;
+                    }
+                } else {
+                    ids.push(id);
+                }
+            }
+            _ => st.lasso_selected = Some((page, vec![id])),
+        }
+        drop(st);
+        self.area.queue_draw();
     }
 
     /// Lifts every currently lasso-selected annotation on `page` out of the
