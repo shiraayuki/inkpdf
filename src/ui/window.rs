@@ -14,6 +14,8 @@ const DEFAULT_WIDTH: i32 = 900;
 const DEFAULT_HEIGHT: i32 = 700;
 /// Side of the square color swatch in the details panel.
 const SWATCH: i32 = 30;
+/// Points added/removed per click on the page width/height steppers.
+const PAGE_SIZE_STEP: f64 = 10.0;
 
 #[derive(Clone)]
 pub struct WindowUi {
@@ -74,21 +76,6 @@ pub fn build(app: &adw::Application) -> WindowUi {
     header.pack_start(&open_button);
     header.pack_start(&save_button);
 
-    let zoom_out_button = gtk::Button::builder()
-        .icon_name("zoom-out-symbolic")
-        .tooltip_text("Zoom out")
-        .css_classes(["flat"])
-        .build();
-    let zoom_in_button = gtk::Button::builder()
-        .icon_name("zoom-in-symbolic")
-        .tooltip_text("Zoom in")
-        .css_classes(["flat"])
-        .build();
-    let zoom_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    zoom_box.add_css_class("linked");
-    zoom_box.append(&zoom_out_button);
-    zoom_box.append(&zoom_in_button);
-
     // Dark/light toggle (default dark = not active).
     let theme_button = gtk::ToggleButton::builder()
         .icon_name("weather-clear-night-symbolic")
@@ -106,14 +93,36 @@ pub fn build(app: &adw::Application) -> WindowUi {
         }
     });
 
-    // Settings menu: zoom and dark/light live behind the gear button instead of
-    // sitting in the header directly.
+    let canvas = Canvas::new();
+
+    // Settings menu (behind the gear): zoom, page size, and the theme toggle.
+    let (zoom_row, zoom_label, zoom_minus, zoom_plus) = value_stepper();
+    let (width_row, width_label, width_minus, width_plus) = value_stepper();
+    let (height_row, height_label, height_minus, height_plus) = value_stepper();
+    let reset_button = gtk::Button::builder()
+        .label("Auf PDF-Größe zurücksetzen")
+        .css_classes(["flat"])
+        .build();
+
+    // Page-size controls act on blank pages only; grouped so they can be disabled
+    // together on a rendered PDF page.
+    let size_section = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    size_section.append(&caption("Breite"));
+    size_section.append(&width_row);
+    size_section.append(&caption("Höhe"));
+    size_section.append(&height_row);
+    size_section.append(&reset_button);
+
     let settings_menu = gtk::Box::new(gtk::Orientation::Vertical, 8);
     settings_menu.set_margin_top(10);
     settings_menu.set_margin_bottom(10);
     settings_menu.set_margin_start(10);
     settings_menu.set_margin_end(10);
-    settings_menu.append(&zoom_box);
+    settings_menu.append(&caption("Zoom"));
+    settings_menu.append(&zoom_row);
+    settings_menu.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    settings_menu.append(&size_section);
+    settings_menu.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     settings_menu.append(&theme_button);
     let settings_popover = gtk::Popover::builder().child(&settings_menu).build();
     let settings_button = gtk::MenuButton::builder()
@@ -124,9 +133,67 @@ pub fn build(app: &adw::Application) -> WindowUi {
         .build();
     header.pack_end(&settings_button);
 
-    load_css();
+    // Keeps the labels in sync with the current zoom/page and disables page-size
+    // controls on non-blank pages. Called when the popover opens and after each step.
+    let refresh_settings: Rc<dyn Fn()> = {
+        let canvas = canvas.clone();
+        let zoom_label = zoom_label.clone();
+        let width_label = width_label.clone();
+        let height_label = height_label.clone();
+        let size_section = size_section.clone();
+        Rc::new(move || {
+            zoom_label.set_text(&format!("{} %", (canvas.zoom() * 100.0).round() as i32));
+            if let Some((w, h)) = canvas.current_page_size() {
+                width_label.set_text(&format!("{} pt", w.round() as i32));
+                height_label.set_text(&format!("{} pt", h.round() as i32));
+            }
+            size_section.set_sensitive(canvas.current_page_is_blank());
+        })
+    };
 
-    let canvas = Canvas::new();
+    let step_zoom = |zoom_in: bool| {
+        let canvas = canvas.clone();
+        let refresh = refresh_settings.clone();
+        move |_: &gtk::Button| {
+            if zoom_in {
+                canvas.zoom_in();
+            } else {
+                canvas.zoom_out();
+            }
+            refresh();
+        }
+    };
+    zoom_minus.connect_clicked(step_zoom(false));
+    zoom_plus.connect_clicked(step_zoom(true));
+
+    let step_size = |dw: f64, dh: f64| {
+        let canvas = canvas.clone();
+        let refresh = refresh_settings.clone();
+        move |_: &gtk::Button| {
+            if let Some((w, h)) = canvas.current_page_size() {
+                canvas.resize_current_page(w + dw, h + dh);
+                refresh();
+            }
+        }
+    };
+    width_minus.connect_clicked(step_size(-PAGE_SIZE_STEP, 0.0));
+    width_plus.connect_clicked(step_size(PAGE_SIZE_STEP, 0.0));
+    height_minus.connect_clicked(step_size(0.0, -PAGE_SIZE_STEP));
+    height_plus.connect_clicked(step_size(0.0, PAGE_SIZE_STEP));
+    {
+        let canvas = canvas.clone();
+        let refresh = refresh_settings.clone();
+        reset_button.connect_clicked(move |_| {
+            canvas.reset_current_page_size();
+            refresh();
+        });
+    }
+    {
+        let refresh = refresh_settings.clone();
+        settings_popover.connect_show(move |_| refresh());
+    }
+
+    load_css();
 
     // Floating Rnote-style panels overlaid on the canvas: tools on the right,
     // tool details on the left.
@@ -183,14 +250,6 @@ pub fn build(app: &adw::Application) -> WindowUi {
         title,
     };
 
-    {
-        let canvas = canvas.clone();
-        zoom_in_button.connect_clicked(move |_| canvas.zoom_in());
-    }
-    {
-        let canvas = canvas.clone();
-        zoom_out_button.connect_clicked(move |_| canvas.zoom_out());
-    }
     {
         let ui = ui.clone();
         open_button.connect_clicked(move |_| open_dialog(&ui));
@@ -436,6 +495,30 @@ fn flat_icon_button(icon: &str, tip: &str) -> gtk::Button {
     button.add_css_class("flat");
     button.add_css_class("circular");
     button
+}
+
+/// A dim caption label for a settings section.
+fn caption(text: &str) -> gtk::Label {
+    let label = gtk::Label::new(Some(text));
+    label.set_xalign(0.0);
+    label.add_css_class("caption");
+    label.add_css_class("dim-label");
+    label
+}
+
+/// Horizontal stepper for the settings popover: `[-]  value  [+]`. Returns the row,
+/// its centered value label, and the two buttons (wired by the caller).
+fn value_stepper() -> (gtk::Box, gtk::Label, gtk::Button, gtk::Button) {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let minus = flat_icon_button("list-remove-symbolic", "Kleiner");
+    let plus = flat_icon_button("list-add-symbolic", "Größer");
+    let label = gtk::Label::new(None);
+    label.set_hexpand(true);
+    label.set_width_chars(7);
+    row.append(&minus);
+    row.append(&label);
+    row.append(&plus);
+    (row, label, minus, plus)
 }
 
 fn flat_toggle(icon: &str, tip: &str) -> gtk::ToggleButton {

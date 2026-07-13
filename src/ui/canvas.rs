@@ -252,6 +252,8 @@ struct DragState {
 const PEN_WIDTH: f64 = 3.0;
 const SHAPE_WIDTH: f64 = 3.0;
 const ERASER_WIDTH: f64 = 10.0;
+/// Smallest allowed page dimension in points.
+const MIN_PAGE: f64 = 50.0;
 
 /// An in-progress drawing/erasing gesture (page-local coordinates in points).
 enum Draw {
@@ -777,6 +779,67 @@ impl Canvas {
 
     pub fn zoom_out(&self) {
         self.set_zoom(self.zoom() / ZOOM_STEP);
+    }
+
+    /// Size (width, height) in points of the current page.
+    pub fn current_page_size(&self) -> Option<(f64, f64)> {
+        let idx = self.current_index();
+        let st = self.state.borrow();
+        st.doc.as_ref()?.pages.get(idx).map(|p| (p.width, p.height))
+    }
+
+    /// Whether the current page is a resizable blank page (not a rendered PDF page).
+    pub fn current_page_is_blank(&self) -> bool {
+        let idx = self.current_index();
+        let st = self.state.borrow();
+        matches!(
+            st.doc.as_ref().and_then(|d| d.pages.get(idx)).map(|p| &p.kind),
+            Some(PageKind::Blank { .. })
+        )
+    }
+
+    /// Resizes the current page (blank pages only). One undo entry per call.
+    pub fn resize_current_page(&self, width: f64, height: f64) {
+        if !self.current_page_is_blank() {
+            return;
+        }
+        let idx = self.current_index();
+        self.record_change();
+        {
+            let mut st = self.state.borrow_mut();
+            if let Some(p) = st.doc.as_mut().and_then(|d| d.pages.get_mut(idx)) {
+                p.width = width.max(MIN_PAGE);
+                p.height = height.max(MIN_PAGE);
+            }
+            st.cache.remove(&idx);
+        }
+        self.update_layout();
+    }
+
+    /// Resets the current blank page to the nearest real PDF page size (the closest
+    /// preceding one, else the closest following one; A4 if there is no PDF page).
+    pub fn reset_current_page_size(&self) {
+        if !self.current_page_is_blank() {
+            return;
+        }
+        let idx = self.current_index();
+        let (w, h) = self.nearest_pdf_page_size(idx);
+        self.resize_current_page(w, h);
+    }
+
+    fn nearest_pdf_page_size(&self, idx: usize) -> (f64, f64) {
+        let st = self.state.borrow();
+        let Some(doc) = st.doc.as_ref() else {
+            return A4;
+        };
+        let preceding = (0..idx).rev();
+        let following = (idx + 1)..doc.pages.len();
+        for i in preceding.chain(following) {
+            if let PageKind::Pdf { .. } = doc.pages[i].kind {
+                return (doc.pages[i].width, doc.pages[i].height);
+            }
+        }
+        A4
     }
 
     /// Index of the page whose area contains the viewport's vertical center.
