@@ -364,6 +364,8 @@ struct Overlay<'a> {
     dragging: Option<&'a DragState>,
     selected: Option<(usize, Uuid)>,
     drawing: Option<&'a Draw>,
+    lasso_selected: Option<&'a (usize, Vec<Uuid>)>,
+    lasso_op: Option<&'a LassoOp>,
 }
 
 struct State {
@@ -410,6 +412,16 @@ struct State {
     /// blank page).
     blank_pattern: PagePattern,
     blank_pattern_spacing: f64,
+    /// Multi-selected annotations for the Lasso tool: (page, ids).
+    lasso_selected: Option<(usize, Vec<Uuid>)>,
+    /// Widget-space point where a Lasso-tool press began.
+    lasso_press: Option<(f64, f64)>,
+    /// (page, x, y) in page-local points where the press landed - promoted to
+    /// `lasso_op` once the drag exceeds the threshold (mirrors `drag_start` ->
+    /// `dragging`).
+    lasso_start: Option<(usize, f64, f64)>,
+    /// The in-progress Lasso gesture, once the drag has exceeded the threshold.
+    lasso_op: Option<LassoOp>,
 }
 
 /// Where an insert/delete acts relative to the current page.
@@ -419,7 +431,7 @@ pub enum Relative {
     After,
 }
 
-/// The selectable tools. Only `Text` is interactive so far; the rest are placeholders.
+/// The selectable tools.
 #[derive(Clone, Copy, PartialEq)]
 pub enum Tool {
     Select,
@@ -427,8 +439,20 @@ pub enum Tool {
     Pen,
     Eraser,
     Shape,
+    /// Rectangle multi-select: drag a marquee to select strokes/shapes/text,
+    /// then move or bulk-restyle the group, or delete it.
+    Lasso,
     Markdown,
     Pages,
+}
+
+/// An in-progress Lasso-tool gesture.
+enum LassoOp {
+    /// Marquee rectangle from `start` to `current` (page-local points).
+    Marquee { page: usize, start: (f64, f64), current: (f64, f64) },
+    /// Group-dragging the lifted annotations; `orig` is the pre-drag snapshot,
+    /// parallel to `lifted` by index, and translated fresh from it each frame.
+    Move { page: usize, orig: Vec<AnnotationKind>, lifted: Vec<Annotation> },
 }
 
 #[derive(Clone)]
@@ -480,6 +504,10 @@ impl Canvas {
             eraser_width: ERASER_WIDTH,
             blank_pattern: PagePattern::Plain,
             blank_pattern_spacing: DEFAULT_PATTERN_SPACING,
+            lasso_selected: None,
+            lasso_press: None,
+            lasso_start: None,
+            lasso_op: None,
         }));
 
         {
@@ -1188,6 +1216,17 @@ impl Canvas {
             return;
         }
 
+        // Lasso: a plain click (no real drag - that's handled in on_drag_*)
+        // either selects just the one annotation under it, or deselects.
+        if self.state.borrow().tool == Tool::Lasso {
+            self.commit_editing();
+            let hit = self.annotation_hit(x, y);
+            let selected = hit.and_then(|(page, index)| self.annotation_id(page, index).map(|id| (page, vec![id])));
+            self.state.borrow_mut().lasso_selected = selected;
+            self.area.queue_draw();
+            return;
+        }
+
         // Clicking inside the box being edited just moves the caret.
         if let Some((page, lx, ly)) = self.page_hit(x, y)
             && self.click_in_editing(page, lx, ly)
@@ -1370,12 +1409,17 @@ impl Canvas {
         }
 
         if self.state.borrow().editing.is_none() {
-            // Not editing: Delete/Backspace removes the selected box.
-            if self.state.borrow().selected.is_some()
-                && matches!(keyval, gdk::Key::Delete | gdk::Key::KP_Delete | gdk::Key::BackSpace)
-            {
-                self.delete_selected();
-                return glib::Propagation::Stop;
+            // Not editing: Delete/Backspace removes the Lasso group, or else the
+            // single selected box.
+            if matches!(keyval, gdk::Key::Delete | gdk::Key::KP_Delete | gdk::Key::BackSpace) {
+                if self.state.borrow().lasso_selected.is_some() {
+                    self.delete_lasso_selected();
+                    return glib::Propagation::Stop;
+                }
+                if self.state.borrow().selected.is_some() {
+                    self.delete_selected();
+                    return glib::Propagation::Stop;
+                }
             }
             return glib::Propagation::Proceed;
         }
@@ -1474,6 +1518,11 @@ impl Canvas {
             return;
         }
 
+        if tool == Tool::Lasso {
+            self.begin_lasso(x, y);
+            return;
+        }
+
         // A drag inside the box being edited selects text. This applies whenever
         // an edit is active, not just with the Text tool - editing can also start
         // from a Select-mode double-click, which never sets `text_mode`.
@@ -1537,6 +1586,12 @@ impl Canvas {
         // Drawing/erasing: the gesture owns the pointer while draw_op is active.
         if self.state.borrow().draw_op.is_some() {
             self.update_draw(offset_x, offset_y);
+            return;
+        }
+
+        // Lasso: marquee-select or group-move owns the pointer while active.
+        if self.state.borrow().lasso_start.is_some() || self.state.borrow().lasso_op.is_some() {
+            self.update_lasso(offset_x, offset_y);
             return;
         }
 
@@ -1611,9 +1666,256 @@ impl Canvas {
         st.drag_start = None;
     }
 
+    /// Records where a Lasso-tool press landed; the actual marquee/group-move
+    /// gesture is only decided once the drag exceeds the threshold (see
+    /// `update_lasso`), so a plain click can still fall through to `on_click`.
+    fn begin_lasso(&self, x: f64, y: f64) {
+        let hit = self.page_hit(x, y);
+        let mut st = self.state.borrow_mut();
+        st.lasso_op = None;
+        st.lasso_press = Some((x, y));
+        st.lasso_start = hit;
+    }
+
+    /// Promotes a pending Lasso press into either a group move (press landed on
+    /// an already-selected annotation) or a fresh marquee rectangle.
+    fn start_lasso_op(&self) {
+        let Some((page, lx, ly)) = self.state.borrow().lasso_start else {
+            return;
+        };
+        let hit_id = {
+            let st = self.state.borrow();
+            st.doc
+                .as_ref()
+                .and_then(|d| d.pages.get(page))
+                .and_then(|p| annotation_at(p, lx, ly).map(|idx| p.annotations[idx].id))
+        };
+        let in_selection = hit_id.is_some_and(|id| {
+            self.state.borrow().lasso_selected.as_ref().is_some_and(|(p, ids)| *p == page && ids.contains(&id))
+        });
+        if in_selection {
+            self.lift_lasso_group(page);
+        } else {
+            let mut st = self.state.borrow_mut();
+            st.lasso_selected = None;
+            st.lasso_op = Some(LassoOp::Marquee { page, start: (lx, ly), current: (lx, ly) });
+        }
+    }
+
+    /// Lifts every currently lasso-selected annotation on `page` out of the
+    /// model into a `LassoOp::Move`, so the group can be dragged as one unit.
+    fn lift_lasso_group(&self, page: usize) {
+        let mut st = self.state.borrow_mut();
+        let Some((sel_page, ids)) = st.lasso_selected.clone() else {
+            return;
+        };
+        if sel_page != page {
+            return;
+        }
+        // Snapshot before lifting so the whole move is one undo entry.
+        let snapshot = st.doc.as_ref().map(|d| d.pages.clone());
+        let Some(p) = st.doc.as_mut().and_then(|d| d.pages.get_mut(page)) else {
+            return;
+        };
+        let mut lifted = Vec::new();
+        let mut orig = Vec::new();
+        p.annotations.retain(|a| {
+            if ids.contains(&a.id) {
+                orig.push(a.kind.clone());
+                lifted.push(a.clone());
+                false
+            } else {
+                true
+            }
+        });
+        if lifted.is_empty() {
+            return;
+        }
+        if let Some(snapshot) = snapshot {
+            st.history.record(snapshot);
+        }
+        st.cache.remove(&page);
+        st.lasso_op = Some(LassoOp::Move { page, orig, lifted });
+    }
+
+    fn update_lasso(&self, offset_x: f64, offset_y: f64) {
+        let should_start = {
+            let st = self.state.borrow();
+            st.lasso_op.is_none()
+                && st.lasso_start.is_some()
+                && offset_x * offset_x + offset_y * offset_y > DRAG_THRESHOLD_SQ
+        };
+        if should_start {
+            self.start_lasso_op();
+        }
+
+        let Some((px, py)) = self.state.borrow().lasso_press else {
+            return;
+        };
+        let current_hit = self.page_hit(px + offset_x, py + offset_y);
+        let zoom = self.state.borrow().zoom;
+
+        let mut st = self.state.borrow_mut();
+        let State { doc, lasso_op, .. } = &mut *st;
+        match lasso_op {
+            Some(LassoOp::Marquee { page, current, .. }) => {
+                if let Some((hit_page, lx, ly)) = current_hit
+                    && hit_page == *page
+                {
+                    *current = (lx, ly);
+                }
+            }
+            Some(LassoOp::Move { page, orig, lifted }) => {
+                let (pw, ph) =
+                    doc.as_ref().and_then(|d| d.pages.get(*page)).map(|p| (p.width, p.height)).unwrap_or(A4);
+                let (bx, by, bw, bh) = union_bounds(orig);
+                let (dx, dy) = clamp_translate(bx, by, bw, bh, offset_x / zoom, offset_y / zoom, pw, ph);
+                for (annotation, orig_kind) in lifted.iter_mut().zip(orig.iter()) {
+                    annotation.kind = translate_annotation(orig_kind, dx, dy);
+                }
+            }
+            None => {}
+        }
+        drop(st);
+        self.area.queue_draw();
+    }
+
+    fn end_lasso(&self) {
+        let op = {
+            let mut st = self.state.borrow_mut();
+            st.lasso_start = None;
+            st.lasso_press = None;
+            st.lasso_op.take()
+        };
+        match op {
+            Some(LassoOp::Move { page, lifted, .. }) => {
+                let mut st = self.state.borrow_mut();
+                let ids: Vec<Uuid> = lifted.iter().map(|a| a.id).collect();
+                if let Some(p) = st.doc.as_mut().and_then(|d| d.pages.get_mut(page)) {
+                    p.annotations.extend(lifted);
+                }
+                st.lasso_selected = Some((page, ids));
+                st.cache.remove(&page);
+                drop(st);
+                self.area.queue_draw();
+            }
+            Some(LassoOp::Marquee { page, start, current }) => {
+                let (x0, y0) = start;
+                let (x1, y1) = current;
+                let rect = (x0.min(x1), y0.min(y1), (x1 - x0).abs(), (y1 - y0).abs());
+                let mut st = self.state.borrow_mut();
+                let ids: Vec<Uuid> = st
+                    .doc
+                    .as_ref()
+                    .and_then(|d| d.pages.get(page))
+                    .map(|p| {
+                        p.annotations
+                            .iter()
+                            .filter(|a| rects_intersect(annotation_bounds(&a.kind), rect))
+                            .map(|a| a.id)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                st.lasso_selected = if ids.is_empty() { None } else { Some((page, ids)) };
+                drop(st);
+                self.area.queue_draw();
+            }
+            None => {}
+        }
+    }
+
+    /// Removes every lasso-selected annotation (one undo entry).
+    fn delete_lasso_selected(&self) {
+        let Some((page, ids)) = self.state.borrow().lasso_selected.clone() else {
+            return;
+        };
+        self.record_change();
+        {
+            let mut st = self.state.borrow_mut();
+            if let Some(p) = st.doc.as_mut().and_then(|d| d.pages.get_mut(page)) {
+                p.annotations.retain(|a| !ids.contains(&a.id));
+            }
+            st.lasso_selected = None;
+            st.cache.remove(&page);
+        }
+        self.area.queue_draw();
+    }
+
+    /// Applies `f` to every lasso-selected annotation whose kind matches
+    /// `applies_to` (one undo entry if anything actually applies).
+    fn apply_to_lasso_if(&self, applies_to: fn(&AnnotationKind) -> bool, f: impl Fn(&mut AnnotationKind)) {
+        let Some((page, ids)) = self.state.borrow().lasso_selected.clone() else {
+            return;
+        };
+        let any_applies = self
+            .state
+            .borrow()
+            .doc
+            .as_ref()
+            .and_then(|d| d.pages.get(page))
+            .map(|p| p.annotations.iter().any(|a| ids.contains(&a.id) && applies_to(&a.kind)))
+            .unwrap_or(false);
+        if !any_applies {
+            return;
+        }
+        self.record_change();
+        let mut st = self.state.borrow_mut();
+        if let Some(p) = st.doc.as_mut().and_then(|d| d.pages.get_mut(page)) {
+            for annotation in p.annotations.iter_mut().filter(|a| ids.contains(&a.id)) {
+                if applies_to(&annotation.kind) {
+                    f(&mut annotation.kind);
+                }
+            }
+        }
+        st.cache.remove(&page);
+        drop(st);
+        self.area.queue_draw();
+    }
+
+    /// Bulk-recolors the Stroke/Shape members of the current Lasso selection.
+    pub fn set_lasso_color(&self, color: Color) {
+        self.apply_to_lasso_if(
+            |k| matches!(k, AnnotationKind::Stroke(_) | AnnotationKind::Shape(_)),
+            move |k| match k {
+                AnnotationKind::Stroke(s) => s.color = color,
+                AnnotationKind::Shape(s) => s.color = color,
+                AnnotationKind::Text(_) => {}
+            },
+        );
+    }
+
+    /// Bulk-resizes the Stroke/Shape members of the current Lasso selection.
+    pub fn set_lasso_width(&self, width: f64) {
+        self.apply_to_lasso_if(
+            |k| matches!(k, AnnotationKind::Stroke(_) | AnnotationKind::Shape(_)),
+            move |k| match k {
+                AnnotationKind::Stroke(s) => s.width = width,
+                AnnotationKind::Shape(s) => s.width = width,
+                AnnotationKind::Text(_) => {}
+            },
+        );
+    }
+
+    /// Bulk-changes the shape kind of the Shape members of the current Lasso selection.
+    pub fn set_lasso_shape_kind(&self, kind: ShapeKind) {
+        self.apply_to_lasso_if(
+            |k| matches!(k, AnnotationKind::Shape(_)),
+            move |k| {
+                if let AnnotationKind::Shape(s) = k {
+                    s.shape = kind;
+                }
+            },
+        );
+    }
+
     fn on_drag_end(&self) {
         if self.state.borrow().draw_op.is_some() {
             self.finish_draw();
+            return;
+        }
+
+        if self.state.borrow().lasso_start.is_some() || self.state.borrow().lasso_op.is_some() {
+            self.end_lasso();
             return;
         }
 
@@ -1836,7 +2138,7 @@ impl Canvas {
             Tool::Text => text_cursor((text_line_height(text_size) * z).round() as i32),
             Tool::Eraser => circle_cursor((eraser_width * z).round() as i32),
             Tool::Pen | Tool::Shape => plus_cursor(),
-            Tool::Select | Tool::Markdown | Tool::Pages => None,
+            Tool::Select | Tool::Lasso | Tool::Markdown | Tool::Pages => None,
         };
         self.area.set_cursor(cursor.as_ref());
     }
@@ -2016,7 +2318,19 @@ fn draw(state: &Rc<RefCell<State>>, ctx: &cairo::Context, width: i32) {
 
     let mut st = state.borrow_mut();
     let State {
-        doc, pdf, zoom, cache, text_mode, editing, current, dragging, selected, draw_op, ..
+        doc,
+        pdf,
+        zoom,
+        cache,
+        text_mode,
+        editing,
+        current,
+        dragging,
+        selected,
+        draw_op,
+        lasso_selected,
+        lasso_op,
+        ..
     } = &mut *st;
     let Some(doc) = doc.as_ref() else {
         return;
@@ -2029,6 +2343,8 @@ fn draw(state: &Rc<RefCell<State>>, ctx: &cairo::Context, width: i32) {
         dragging: dragging.as_ref(),
         selected: *selected,
         drawing: draw_op.as_ref(),
+        lasso_selected: lasso_selected.as_ref(),
+        lasso_op: lasso_op.as_ref(),
     };
 
     let (_x0, cy0, _x1, cy1) = ctx.clip_extents().unwrap_or((0.0, 0.0, f64::MAX, f64::MAX));
@@ -2288,6 +2604,30 @@ fn clamp_translate(bx: f64, by: f64, bw: f64, bh: f64, dx: f64, dy: f64, pw: f64
     (dx.clamp(min_dx, max_dx), dy.clamp(min_dy, max_dy))
 }
 
+/// Combined bounding box (x, y, w, h) of several annotation kinds, e.g. for
+/// clamping a Lasso group-move so the whole group stays on the page.
+fn union_bounds(kinds: &[AnnotationKind]) -> (f64, f64, f64, f64) {
+    let mut iter = kinds.iter().map(annotation_bounds);
+    let Some((x0, y0, w0, h0)) = iter.next() else {
+        return (0.0, 0.0, 0.0, 0.0);
+    };
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (x0, y0, x0 + w0, y0 + h0);
+    for (x, y, w, h) in iter {
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x + w);
+        max_y = max_y.max(y + h);
+    }
+    (min_x, min_y, max_x - min_x, max_y - min_y)
+}
+
+/// Whether two (x, y, w, h) rectangles overlap.
+fn rects_intersect(a: (f64, f64, f64, f64), b: (f64, f64, f64, f64)) -> bool {
+    let (ax, ay, aw, ah) = a;
+    let (bx, by, bw, bh) = b;
+    ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by
+}
+
 /// Draws a freehand stroke as a Catmull-Rom spline through the sampled points
 /// (rendered as cubic Béziers), so it looks smooth instead of polygonal.
 /// A single point renders as a dot.
@@ -2538,6 +2878,37 @@ fn draw_overlay(c: &cairo::Context, page: &Page, index: usize, zoom: f64, overla
         draw_annotation(c, &ds.annotation.kind);
         let (x, y, w, h) = annotation_bounds(&ds.annotation.kind);
         stroke_box(c, x, y, w, h, zoom, BOX_ACTIVE);
+    }
+
+    // Selection handles for every Lasso-selected annotation.
+    if let Some((sel_page, ids)) = overlay.lasso_selected
+        && *sel_page == index
+    {
+        for id in ids {
+            if let Some(annotation) = page.annotations.iter().find(|a| a.id == *id) {
+                let (x, y, w, h) = annotation_bounds(&annotation.kind);
+                stroke_selection_handles(c, x, y, w, h, zoom);
+            }
+        }
+    }
+
+    // The in-progress Lasso gesture: a marquee rectangle, or the group being dragged.
+    if let Some(op) = overlay.lasso_op {
+        match op {
+            LassoOp::Marquee { page: op_page, start, current } if *op_page == index => {
+                let (x0, y0) = *start;
+                let (x1, y1) = *current;
+                stroke_box(c, x0.min(x1), y0.min(y1), (x1 - x0).abs(), (y1 - y0).abs(), zoom, BOX_ACTIVE);
+            }
+            LassoOp::Move { page: op_page, lifted, .. } if *op_page == index => {
+                for annotation in lifted {
+                    draw_annotation(c, &annotation.kind);
+                    let (x, y, w, h) = annotation_bounds(&annotation.kind);
+                    stroke_selection_handles(c, x, y, w, h, zoom);
+                }
+            }
+            _ => {}
+        }
     }
 
     // Live preview of the in-progress pen stroke or shape.
@@ -2965,6 +3336,33 @@ mod tests {
         // Moving far left/up clamps to exactly reach the page's left/top edge.
         let (dx, dy) = clamp_translate(70.0, 70.0, 20.0, 20.0, -200.0, -200.0, 100.0, 100.0);
         assert_eq!((dx, dy), (-70.0, -70.0));
+    }
+
+    #[test]
+    fn union_bounds_covers_the_whole_group() {
+        let a = AnnotationKind::Shape(ShapeAnnotation {
+            shape: ShapeKind::Rectangle,
+            x0: 0.0,
+            y0: 0.0,
+            x1: 5.0,
+            y1: 5.0,
+            color: Color::BLACK,
+            width: 1.0,
+        });
+        let b = AnnotationKind::Stroke(StrokeAnnotation {
+            points: vec![(10.0, 10.0), (20.0, 15.0)],
+            color: Color::BLACK,
+            width: 1.0,
+        });
+        assert_eq!(union_bounds(&[a, b]), (0.0, 0.0, 20.0, 15.0));
+        assert_eq!(union_bounds(&[]), (0.0, 0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn rects_intersect_cases() {
+        assert!(rects_intersect((0.0, 0.0, 10.0, 10.0), (5.0, 5.0, 10.0, 10.0)), "overlapping");
+        assert!(!rects_intersect((0.0, 0.0, 10.0, 10.0), (10.0, 10.0, 5.0, 5.0)), "touching edges only");
+        assert!(!rects_intersect((0.0, 0.0, 10.0, 10.0), (20.0, 20.0, 5.0, 5.0)), "far apart");
     }
 
     #[test]

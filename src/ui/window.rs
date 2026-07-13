@@ -786,10 +786,11 @@ fn build_tool_strip(canvas: &Canvas, details: &gtk::Stack) -> gtk::Box {
     let strip = gtk::Box::new(gtk::Orientation::Vertical, 6);
     strip.add_css_class("inkpdf-panel");
 
-    let tools: [(&str, &str, Tool, &str); 6] = [
+    let tools: [(&str, &str, Tool, &str); 7] = [
         ("inkpdf-pen-symbolic", "Pen", Tool::Pen, "pen"),
         ("inkpdf-shapes-symbolic", "Shapes", Tool::Shape, "shapes"),
         ("inkpdf-text-symbolic", "Text", Tool::Text, "text"),
+        ("inkpdf-select-symbolic", "Select (drag to lasso strokes/shapes)", Tool::Lasso, "lasso"),
         ("inkpdf-eraser-symbolic", "Eraser", Tool::Eraser, "eraser"),
         ("inkpdf-markdown-symbolic", "Markdown text", Tool::Markdown, "markdown"),
         ("inkpdf-pages-symbolic", "Pages", Tool::Pages, "pages"),
@@ -864,6 +865,7 @@ fn build_details_panel(canvas: &Canvas) -> (gtk::Stack, gtk::Button, gtk::Button
     stack.add_named(&page_pen(canvas), Some("pen"));
     stack.add_named(&page_shapes(canvas), Some("shapes"));
     stack.add_named(&page_text(canvas), Some("text"));
+    stack.add_named(&page_lasso(canvas), Some("lasso"));
     stack.add_named(&page_eraser(canvas), Some("eraser"));
     stack.add_named(&page_markdown(), Some("markdown"));
     stack.set_visible_child_name("pen");
@@ -1165,6 +1167,39 @@ fn page_shapes(canvas: &Canvas) -> gtk::Box {
     {
         let canvas = canvas.clone();
         page.append(&size_stepper(3.0, 1.0, 20.0, 1.0, 0, move |v| canvas.set_shape_width(v)));
+    }
+    page
+}
+
+/// Lasso ("Select") tool page: bulk-edits the current multi-selection. The
+/// shape-kind buttons are plain (momentary), not toggles - like the text
+/// style buttons, they act on the selection and must not stick in :checked.
+fn page_lasso(canvas: &Canvas) -> gtk::Box {
+    let page = detail_column();
+
+    let shapes: [(&str, &str, ShapeKind); 3] = [
+        ("inkpdf-rect-symbolic", "Als Rechteck", ShapeKind::Rectangle),
+        ("inkpdf-ellipse-symbolic", "Als Ellipse", ShapeKind::Ellipse),
+        ("inkpdf-line-symbolic", "Als Linie", ShapeKind::Line),
+    ];
+    for (icon, tip, kind) in shapes {
+        let button = flat_icon_button(icon, tip);
+        let canvas = canvas.clone();
+        button.connect_clicked(move |_| canvas.set_lasso_shape_kind(kind));
+        page.append(&button);
+    }
+
+    page.append(&hsep());
+    let color = color_button();
+    {
+        let canvas = canvas.clone();
+        color.connect_rgba_notify(move |btn| canvas.set_lasso_color(color_from_rgba(&btn.rgba())));
+    }
+    page.append(&color);
+
+    {
+        let canvas = canvas.clone();
+        page.append(&size_stepper(3.0, 0.5, 20.0, 0.5, 1, move |v| canvas.set_lasso_width(v)));
     }
     page
 }
