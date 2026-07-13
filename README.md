@@ -35,9 +35,34 @@ simplicity, with room to grow toward Xournal++-style depth.
 
 ## Installation
 
-inkpdf currently only targets Linux. There's no packaged release yet — build it from source:
+inkpdf currently only targets Linux. There's no published Flathub/AUR release yet, but you can
+build a proper sandboxed Flatpak (or build from source) yourself.
 
-### Dependencies
+### Flatpak
+
+Requires `flatpak` and `flatpak-builder`, plus the Flathub remote:
+
+```sh
+flatpak remote-add --if-not-exists --user flathub https://flathub.org/repo/flathub.flatpakrepo
+```
+
+Then, from a checkout of this repo:
+
+```sh
+flatpak install --user flathub org.gnome.Platform//49 org.gnome.Sdk//49 \
+    org.freedesktop.Sdk.Extension.rust-stable//25.08
+flatpak-builder --user --install --force-clean build-dir de.nikolas.inkpdf.json
+flatpak run de.nikolas.inkpdf
+```
+
+This builds poppler from source and inkpdf offline against the vendored crates in
+`cargo-sources.json`, so the first build takes a few minutes. All PDF parsing/rendering happens
+in a Landlock+seccomp-sandboxed subprocess regardless of how you install inkpdf (see
+"Sandboxed PDF parsing" above) — the Flatpak's own sandbox is on top of that, not instead of it.
+
+### Build from source
+
+#### Dependencies
 
 - Rust (stable, edition 2024 support required — 1.85+)
 - `gtk4`, `libadwaita`, `poppler-glib` (development packages)
@@ -48,17 +73,14 @@ On Arch Linux:
 sudo pacman -S gtk4 libadwaita poppler-glib
 ```
 
-### Build
+#### Build
 
 ```sh
-git clone <this-repo-url>
+git clone https://github.com/shiraayuki/inkpdf
 cd inkpdf
 cargo build --release
 ./target/release/inkpdf
 ```
-
-A Flatpak manifest (`de.nikolas.inkpdf.json`) is also included in the repo for building a
-sandboxed package locally with `flatpak-builder`.
 
 ## Screenshots
 
