@@ -25,18 +25,18 @@
     "semantic_hash": "7d9a75c9d4e38d2cfd996650e4027c11"
   },
   "src/ui/canvas.rs": {
-    "mtime": 1783950541.3125753,
-    "ast_hash": "7a5abaa48c959ca582ecd053244e309a",
+    "mtime": 1783951143.532137,
+    "ast_hash": "a2b8eec54c449106ef60b3c81de7da1c",
     "semantic_hash": ""
   },
   "src/ui/mod.rs": {
-    "mtime": 1783853898.274945,
-    "ast_hash": "5a3efbaf26b25bbcd0a9838e7ccc6576",
-    "semantic_hash": "5a3efbaf26b25bbcd0a9838e7ccc6576"
+    "mtime": 1783951089.8722448,
+    "ast_hash": "3e583150dec8f8e70b0351dddcedef9a",
+    "semantic_hash": ""
   },
   "src/ui/window.rs": {
-    "mtime": 1783950547.6515355,
-    "ast_hash": "9c69088c8272adae848ff9d45aa4d8a4",
+    "mtime": 1783951247.4888818,
+    "ast_hash": "3c3abeca87bcafa3629e66fb6518113a",
     "semantic_hash": ""
   },
   "data/icons/hicolor/scalable/actions/inkpdf-ellipse-symbolic.svg": {
@@ -108,5 +108,10 @@
     "mtime": 1783869518.724136,
     "ast_hash": "50499aa05f6d9d2f4d0459b6a5dfcc45",
     "semantic_hash": "50499aa05f6d9d2f4d0459b6a5dfcc45"
+  },
+  "src/ui/settings.rs": {
+    "mtime": 1783951275.3818042,
+    "ast_hash": "cc95887e421bce44f9dc564823a7e064",
+    "semantic_hash": ""
   }
 }

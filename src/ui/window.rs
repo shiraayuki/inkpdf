@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use adw::prelude::*;
-use gtk::{gdk, gio};
+use gtk::{gdk, gio, glib};
 
 use crate::engine::OpenDocument;
 use crate::engine::document::{
@@ -12,6 +12,7 @@ use crate::engine::document::{
 use crate::engine::pdf::PdfDocument;
 use crate::engine::storage;
 use crate::ui::canvas::{Canvas, Relative, Tool, draw_page_pattern};
+use crate::ui::settings::{self, AppSettings};
 
 const DEFAULT_WIDTH: i32 = 900;
 const DEFAULT_HEIGHT: i32 = 700;
@@ -148,6 +149,24 @@ impl WindowUi {
 
     fn insert_page(&self, rel: Relative) {
         self.canvas.insert_blank_page(rel);
+    }
+
+    /// Snapshot of the current tool defaults, for persisting across restarts.
+    fn current_settings(&self, dark_mode: bool) -> AppSettings {
+        AppSettings {
+            dark_mode,
+            pen_color: self.canvas.pen_color(),
+            pen_width: self.canvas.pen_width(),
+            shape_kind: self.canvas.shape_kind(),
+            shape_color: self.canvas.shape_color(),
+            shape_width: self.canvas.shape_width(),
+            eraser_width: self.canvas.eraser_width(),
+            text_size: self.canvas.text_size(),
+            text_color: self.canvas.text_color(),
+            text_font: self.canvas.text_font(),
+            blank_pattern: self.canvas.blank_pattern(),
+            blank_pattern_spacing: self.canvas.pattern_spacing(),
+        }
     }
 
     /// Creates a fresh blank tab, stashes the previously active tab's live canvas
@@ -495,6 +514,35 @@ pub fn build(app: &adw::Application) -> WindowUi {
     };
     canvas.set_open_document_with_zoom(OpenDocument { model, pdf }, zoom);
     ui.show_title(None);
+
+    // Restore persisted tool defaults (pen/shape/eraser/text, blank-page
+    // pattern, theme) from the last session, if any.
+    let saved_settings = settings::load();
+    theme_button.set_active(!saved_settings.dark_mode);
+    canvas.set_pen_color(saved_settings.pen_color);
+    canvas.set_pen_width(saved_settings.pen_width);
+    canvas.set_shape_kind(saved_settings.shape_kind);
+    canvas.set_shape_color(saved_settings.shape_color);
+    canvas.set_shape_width(saved_settings.shape_width);
+    canvas.set_eraser_width(saved_settings.eraser_width);
+    canvas.set_text_size(saved_settings.text_size);
+    canvas.set_text_color(saved_settings.text_color);
+    canvas.set_text_font(saved_settings.text_font);
+    canvas.set_blank_pattern(saved_settings.blank_pattern);
+    canvas.set_pattern_spacing(saved_settings.blank_pattern_spacing);
+
+    // Persist the current tool defaults when the window closes.
+    {
+        let ui = ui.clone();
+        let theme_button = theme_button.clone();
+        window.connect_close_request(move |_| {
+            let current = ui.current_settings(!theme_button.is_active());
+            if let Err(err) = settings::save(&current) {
+                eprintln!("failed to save settings: {err:#}");
+            }
+            glib::Propagation::Proceed
+        });
+    }
 
     register_shortcuts(app, &window, &ui);
 

@@ -622,29 +622,57 @@ impl Canvas {
         self.area.queue_draw();
     }
 
+    pub fn text_size(&self) -> f64 {
+        self.state.borrow().text_size
+    }
+
     pub fn set_pen_color(&self, color: Color) {
         self.state.borrow_mut().pen_color = color;
+    }
+
+    pub fn pen_color(&self) -> Color {
+        self.state.borrow().pen_color
     }
 
     pub fn set_pen_width(&self, width: f64) {
         self.state.borrow_mut().pen_width = width;
     }
 
+    pub fn pen_width(&self) -> f64 {
+        self.state.borrow().pen_width
+    }
+
     pub fn set_shape_kind(&self, kind: ShapeKind) {
         self.state.borrow_mut().shape_kind = kind;
+    }
+
+    pub fn shape_kind(&self) -> ShapeKind {
+        self.state.borrow().shape_kind
     }
 
     pub fn set_shape_color(&self, color: Color) {
         self.state.borrow_mut().shape_color = color;
     }
 
+    pub fn shape_color(&self) -> Color {
+        self.state.borrow().shape_color
+    }
+
     pub fn set_shape_width(&self, width: f64) {
         self.state.borrow_mut().shape_width = width;
+    }
+
+    pub fn shape_width(&self) -> f64 {
+        self.state.borrow().shape_width
     }
 
     pub fn set_eraser_width(&self, width: f64) {
         self.state.borrow_mut().eraser_width = width;
         self.update_cursor();
+    }
+
+    pub fn eraser_width(&self) -> f64 {
+        self.state.borrow().eraser_width
     }
 
     /// Sets the font color: becomes the color for newly typed characters and, while
@@ -653,9 +681,17 @@ impl Canvas {
         self.apply_style(move |s| s.color = color);
     }
 
+    pub fn text_color(&self) -> Color {
+        self.state.borrow().text_style.color
+    }
+
     /// Sets the font family (see `set_text_color` for the new-text/selection split).
     pub fn set_text_font(&self, font: String) {
         self.apply_style(move |s| s.font = font.clone());
+    }
+
+    pub fn text_font(&self) -> String {
+        self.state.borrow().text_style.font.clone()
     }
 
     pub fn toggle_bold(&self) {

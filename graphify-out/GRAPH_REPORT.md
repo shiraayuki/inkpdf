@@ -1,16 +1,16 @@
 # Graph Report - inkpdf  (2026-07-13)
 
 ## Corpus Check
-- 8 files · ~17,814 words
+- 9 files · ~18,277 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 341 nodes · 985 edges · 8 communities (7 shown, 1 thin omitted)
+- 366 nodes · 1037 edges · 15 communities (11 shown, 4 thin omitted)
 - Extraction: 100% EXTRACTED · 0% INFERRED · 0% AMBIGUOUS · INFERRED: 1 edges (avg confidence: 0.8)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `b1308b93`
+- Built from commit: `c511735d`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -21,16 +21,22 @@
 - Document Model
 - Text Editing & Styling
 - Engine / PDF Loading
+- Canvas
 - App Entry Point
+- settings.rs
+- Option
+- .style_selection
+- .on_click
+- .page_hit
 
 ## God Nodes (most connected - your core abstractions)
-1. `Canvas` - 95 edges
+1. `Canvas` - 104 edges
 2. `TextEdit` - 35 edges
-3. `WindowUi` - 30 edges
-4. `build()` - 27 edges
+3. `WindowUi` - 31 edges
+4. `build()` - 28 edges
 5. `Document` - 22 edges
-6. `State` - 20 edges
-7. `Color` - 16 edges
+6. `Color` - 20 edges
+7. `State` - 20 edges
 8. `Page` - 16 edges
 9. `TextStyle` - 15 edges
 10. `draw_overlay()` - 15 edges
@@ -44,55 +50,67 @@
   src/ui/canvas.rs → src/engine/document.rs
 - `State` --references--> `Color`  [EXTRACTED]
   src/ui/canvas.rs → src/engine/document.rs
-- `color_from_rgba()` --references--> `Color`  [EXTRACTED]
-  src/ui/window.rs → src/engine/document.rs
+- `AppSettings` --references--> `Color`  [EXTRACTED]
+  src/ui/settings.rs → src/engine/document.rs
 
 ## Import Cycles
 - None detected.
 
-## Communities (8 total, 1 thin omitted)
+## Communities (15 total, 4 thin omitted)
 
 ### Community 0 - "Canvas Rendering & Hit-Testing"
-Cohesion: 0.08
-Nodes (58): HashMap, ImageSurface, Instant, ModelerInputEventType, Page, ShapeAnnotation, ShapeKind, a4_page() (+50 more)
-
-### Community 1 - "Canvas Input & Edit Sessions"
-Cohesion: 0.06
-Nodes (15): Cursor, ScrolledWindow, Canvas, circle_cursor(), content_size(), cursor_from_draw(), plus_cursor(), Relative (+7 more)
+Cohesion: 0.07
+Nodes (62): HashMap, ImageSurface, Instant, ModelerInputEventType, Page, a4_page(), ann_glyphs(), annotation_at() (+54 more)
 
 ### Community 2 - "Window & Tool UI"
-Cohesion: 0.08
+Cohesion: 0.07
 Nodes (62): Application, ApplicationWindow, Button, Cell, ColorDialogButton, IsA, Label, MenuItem (+54 more)
 
 ### Community 3 - "Document Model"
 Cohesion: 0.08
-Nodes (31): Default, Annotation, AnnotationKind, Color, default_font(), Document, insert_blank_page_adds_page_at_index(), PageKind (+23 more)
+Nodes (32): Annotation, AnnotationKind, Color, default_font(), Document, insert_blank_page_adds_page_at_index(), PageKind, PagePattern (+24 more)
 
 ### Community 4 - "Text Editing & Styling"
-Cohesion: 0.14
-Nodes (12): Key, ModifierType, Propagation, ctrl_word_navigation_jumps_by_word(), empty_edit(), glyphs_of(), marker_and_bold_apply_to_selection(), shift_selects_and_color_applies_to_selection_only() (+4 more)
+Cohesion: 0.17
+Nodes (5): Key, ModifierType, Propagation, text_edit_insert_delete_and_navigate(), TextEdit
 
 ### Community 5 - "Engine / PDF Loading"
 Cohesion: 0.14
 Nodes (15): file_name(), OpenDocument, pdf_to_inkpdf_roundtrip_rebuilds_renderer(), Option, Path, Result, Self, String (+7 more)
 
+### Community 6 - "Canvas"
+Cohesion: 0.14
+Nodes (3): ScrolledWindow, Canvas, DrawingArea
+
+### Community 9 - "settings.rs"
+Cohesion: 0.29
+Nodes (12): AppSettings, load(), load_from(), path(), roundtrip_preserves_settings(), Default, PathBuf, Result (+4 more)
+
+### Community 11 - "Option"
+Cohesion: 0.27
+Nodes (7): Cursor, circle_cursor(), cursor_from_draw(), plus_cursor(), Option, stroke_halo(), text_cursor()
+
+### Community 12 - ".style_selection"
+Cohesion: 0.22
+Nodes (3): Fn, String, text_of()
+
 ## Knowledge Gaps
-- **1 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **4 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `Canvas` connect `Canvas Input & Edit Sessions` to `Canvas Rendering & Hit-Testing`, `Window & Tool UI`, `Document Model`, `Text Editing & Styling`, `Engine / PDF Loading`?**
-  _High betweenness centrality (0.458) - this node is a cross-community bridge._
-- **Why does `Document` connect `Document Model` to `Canvas Rendering & Hit-Testing`, `Canvas Input & Edit Sessions`, `Window & Tool UI`, `Engine / PDF Loading`?**
-  _High betweenness centrality (0.125) - this node is a cross-community bridge._
-- **Why does `WindowUi` connect `Window & Tool UI` to `Canvas Input & Edit Sessions`?**
-  _High betweenness centrality (0.102) - this node is a cross-community bridge._
+- **Why does `Canvas` connect `Canvas` to `Canvas Rendering & Hit-Testing`, `Canvas Input & Edit Sessions`, `Window & Tool UI`, `Document Model`, `Text Editing & Styling`, `Engine / PDF Loading`, `.commit_editing`, `Option`, `.style_selection`, `.on_click`, `.page_hit`?**
+  _High betweenness centrality (0.463) - this node is a cross-community bridge._
+- **Why does `Document` connect `Document Model` to `Canvas Rendering & Hit-Testing`, `.commit_editing`, `Window & Tool UI`, `Engine / PDF Loading`?**
+  _High betweenness centrality (0.110) - this node is a cross-community bridge._
+- **Why does `WindowUi` connect `Window & Tool UI` to `Canvas`?**
+  _High betweenness centrality (0.099) - this node is a cross-community bridge._
 - **Should `Canvas Rendering & Hit-Testing` be split into smaller, more focused modules?**
-  _Cohesion score 0.0763000852514919 - nodes in this community are weakly interconnected._
-- **Should `Canvas Input & Edit Sessions` be split into smaller, more focused modules?**
-  _Cohesion score 0.05895061728395062 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.07219548315438726 - nodes in this community are weakly interconnected._
 - **Should `Window & Tool UI` be split into smaller, more focused modules?**
-  _Cohesion score 0.07552973342447027 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.07425907425907426 - nodes in this community are weakly interconnected._
 - **Should `Document Model` be split into smaller, more focused modules?**
-  _Cohesion score 0.07918367346938776 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.07686274509803921 - nodes in this community are weakly interconnected._
+- **Should `Engine / PDF Loading` be split into smaller, more focused modules?**
+  _Cohesion score 0.14153846153846153 - nodes in this community are weakly interconnected._
