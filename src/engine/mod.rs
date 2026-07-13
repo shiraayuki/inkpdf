@@ -2,7 +2,10 @@
 
 pub mod document;
 pub mod pdf;
+pub mod pdf_worker;
+pub mod sandbox;
 pub mod storage;
+pub mod worker_protocol;
 
 use std::path::Path;
 use std::sync::Arc;

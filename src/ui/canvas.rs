@@ -693,12 +693,15 @@ impl Canvas {
     }
 
     /// Flattens the current document (PDF/blank backgrounds + every
-    /// annotation) into a real PDF file at `path`.
+    /// annotation) into a real PDF file at `path`. Runs in a freshly
+    /// spawned, sandboxed subprocess (see `engine::pdf_worker`) rather than
+    /// parsing the embedded PDF bytes here, since this is exactly the kind
+    /// of untrusted-input parsing the sandbox exists for.
     pub fn export_pdf(&self, path: &std::path::Path) -> anyhow::Result<()> {
         self.commit_editing();
         let st = self.state.borrow();
         let doc = st.doc.as_ref().ok_or_else(|| anyhow::anyhow!("no document open"))?;
-        render_document_to_pdf(doc, st.pdf.as_ref(), path)
+        crate::engine::pdf_worker::spawn_export_worker(doc, path)
     }
 
     /// Takes the document + pdf handle out of the canvas (e.g. when switching away
@@ -2737,12 +2740,16 @@ fn page_surface(
         let c = cairo::Context::new(&surface).ok()?;
         match &page.kind {
             PageKind::Pdf { page_index } => {
-                // poppler draws no page background, so lay down white first.
+                // poppler draws no page background, so lay down white first
+                // (also the fallback if the sandboxed worker fails to render
+                // for any reason - e.g. a malformed page).
                 c.set_source_rgb(1.0, 1.0, 1.0);
                 let _ = c.paint();
-                c.scale(zoom, zoom);
-                if let Some(pdf) = pdf {
-                    pdf.render_page(*page_index, &c);
+                if let Some(pdf) = pdf
+                    && let Ok(rendered) = pdf.render_page_argb(*page_index, pw, ph, zoom)
+                {
+                    let _ = c.set_source_surface(&rendered, 0.0, 0.0);
+                    let _ = c.paint();
                 }
             }
             PageKind::Blank { color, pattern, pattern_spacing } => {
@@ -2765,8 +2772,22 @@ fn page_surface(
 /// Flattens `doc` into a real, multi-page PDF file at `path`: each document
 /// page becomes one PDF page at its own size (in PDF points, so no zoom/
 /// scale is applied - unlike `page_surface`, which rasterizes for on-screen
-/// display). `pdf` supplies the source pages for any `PageKind::Pdf` page.
-fn render_document_to_pdf(doc: &Document, pdf: Option<&PdfDocument>, path: &std::path::Path) -> anyhow::Result<()> {
+/// display). Any `PageKind::Pdf` page is rendered straight from `doc`'s own
+/// embedded PDF bytes via a local poppler handle.
+///
+/// Must only ever run inside the already-sandboxed export worker (see
+/// `engine::pdf_worker::run_export_worker`) - unlike the rest of the app,
+/// this parses untrusted PDF bytes directly, with none of the IPC-based
+/// isolation `engine::pdf::PdfDocument` gives the main process.
+pub(crate) fn render_document_to_pdf_local(doc: &Document, path: &std::path::Path) -> anyhow::Result<()> {
+    let poppler_doc = match &doc.source {
+        Some(src) => {
+            let bytes = gtk::glib::Bytes::from_owned(src.bytes.clone());
+            Some(poppler::Document::from_bytes(&bytes, None).map_err(|e| anyhow::anyhow!("could not open embedded PDF: {e}"))?)
+        }
+        None => None,
+    };
+
     let first = doc.pages.first().ok_or_else(|| anyhow::anyhow!("document has no pages"))?;
     let surface = cairo::PdfSurface::new(first.width, first.height, path)?;
 
@@ -2780,8 +2801,8 @@ fn render_document_to_pdf(doc: &Document, pdf: Option<&PdfDocument>, path: &std:
                 // poppler draws no page background, so lay down white first.
                 c.set_source_rgb(1.0, 1.0, 1.0);
                 c.paint()?;
-                if let Some(pdf) = pdf {
-                    pdf.render_page(*page_index, &c);
+                if let Some(poppler_page) = poppler_doc.as_ref().and_then(|d| d.page(*page_index as i32)) {
+                    poppler_page.render(&c);
                 }
             }
             PageKind::Blank { color, pattern, pattern_spacing } => {
@@ -4438,7 +4459,7 @@ mod tests {
         doc.pages.push(a4_page());
 
         let path = std::env::temp_dir().join(format!("inkpdf-export-test-{}.pdf", Uuid::new_v4()));
-        render_document_to_pdf(&doc, None, &path).expect("export should succeed");
+        render_document_to_pdf_local(&doc, &path).expect("export should succeed");
 
         let bytes = std::fs::read(&path).expect("exported file should be readable");
         std::fs::remove_file(&path).ok();
@@ -4449,17 +4470,30 @@ mod tests {
         let (w, h) = pdf.page_size(0);
         assert!((w - A4.0).abs() < 0.5 && (h - A4.1).abs() < 0.5, "page size should match the document page");
 
-        let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, w.ceil() as i32, h.ceil() as i32).unwrap();
-        {
-            let c = cairo::Context::new(&surface).unwrap();
-            c.set_source_rgb(1.0, 1.0, 1.0);
-            let _ = c.paint();
-            pdf.render_page(0, &c);
-        }
+        let mut surface = pdf.render_page_argb(0, w.ceil() as i32, h.ceil() as i32, 1.0).expect("render should succeed");
         surface.flush();
         let data = surface.data().unwrap();
         let non_white = data.iter().filter(|&&b| b != 0xFF).count();
         assert!(non_white > 0, "the exported text annotation should show up when the PDF is re-rendered");
+    }
+
+    #[test]
+    fn spawn_export_worker_writes_a_readable_pdf() {
+        // End-to-end through the real sandboxed subprocess (not just the
+        // local rendering function): spawns the actual compiled `inkpdf`
+        // binary as an export worker, same as the app does for real.
+        let mut doc = Document::new();
+        doc.pages.push(text_page(50.0, 50.0, "sandboxed export"));
+
+        let path = std::env::temp_dir().join(format!("inkpdf-export-worker-test-{}.pdf", Uuid::new_v4()));
+        crate::engine::pdf_worker::spawn_export_worker(&doc, &path).expect("export worker should succeed");
+
+        let bytes = std::fs::read(&path).expect("exported file should be readable");
+        std::fs::remove_file(&path).ok();
+        assert!(!bytes.is_empty(), "exported PDF should not be empty");
+
+        let pdf = PdfDocument::from_bytes(bytes.into()).expect("exported bytes should be a valid PDF");
+        assert_eq!(pdf.n_pages(), 1);
     }
 
     #[test]

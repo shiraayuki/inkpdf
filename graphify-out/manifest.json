@@ -5,13 +5,13 @@
     "semantic_hash": ""
   },
   "src/engine/mod.rs": {
-    "mtime": 1783974187.1365633,
-    "ast_hash": "65c84ae38be9cb3fb40b310b7a6d250d",
+    "mtime": 1783975114.4763544,
+    "ast_hash": "a979f1be4bcc6215dc542f5b6c3fc85c",
     "semantic_hash": ""
   },
   "src/engine/pdf.rs": {
-    "mtime": 1783974207.6354463,
-    "ast_hash": "0d342b38b1c930bf6c4faa8f9fd8a8c1",
+    "mtime": 1783975258.5386493,
+    "ast_hash": "ba9312fc1cbcb742c4834a5773ea6f17",
     "semantic_hash": ""
   },
   "src/engine/storage.rs": {
@@ -20,13 +20,13 @@
     "semantic_hash": ""
   },
   "src/main.rs": {
-    "mtime": 1783973268.928057,
-    "ast_hash": "7d9a75c9d4e38d2cfd996650e4027c11",
-    "semantic_hash": "7d9a75c9d4e38d2cfd996650e4027c11"
+    "mtime": 1783975243.7257102,
+    "ast_hash": "bbc5eeb7fd4fa36f3edb17a996a6b54c",
+    "semantic_hash": ""
   },
   "src/ui/canvas.rs": {
-    "mtime": 1783974216.3713968,
-    "ast_hash": "7eea2479b6d63b43d1c8339d37014322",
+    "mtime": 1783975264.7636237,
+    "ast_hash": "26e24948e2d5db17d6efbd3b6c85da4e",
     "semantic_hash": ""
   },
   "src/ui/mod.rs": {
@@ -132,6 +132,26 @@
   "data/icons/hicolor/scalable/actions/inkpdf-latex-symbolic.svg": {
     "mtime": 1783969800.5182977,
     "ast_hash": "74c7f23db2d9e356e0cbfcb4ed985b7d",
+    "semantic_hash": ""
+  },
+  "src/engine/pdf_worker.rs": {
+    "mtime": 1783975391.4250822,
+    "ast_hash": "0f722efe06cf4027160d01786a34fdc7",
+    "semantic_hash": ""
+  },
+  "src/engine/sandbox.rs": {
+    "mtime": 1783975365.1161973,
+    "ast_hash": "6f8d823c1740bd65d3c0127c4e19f398",
+    "semantic_hash": ""
+  },
+  "src/engine/worker_protocol.rs": {
+    "mtime": 1783975008.4379454,
+    "ast_hash": "ce21d06703e7921f58d082d247f8e176",
+    "semantic_hash": ""
+  },
+  "src/lib.rs": {
+    "mtime": 1783975380.344131,
+    "ast_hash": "de8958b01c6b457d08c65f1814692cad",
     "semantic_hash": ""
   }
 }
