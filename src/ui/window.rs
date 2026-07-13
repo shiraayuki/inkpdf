@@ -1034,6 +1034,23 @@ fn page_pages(canvas: &Canvas) -> (gtk::Box, gtk::Button, gtk::Button) {
                 }
             });
         }
+        // Right-click: apply this pattern (with the current spacing) to every
+        // blank page in the document, not just the current one.
+        {
+            let canvas = canvas.clone();
+            let anchor = toggle.clone();
+            add_secondary_click(&toggle, move || {
+                let canvas = canvas.clone();
+                show_menu(
+                    &anchor,
+                    vec![(
+                        "Auf alle Seiten anwenden",
+                        true,
+                        Box::new(move || canvas.apply_blank_style_to_all(pattern, canvas.pattern_spacing())),
+                    )],
+                );
+            });
+        }
         page.append(&toggle);
     }
 

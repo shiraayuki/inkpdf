@@ -901,6 +901,29 @@ impl Canvas {
         }
     }
 
+    /// Applies a pattern/spacing to every blank page in the document (not just
+    /// the current one), and makes it the default for future ones too. One
+    /// undo entry for the whole change.
+    pub fn apply_blank_style_to_all(&self, pattern: PagePattern, spacing: f64) {
+        self.record_change();
+        {
+            let mut st = self.state.borrow_mut();
+            let state: &mut State = &mut st;
+            state.blank_pattern = pattern;
+            state.blank_pattern_spacing = spacing;
+            if let Some(doc) = state.doc.as_mut() {
+                for page in &mut doc.pages {
+                    if let PageKind::Blank { pattern: p, pattern_spacing: s, .. } = &mut page.kind {
+                        *p = pattern;
+                        *s = spacing;
+                    }
+                }
+            }
+            state.cache.clear();
+        }
+        self.update_layout();
+    }
+
     /// Resizes the current page (blank pages only). One undo entry per call.
     pub fn resize_current_page(&self, width: f64, height: f64) {
         if !self.current_page_is_blank() {
