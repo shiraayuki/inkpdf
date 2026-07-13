@@ -460,6 +460,7 @@ name = "inkpdf"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cairo-rs",
  "flate2",
  "gtk4",
  "ink-stroke-modeler-rs",

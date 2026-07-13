@@ -422,8 +422,14 @@ pub fn build(app: &adw::Application) -> WindowUi {
         .tooltip_text("Neuer Tab")
         .css_classes(["flat"])
         .build();
+    let export_pdf_button = gtk::Button::builder()
+        .icon_name("document-export-symbolic")
+        .tooltip_text("Als PDF exportieren")
+        .css_classes(["flat"])
+        .build();
     header.pack_start(&open_button);
     header.pack_start(&save_button);
+    header.pack_start(&export_pdf_button);
     header.pack_start(&new_tab_button);
 
     // Dark/light toggle (default dark = not active).
@@ -670,6 +676,10 @@ pub fn build(app: &adw::Application) -> WindowUi {
     }
     {
         let ui = ui.clone();
+        export_pdf_button.connect_clicked(move |_| export_pdf_dialog(&ui));
+    }
+    {
+        let ui = ui.clone();
         new_tab_button.connect_clicked(move |_| ui.new_tab());
     }
     {
@@ -860,6 +870,48 @@ fn save_dialog_then(ui: &WindowUi, and_then: impl Fn(&WindowUi) + 'static) {
                 and_then(&ui);
             }
             Err(err) => show_error(&ui.window, &format!("{err:#}")),
+        }
+    });
+}
+
+/// Asks for a save location, then flattens the current document (backgrounds +
+/// annotations) into a real PDF file there.
+fn export_pdf_dialog(ui: &WindowUi) {
+    if ui.canvas.document().is_none() {
+        return;
+    }
+
+    let title = ui.title.title();
+    let stem = Path::new(title.as_str())
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned());
+    let initial = match stem {
+        Some(s) if !s.is_empty() && title != "Unbenannt" => format!("{s}.pdf"),
+        _ => "untitled.pdf".to_string(),
+    };
+
+    let dialog = gtk::FileDialog::builder()
+        .title("Als PDF exportieren")
+        .initial_name(initial)
+        .modal(true)
+        .build();
+
+    let ui = ui.clone();
+    let parent = ui.window.clone();
+    dialog.save(Some(&parent), gio::Cancellable::NONE, move |result| {
+        let file = match result {
+            Ok(file) => file,
+            Err(_) => return,
+        };
+        let Some(mut path) = file.path() else {
+            show_error(&ui.window, "The file has no local path.");
+            return;
+        };
+        if path.extension().is_none_or(|e| !e.eq_ignore_ascii_case("pdf")) {
+            path.set_extension("pdf");
+        }
+        if let Err(err) = ui.canvas.export_pdf(&path) {
+            show_error(&ui.window, &format!("{err:#}"));
         }
     });
 }

@@ -692,6 +692,15 @@ impl Canvas {
         self.state.borrow().doc.clone()
     }
 
+    /// Flattens the current document (PDF/blank backgrounds + every
+    /// annotation) into a real PDF file at `path`.
+    pub fn export_pdf(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        self.commit_editing();
+        let st = self.state.borrow();
+        let doc = st.doc.as_ref().ok_or_else(|| anyhow::anyhow!("no document open"))?;
+        render_document_to_pdf(doc, st.pdf.as_ref(), path)
+    }
+
     /// Takes the document + pdf handle out of the canvas (e.g. when switching away
     /// from a tab), leaving the canvas without an open document. Unlike
     /// `document()`, this does not clone: the pdf handle isn't `Clone`.
@@ -2756,6 +2765,46 @@ fn page_surface(
     Some(surface)
 }
 
+/// Flattens `doc` into a real, multi-page PDF file at `path`: each document
+/// page becomes one PDF page at its own size (in PDF points, so no zoom/
+/// scale is applied - unlike `page_surface`, which rasterizes for on-screen
+/// display). `pdf` supplies the source pages for any `PageKind::Pdf` page.
+fn render_document_to_pdf(doc: &Document, pdf: Option<&PdfDocument>, path: &std::path::Path) -> anyhow::Result<()> {
+    let first = doc.pages.first().ok_or_else(|| anyhow::anyhow!("document has no pages"))?;
+    let surface = cairo::PdfSurface::new(first.width, first.height, path)?;
+
+    for (i, page) in doc.pages.iter().enumerate() {
+        if i > 0 {
+            surface.set_size(page.width, page.height)?;
+        }
+        let c = cairo::Context::new(&surface)?;
+        match &page.kind {
+            PageKind::Pdf { page_index } => {
+                // poppler draws no page background, so lay down white first.
+                c.set_source_rgb(1.0, 1.0, 1.0);
+                c.paint()?;
+                if let Some(pdf) = pdf {
+                    pdf.render_page(*page_index, &c);
+                }
+            }
+            PageKind::Blank { color, pattern, pattern_spacing } => {
+                let Color { r, g, b, a } = *color;
+                c.set_source_rgba(r, g, b, a);
+                c.paint()?;
+                draw_page_pattern(&c, *pattern, *pattern_spacing, page.width, page.height);
+            }
+        }
+        for annotation in &page.annotations {
+            draw_annotation(&c, &annotation.kind);
+        }
+        c.show_page()?;
+    }
+
+    surface.finish();
+    surface.status()?;
+    Ok(())
+}
+
 /// Draws glyphs (each with its own style: color, font, highlight, weight, decoration),
 /// honoring newlines. Context in page-point space.
 /// Renders one glyph at `(gx, line_top)` (highlight, color, underline/
@@ -4356,6 +4405,37 @@ mod tests {
             source: "\\frac{a}{b}".to_string(),
         }));
         assert!(big.2 > small.2 && big.3 > small.3, "bumping the base size should scale the whole formula up");
+    }
+
+    #[test]
+    fn export_pdf_writes_a_readable_multi_page_pdf() {
+        let mut doc = Document::new();
+        doc.pages.push(text_page(50.0, 50.0, "exported"));
+        doc.pages.push(a4_page());
+
+        let path = std::env::temp_dir().join(format!("inkpdf-export-test-{}.pdf", Uuid::new_v4()));
+        render_document_to_pdf(&doc, None, &path).expect("export should succeed");
+
+        let bytes = std::fs::read(&path).expect("exported file should be readable");
+        std::fs::remove_file(&path).ok();
+        assert!(!bytes.is_empty(), "exported PDF should not be empty");
+
+        let pdf = PdfDocument::from_bytes(bytes).expect("exported bytes should be a valid PDF");
+        assert_eq!(pdf.n_pages(), 2, "one PDF page per document page");
+        let (w, h) = pdf.page_size(0);
+        assert!((w - A4.0).abs() < 0.5 && (h - A4.1).abs() < 0.5, "page size should match the document page");
+
+        let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, w.ceil() as i32, h.ceil() as i32).unwrap();
+        {
+            let c = cairo::Context::new(&surface).unwrap();
+            c.set_source_rgb(1.0, 1.0, 1.0);
+            let _ = c.paint();
+            pdf.render_page(0, &c);
+        }
+        surface.flush();
+        let data = surface.data().unwrap();
+        let non_white = data.iter().filter(|&&b| b != 0xFF).count();
+        assert!(non_white > 0, "the exported text annotation should show up when the PDF is re-rendered");
     }
 
     #[test]
