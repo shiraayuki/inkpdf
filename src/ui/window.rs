@@ -118,6 +118,25 @@ impl WindowUi {
         }
     }
 
+    /// Whether *any* open tab has unsaved changes - unlike `is_dirty`, which
+    /// only looks at the active one. Used before closing the whole window,
+    /// since every tab's work would be lost, not just the one on screen.
+    fn any_tab_dirty(&self) -> bool {
+        let active = self.active_tab.get();
+        if self.is_dirty() {
+            return true;
+        }
+        self.tabs.borrow().iter().enumerate().any(|(i, tab)| {
+            if i == active {
+                return false; // already checked via is_dirty above
+            }
+            match &tab.saved_snapshot {
+                Some(saved) => tab.model != *saved,
+                None => true,
+            }
+        })
+    }
+
     /// Sets the header title to the file name and the subtitle to its full path
     /// (or "Unbenannt" for a document with no file yet); keeps the active tab's
     /// label and the tab bar in sync.
@@ -642,11 +661,35 @@ pub fn build(app: &adw::Application) -> WindowUi {
     canvas.set_blank_pattern(saved_settings.blank_pattern);
     canvas.set_pattern_spacing(saved_settings.blank_pattern_spacing);
 
-    // Persist the current tool defaults when the window closes.
+    // Asks first if any tab has unsaved changes, then persists the current
+    // tool defaults when the window actually closes. `confirmed` tracks
+    // "user already said yes" across the second, re-triggered close
+    // request (see below) so it doesn't ask twice.
     {
         let ui = ui.clone();
         let theme_button = theme_button.clone();
-        window.connect_close_request(move |_| {
+        let confirmed = Rc::new(Cell::new(false));
+        window.connect_close_request(move |window| {
+            if !confirmed.get() && ui.any_tab_dirty() {
+                let dialog = gtk::AlertDialog::builder()
+                    .message("Ungespeicherte Änderungen")
+                    .detail("Es gibt ungespeicherte Änderungen in einem oder mehreren Tabs. Trotzdem schließen?")
+                    .buttons(["Abbrechen", "Schließen"])
+                    .cancel_button(0)
+                    .default_button(0)
+                    .modal(true)
+                    .build();
+                let confirmed = confirmed.clone();
+                let window_for_reclose = window.clone();
+                dialog.choose(Some(window), gio::Cancellable::NONE, move |response| {
+                    if let Ok(1) = response {
+                        confirmed.set(true);
+                        window_for_reclose.close();
+                    }
+                });
+                return glib::Propagation::Stop;
+            }
+
             let current = ui.current_settings(!theme_button.is_active());
             if let Err(err) = settings::save(&current) {
                 eprintln!("failed to save settings: {err:#}");
