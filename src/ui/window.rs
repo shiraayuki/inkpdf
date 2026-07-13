@@ -792,7 +792,7 @@ fn build_tool_strip(canvas: &Canvas, details: &gtk::Stack) -> gtk::Box {
         ("inkpdf-text-symbolic", "Text", Tool::Text, "text"),
         ("inkpdf-select-symbolic", "Select (drag to lasso strokes/shapes)", Tool::Lasso, "lasso"),
         ("inkpdf-eraser-symbolic", "Eraser", Tool::Eraser, "eraser"),
-        ("inkpdf-markdown-symbolic", "Markdown text", Tool::Markdown, "markdown"),
+        ("inkpdf-markdown-symbolic", "Markdown (Shift+Enter renders)", Tool::Markdown, "markdown"),
         ("inkpdf-pages-symbolic", "Pages", Tool::Pages, "pages"),
     ];
 
@@ -867,7 +867,7 @@ fn build_details_panel(canvas: &Canvas) -> (gtk::Stack, gtk::Button, gtk::Button
     stack.add_named(&page_text(canvas), Some("text"));
     stack.add_named(&page_lasso(canvas), Some("lasso"));
     stack.add_named(&page_eraser(canvas), Some("eraser"));
-    stack.add_named(&page_markdown(), Some("markdown"));
+    stack.add_named(&page_markdown(canvas), Some("markdown"));
     stack.set_visible_child_name("pen");
     (stack, add_page_button, remove_page_button)
 }
@@ -1283,9 +1283,18 @@ fn page_eraser(canvas: &Canvas) -> gtk::Box {
     page
 }
 
-fn page_markdown() -> gtk::Box {
+/// Markdown tool page: click places a box like Text (raw source shown while
+/// editing); Shift+Enter commits and renders it; clicking it again shows the
+/// source again. Supports a basic Markdown + LaTeX-math subset - see
+/// `layout_and_draw_markdown`/`parse_math` in canvas.rs for exactly what's
+/// covered (headings, bold/italic, lists, code, rules, frac/sqrt/sup/sub and
+/// common Greek letters/operators - not a full CommonMark or TeX engine).
+fn page_markdown(canvas: &Canvas) -> gtk::Box {
     let page = detail_column();
-    page.append(&size_stepper(16.0, 8.0, 72.0, 1.0, 0, |_| {}));
+    {
+        let canvas = canvas.clone();
+        page.append(&size_stepper(16.0, 8.0, 72.0, 1.0, 0, move |v| canvas.set_text_size(v)));
+    }
     page
 }
 

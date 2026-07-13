@@ -148,11 +148,23 @@ pub struct ShapeAnnotation {
     pub width: f64,
 }
 
+/// A Markdown (+ a basic LaTeX-math subset) box: `source` is the raw text
+/// typed by the user; it is parsed and laid out fresh on every render rather
+/// than storing pre-rendered output.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct MarkdownAnnotation {
+    pub x: f64,
+    pub y: f64,
+    pub size: f64,
+    pub source: String,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum AnnotationKind {
     Text(TextAnnotation),
     Stroke(StrokeAnnotation),
     Shape(ShapeAnnotation),
+    Markdown(MarkdownAnnotation),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

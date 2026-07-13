@@ -8,12 +8,14 @@ use gtk::gdk;
 use gtk::glib;
 use gtk::prelude::*;
 use ink_stroke_modeler_rs::{ModelerInput, ModelerInputEventType, ModelerParams, StrokeModeler};
+use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
 use uuid::Uuid;
 
 use crate::engine::OpenDocument;
 use crate::engine::document::{
-    A4, Annotation, AnnotationKind, Color, DEFAULT_PATTERN_SPACING, Document, Page, PageKind,
-    PagePattern, ShapeAnnotation, ShapeKind, StrokeAnnotation, TextAnnotation, TextRun, TextStyle,
+    A4, Annotation, AnnotationKind, Color, DEFAULT_PATTERN_SPACING, Document, MarkdownAnnotation,
+    Page, PageKind, PagePattern, ShapeAnnotation, ShapeKind, StrokeAnnotation, TextAnnotation,
+    TextRun, TextStyle,
 };
 use crate::engine::pdf::PdfDocument;
 
@@ -40,7 +42,17 @@ struct Glyph {
     style: TextStyle,
 }
 
-/// A text box currently being typed. `x`/`y` are the top-left anchor in page points.
+/// Whether an edit session's raw glyph buffer will commit as a styled text
+/// box or as Markdown source (rendered/parsed fresh on commit).
+#[derive(Clone, Copy, PartialEq)]
+enum TextEditKind {
+    Text,
+    Markdown,
+}
+
+/// A text or Markdown box currently being typed (the raw source, in both
+/// cases - Markdown is only parsed/rendered once committed). `x`/`y` are the
+/// top-left anchor in page points.
 struct TextEdit {
     page: usize,
     x: f64,
@@ -54,6 +66,7 @@ struct TextEdit {
     id: Uuid,
     /// The annotation this edit replaces, kept so Escape can restore it.
     original: Option<Annotation>,
+    kind: TextEditKind,
 }
 
 impl TextEdit {
@@ -244,6 +257,18 @@ impl TextEdit {
     fn is_blank(&self) -> bool {
         self.glyphs.iter().all(|g| g.ch.is_whitespace())
     }
+
+    /// The raw characters, ignoring per-glyph style - used for Markdown
+    /// source, which carries no manual per-character styling.
+    fn plain_text(&self) -> String {
+        self.glyphs.iter().map(|g| g.ch).collect()
+    }
+}
+
+/// Builds a plain (uniformly default-styled) glyph buffer from raw text, for
+/// editing a Markdown box's source (which has no per-character styling).
+fn glyphs_from_plain(source: &str) -> Vec<Glyph> {
+    source.chars().map(|ch| Glyph { ch, style: TextStyle::default() }).collect()
 }
 
 /// An annotation lifted out of the model while being dragged (any kind).
@@ -359,7 +384,7 @@ impl History {
 
 /// The transient bits drawn on top of the cached page surfaces.
 struct Overlay<'a> {
-    text_mode: bool,
+    place_kind: Option<TextEditKind>,
     editing: Option<&'a TextEdit>,
     dragging: Option<&'a DragState>,
     selected: Option<(usize, Uuid)>,
@@ -374,7 +399,9 @@ struct State {
     zoom: f64,
     /// Rendered pages keyed by index; cleared on zoom or structure change.
     cache: HashMap<usize, cairo::ImageSurface>,
-    text_mode: bool,
+    /// Which box-placement tool is active, if any (Text or Markdown); `None`
+    /// for every other tool (Select, Pen, Shape, Eraser, Lasso, Pages).
+    place_kind: Option<TextEditKind>,
     editing: Option<TextEdit>,
     /// Page nearest the viewport center; gets the accent frame and anchors insert/delete.
     current: usize,
@@ -482,7 +509,7 @@ impl Canvas {
             pdf: None,
             zoom: 1.0,
             cache: HashMap::new(),
-            text_mode: false,
+            place_kind: None,
             editing: None,
             current: 0,
             drag_start: None,
@@ -672,20 +699,25 @@ impl Canvas {
         true
     }
 
-    pub fn set_text_mode(&self, on: bool) {
-        if !on {
+    fn set_place_kind(&self, kind: Option<TextEditKind>) {
+        if kind.is_none() {
             self.commit_editing();
         }
-        self.state.borrow_mut().text_mode = on;
-        // Focus is grabbed on click (placing/editing text), not here, so toggling
-        // the tool does not make the ScrolledWindow jump to the top.
+        self.state.borrow_mut().place_kind = kind;
+        // Focus is grabbed on click (placing/editing the box), not here, so
+        // toggling the tool does not make the ScrolledWindow jump to the top.
         self.area.queue_draw();
     }
 
     /// Selects the active tool.
     pub fn set_tool(&self, tool: Tool) {
-        // Leaving text editing commits it; other tools have no pending state here.
-        self.set_text_mode(tool == Tool::Text);
+        // Leaving Text/Markdown editing commits it; other tools have no pending state here.
+        let kind = match tool {
+            Tool::Text => Some(TextEditKind::Text),
+            Tool::Markdown => Some(TextEditKind::Markdown),
+            _ => None,
+        };
+        self.set_place_kind(kind);
         self.state.borrow_mut().tool = tool;
         self.update_cursor();
     }
@@ -1237,14 +1269,17 @@ impl Canvas {
         // Any other click finishes an active edit.
         self.commit_editing();
 
-        let text_mode = self.state.borrow().text_mode;
+        let place_kind = self.state.borrow().place_kind;
         let hit = self.annotation_hit(x, y);
 
-        if text_mode {
+        if let Some(kind) = place_kind {
             if let Some((page, index)) = hit {
                 self.start_edit_existing(page, index);
             } else if let Some((page, lx, ly)) = self.page_hit(x, y) {
-                self.start_new_text(page, lx, ly);
+                match kind {
+                    TextEditKind::Text => self.start_new_text(page, lx, ly),
+                    TextEditKind::Markdown => self.start_new_markdown(page, lx, ly),
+                }
             }
         } else if n_press == 2 {
             if let Some((page, index)) = hit {
@@ -1300,6 +1335,14 @@ impl Canvas {
     }
 
     fn start_new_text(&self, page: usize, lx: f64, ly: f64) {
+        self.start_new_edit(page, lx, ly, TextEditKind::Text);
+    }
+
+    fn start_new_markdown(&self, page: usize, lx: f64, ly: f64) {
+        self.start_new_edit(page, lx, ly, TextEditKind::Markdown);
+    }
+
+    fn start_new_edit(&self, page: usize, lx: f64, ly: f64, kind: TextEditKind) {
         self.begin_edit_session();
         {
             let mut st = self.state.borrow_mut();
@@ -1319,6 +1362,7 @@ impl Canvas {
                 anchor: None,
                 id: Uuid::new_v4(),
                 original: None,
+                kind,
             });
         }
         self.area.queue_draw();
@@ -1339,9 +1383,12 @@ impl Canvas {
         let Some(annotation) = removed else {
             return;
         };
-        let (x, y, size, glyphs, id) = match &annotation.kind {
-            AnnotationKind::Text(t) => (t.x, t.y, t.size, ann_glyphs(t), annotation.id),
-            // Only text is editable; restore anything else and bail.
+        let (x, y, size, glyphs, id, kind) = match &annotation.kind {
+            AnnotationKind::Text(t) => (t.x, t.y, t.size, ann_glyphs(t), annotation.id, TextEditKind::Text),
+            AnnotationKind::Markdown(m) => {
+                (m.x, m.y, m.size, glyphs_from_plain(&m.source), annotation.id, TextEditKind::Markdown)
+            }
+            // Only text/Markdown boxes are editable; restore anything else and bail.
             _ => {
                 let mut st = self.state.borrow_mut();
                 if let Some(p) = st.doc.as_mut().and_then(|d| d.pages.get_mut(page)) {
@@ -1364,6 +1411,7 @@ impl Canvas {
                 anchor: None,
                 id,
                 original: Some(annotation),
+                kind,
             });
             st.cache.remove(&page);
         }
@@ -1430,7 +1478,11 @@ impl Canvas {
         match keyval {
             gdk::Key::Escape => self.cancel_editing(),
             gdk::Key::Return | gdk::Key::KP_Enter => {
-                if ctrl {
+                // Text commits on Ctrl+Enter; Markdown commits (and renders) on
+                // Shift+Enter, since Shift'd text is otherwise meaningless here.
+                let is_markdown = self.state.borrow().editing.as_ref().is_some_and(|ed| ed.kind == TextEditKind::Markdown);
+                let commits = if is_markdown { extend } else { ctrl };
+                if commits {
                     self.commit_editing();
                 } else {
                     let style = self.state.borrow().text_style.clone();
@@ -1472,15 +1524,21 @@ impl Canvas {
             if !ed.is_blank()
                 && let Some(page) = st.doc.as_mut().and_then(|d| d.pages.get_mut(ed.page))
             {
-                page.annotations.push(Annotation {
-                    id: ed.id,
-                    kind: AnnotationKind::Text(TextAnnotation {
+                let kind = match ed.kind {
+                    TextEditKind::Text => AnnotationKind::Text(TextAnnotation {
                         x: ed.x,
                         y: ed.y,
                         size: ed.size,
                         runs: ed.to_runs(),
                     }),
-                });
+                    TextEditKind::Markdown => AnnotationKind::Markdown(MarkdownAnnotation {
+                        x: ed.x,
+                        y: ed.y,
+                        size: ed.size,
+                        source: ed.plain_text(),
+                    }),
+                };
+                page.annotations.push(Annotation { id: ed.id, kind });
             }
             st.cache.remove(&ed.page);
             // Record the session as one undo entry, but only if it changed the pages.
@@ -1524,8 +1582,8 @@ impl Canvas {
         }
 
         // A drag inside the box being edited selects text. This applies whenever
-        // an edit is active, not just with the Text tool - editing can also start
-        // from a Select-mode double-click, which never sets `text_mode`.
+        // an edit is active, not just with the Text/Markdown tools - editing can
+        // also start from a Select-mode double-click, which never sets `place_kind`.
         if self.state.borrow().editing.is_some() {
             if let Some((page, lx, ly)) = self.page_hit(x, y) {
                 let pos = {
@@ -1556,9 +1614,9 @@ impl Canvas {
             return;
         }
 
-        if self.state.borrow().text_mode {
-            // Text tool active but nothing is being edited yet (about to place a
-            // new box on click) - there is no box to drag.
+        if self.state.borrow().place_kind.is_some() {
+            // Text/Markdown tool active but nothing is being edited yet (about
+            // to place a new box on click) - there is no box to drag.
             return;
         }
 
@@ -1879,7 +1937,7 @@ impl Canvas {
             move |k| match k {
                 AnnotationKind::Stroke(s) => s.color = color,
                 AnnotationKind::Shape(s) => s.color = color,
-                AnnotationKind::Text(_) => {}
+                AnnotationKind::Text(_) | AnnotationKind::Markdown(_) => {}
             },
         );
     }
@@ -1891,7 +1949,7 @@ impl Canvas {
             move |k| match k {
                 AnnotationKind::Stroke(s) => s.width = width,
                 AnnotationKind::Shape(s) => s.width = width,
-                AnnotationKind::Text(_) => {}
+                AnnotationKind::Text(_) | AnnotationKind::Markdown(_) => {}
             },
         );
     }
@@ -2320,7 +2378,7 @@ fn draw(state: &Rc<RefCell<State>>, ctx: &cairo::Context, width: i32) {
         pdf,
         zoom,
         cache,
-        text_mode,
+        place_kind,
         editing,
         current,
         dragging,
@@ -2336,7 +2394,7 @@ fn draw(state: &Rc<RefCell<State>>, ctx: &cairo::Context, width: i32) {
     let z = *zoom;
     let current = *current;
     let overlay = Overlay {
-        text_mode: *text_mode,
+        place_kind: *place_kind,
         editing: editing.as_ref(),
         dragging: dragging.as_ref(),
         selected: *selected,
@@ -2526,12 +2584,552 @@ fn draw_glyphs(c: &cairo::Context, x: f64, y: f64, size: f64, glyphs: &[Glyph]) 
     }
 }
 
+// --- Markdown rendering ------------------------------------------------
+//
+// A small, self-contained Markdown (via pulldown-cmark) + best-effort LaTeX
+// math subset renderer. It deliberately does not reuse the Glyph/TextStyle
+// pipeline used for Text boxes: Markdown needs block layout (headings of
+// different sizes, lists, code, rules) that a single-size styled-run box
+// was never designed for. Lines never word-wrap, matching every other box in
+// this app; a bare newline inside a paragraph is treated as a hard line
+// break (Enter = new line), not CommonMark's "soft break = space" - this is
+// a typed note box, not a static-site renderer.
+
+fn select_font(c: &cairo::Context, bold: bool, italic: bool, mono: bool) {
+    let family = if mono { "Monospace" } else { "Sans" };
+    let slant = if italic { cairo::FontSlant::Italic } else { cairo::FontSlant::Normal };
+    let weight = if bold { cairo::FontWeight::Bold } else { cairo::FontWeight::Normal };
+    c.select_font_face(family, slant, weight);
+}
+
+fn measure_text(c: &cairo::Context, text: &str, size: f64, bold: bool, italic: bool, mono: bool) -> f64 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    select_font(c, bold, italic, mono);
+    c.set_font_size(size);
+    c.text_extents(text).map(|e| e.x_advance()).unwrap_or(0.0)
+}
+
+fn draw_text_run(c: &cairo::Context, x: f64, baseline_y: f64, text: &str, size: f64, bold: bool, italic: bool, mono: bool) {
+    if text.is_empty() {
+        return;
+    }
+    select_font(c, bold, italic, mono);
+    c.set_font_size(size);
+    c.move_to(x, baseline_y);
+    let _ = c.show_text(text);
+}
+
+fn heading_scale(level: HeadingLevel) -> f64 {
+    match level {
+        HeadingLevel::H1 => 2.0,
+        HeadingLevel::H2 => 1.6,
+        HeadingLevel::H3 => 1.3,
+        HeadingLevel::H4 => 1.15,
+        HeadingLevel::H5 => 1.05,
+        HeadingLevel::H6 => 1.0,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct MdRun {
+    text: String,
+    bold: bool,
+    italic: bool,
+    mono: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum MdPiece {
+    Run(MdRun),
+    /// Raw LaTeX-ish source between `$...$`/`$$...$$`, parsed by `parse_math`.
+    Math(String),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct MdLine {
+    prefix: Option<String>,
+    indent: usize,
+    pieces: Vec<MdPiece>,
+    size_scale: f64,
+    rule: bool,
+}
+
+impl MdLine {
+    fn empty(size_scale: f64) -> Self {
+        Self { prefix: None, indent: 0, pieces: Vec::new(), size_scale, rule: false }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.prefix.is_none() && self.pieces.is_empty() && !self.rule
+    }
+}
+
+enum MathSplit {
+    Plain(String),
+    Math(String),
+}
+
+/// Splits `text` on `$...$` / `$$...$$` inline math delimiters (not nested).
+/// An unterminated `$` is treated as plain text rather than swallowing the
+/// rest of the line.
+fn split_math(text: &str) -> Vec<MathSplit> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    loop {
+        let Some(start) = rest.find('$') else {
+            if !rest.is_empty() {
+                out.push(MathSplit::Plain(rest.to_string()));
+            }
+            break;
+        };
+        if start > 0 {
+            out.push(MathSplit::Plain(rest[..start].to_string()));
+        }
+        let is_block = rest[start + 1..].starts_with('$');
+        let delim = if is_block { "$$" } else { "$" };
+        let after = &rest[start + delim.len()..];
+        match after.find(delim) {
+            Some(end) => {
+                out.push(MathSplit::Math(after[..end].to_string()));
+                rest = &after[end + delim.len()..];
+            }
+            None => {
+                out.push(MathSplit::Plain(rest[start..].to_string()));
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Splits `text` on inline math and appends the resulting plain-text run(s)
+/// and math piece(s) to `cur`.
+fn push_md_pieces(cur: &mut MdLine, text: &str, bold: bool, italic: bool, mono: bool) {
+    for piece in split_math(text) {
+        match piece {
+            MathSplit::Plain(t) => {
+                if !t.is_empty() {
+                    cur.pieces.push(MdPiece::Run(MdRun { text: t, bold, italic, mono }));
+                }
+            }
+            MathSplit::Math(expr) => cur.pieces.push(MdPiece::Math(expr)),
+        }
+    }
+}
+
+/// Parses Markdown source into simple, layout-ready lines. Headings scale the
+/// line's font size; bold/italic/code map to per-run flags; list items get a
+/// bullet/number prefix; `$...$` spans are pulled out as raw math expressions
+/// for `parse_math`/`render_math_tokens` to typeset separately.
+fn parse_markdown_lines(source: &str) -> Vec<MdLine> {
+    let mut lines = Vec::new();
+    let mut cur = MdLine::empty(1.0);
+    let mut bold = 0usize;
+    let mut italic = 0usize;
+    let mut code = 0usize;
+    let mut list_stack: Vec<Option<u64>> = Vec::new();
+    let mut heading = 1.0_f64;
+
+    let push_line = |cur: &mut MdLine, lines: &mut Vec<MdLine>, scale: f64| {
+        if !cur.is_empty() {
+            lines.push(std::mem::replace(cur, MdLine::empty(scale)));
+        } else {
+            cur.size_scale = scale;
+        }
+    };
+
+    for event in Parser::new(source) {
+        match event {
+            Event::Start(Tag::Heading { level, .. }) => {
+                push_line(&mut cur, &mut lines, heading);
+                heading = heading_scale(level);
+                cur.size_scale = heading;
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                push_line(&mut cur, &mut lines, 1.0);
+                heading = 1.0;
+            }
+            Event::Start(Tag::Paragraph) => push_line(&mut cur, &mut lines, heading),
+            Event::End(TagEnd::Paragraph) => push_line(&mut cur, &mut lines, heading),
+            Event::Start(Tag::Strong) => bold += 1,
+            Event::End(TagEnd::Strong) => bold = bold.saturating_sub(1),
+            Event::Start(Tag::Emphasis) => italic += 1,
+            Event::End(TagEnd::Emphasis) => italic = italic.saturating_sub(1),
+            Event::Start(Tag::List(start)) => list_stack.push(start),
+            Event::End(TagEnd::List(_)) => {
+                list_stack.pop();
+            }
+            Event::Start(Tag::Item) => {
+                push_line(&mut cur, &mut lines, heading);
+                cur.indent = list_stack.len().saturating_sub(1);
+                cur.prefix = Some(match list_stack.last_mut() {
+                    Some(Some(n)) => {
+                        let s = format!("{n}.");
+                        *n += 1;
+                        s
+                    }
+                    _ => "\u{2022}".to_string(),
+                });
+            }
+            Event::End(TagEnd::Item) => push_line(&mut cur, &mut lines, heading),
+            Event::Start(Tag::CodeBlock(_)) => {
+                push_line(&mut cur, &mut lines, heading);
+                code += 1;
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                push_line(&mut cur, &mut lines, heading);
+                code = code.saturating_sub(1);
+            }
+            Event::Start(Tag::BlockQuote(_)) => {
+                push_line(&mut cur, &mut lines, heading);
+                cur.indent += 1;
+            }
+            Event::Rule => {
+                push_line(&mut cur, &mut lines, heading);
+                cur.rule = true;
+                push_line(&mut cur, &mut lines, heading);
+            }
+            Event::SoftBreak | Event::HardBreak => push_line(&mut cur, &mut lines, heading),
+            Event::Text(text) => push_md_pieces(&mut cur, &text, bold > 0, italic > 0, code > 0),
+            Event::Code(text) => push_md_pieces(&mut cur, &text, bold > 0, italic > 0, true),
+            _ => {}
+        }
+    }
+    push_line(&mut cur, &mut lines, heading);
+    lines
+}
+
+/// A single token within a parsed (not yet laid out) math expression.
+enum MathToken {
+    /// Plain math-mode text (rendered in italic, the usual math convention).
+    Text(String),
+    Sup(String),
+    Sub(String),
+    /// Numerator, denominator - each is plain text, not recursively parsed.
+    Frac(String, String),
+    /// Argument - plain text, not recursively parsed.
+    Sqrt(String),
+}
+
+/// Best-effort, non-nested LaTeX math subset: recognizes `\frac{a}{b}`,
+/// `\sqrt{x}`, `^sup`/`^{sup}`, `_sub`/`_{sub}`, and a small table of
+/// `\command` symbols (Greek letters, common operators). This is NOT a full
+/// TeX engine - arguments are not themselves parsed for nested math, and
+/// anything unrecognized falls back to being shown as plain (italic) text
+/// rather than failing.
+fn parse_math(expr: &str) -> Vec<MathToken> {
+    let chars: Vec<char> = expr.chars().collect();
+    let mut i = 0usize;
+    let mut plain = String::new();
+    let mut tokens = Vec::new();
+
+    fn flush(plain: &mut String, tokens: &mut Vec<MathToken>) {
+        if !plain.is_empty() {
+            tokens.push(MathToken::Text(std::mem::take(plain)));
+        }
+    }
+
+    // A `{...}` group (single level, no nested braces) or else a single char.
+    fn read_group(chars: &[char], i: &mut usize) -> String {
+        if chars.get(*i) == Some(&'{') {
+            *i += 1;
+            let start = *i;
+            while *i < chars.len() && chars[*i] != '}' {
+                *i += 1;
+            }
+            let s: String = chars[start..*i].iter().collect();
+            if *i < chars.len() {
+                *i += 1;
+            }
+            s
+        } else if *i < chars.len() {
+            let s = chars[*i].to_string();
+            *i += 1;
+            s
+        } else {
+            String::new()
+        }
+    }
+
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => {
+                i += 1;
+                let start = i;
+                while i < chars.len() && chars[i].is_alphabetic() {
+                    i += 1;
+                }
+                let cmd: String = chars[start..i].iter().collect();
+                if cmd == "frac" {
+                    flush(&mut plain, &mut tokens);
+                    let a = read_group(&chars, &mut i);
+                    let b = read_group(&chars, &mut i);
+                    tokens.push(MathToken::Frac(a, b));
+                } else if cmd == "sqrt" {
+                    flush(&mut plain, &mut tokens);
+                    tokens.push(MathToken::Sqrt(read_group(&chars, &mut i)));
+                } else if let Some(sym) = math_symbol(&cmd) {
+                    plain.push_str(sym);
+                } else if !cmd.is_empty() {
+                    // Unknown command: show its name so it stays legible.
+                    plain.push_str(&cmd);
+                } else if i < chars.len() {
+                    // "\<punctuation>" (e.g. "\{"): the escaped char, literally.
+                    plain.push(chars[i]);
+                    i += 1;
+                }
+            }
+            '^' => {
+                i += 1;
+                flush(&mut plain, &mut tokens);
+                tokens.push(MathToken::Sup(read_group(&chars, &mut i)));
+            }
+            '_' => {
+                i += 1;
+                flush(&mut plain, &mut tokens);
+                tokens.push(MathToken::Sub(read_group(&chars, &mut i)));
+            }
+            c => {
+                plain.push(c);
+                i += 1;
+            }
+        }
+    }
+    flush(&mut plain, &mut tokens);
+    tokens
+}
+
+fn math_symbol(cmd: &str) -> Option<&'static str> {
+    Some(match cmd {
+        "alpha" => "\u{03b1}",
+        "beta" => "\u{03b2}",
+        "gamma" => "\u{03b3}",
+        "delta" => "\u{03b4}",
+        "epsilon" => "\u{03b5}",
+        "zeta" => "\u{03b6}",
+        "eta" => "\u{03b7}",
+        "theta" => "\u{03b8}",
+        "iota" => "\u{03b9}",
+        "kappa" => "\u{03ba}",
+        "lambda" => "\u{03bb}",
+        "mu" => "\u{03bc}",
+        "nu" => "\u{03bd}",
+        "xi" => "\u{03be}",
+        "pi" => "\u{03c0}",
+        "rho" => "\u{03c1}",
+        "sigma" => "\u{03c3}",
+        "tau" => "\u{03c4}",
+        "phi" => "\u{03c6}",
+        "chi" => "\u{03c7}",
+        "psi" => "\u{03c8}",
+        "omega" => "\u{03c9}",
+        "Gamma" => "\u{0393}",
+        "Delta" => "\u{0394}",
+        "Theta" => "\u{0398}",
+        "Lambda" => "\u{039b}",
+        "Xi" => "\u{039e}",
+        "Pi" => "\u{03a0}",
+        "Sigma" => "\u{03a3}",
+        "Phi" => "\u{03a6}",
+        "Psi" => "\u{03a8}",
+        "Omega" => "\u{03a9}",
+        "infty" => "\u{221e}",
+        "leq" => "\u{2264}",
+        "geq" => "\u{2265}",
+        "neq" => "\u{2260}",
+        "approx" => "\u{2248}",
+        "times" => "\u{00d7}",
+        "cdot" => "\u{00b7}",
+        "pm" => "\u{00b1}",
+        "rightarrow" | "to" => "\u{2192}",
+        "leftarrow" => "\u{2190}",
+        "sum" => "\u{2211}",
+        "prod" => "\u{220f}",
+        "int" => "\u{222b}",
+        "partial" => "\u{2202}",
+        "nabla" => "\u{2207}",
+        _ => return None,
+    })
+}
+
+/// Lays out (and, if `draw`, paints) a math token stream starting at `(x,
+/// baseline_y)` in page points. Returns (total width, extra ascent, extra
+/// descent) beyond the surrounding line's normal metrics, so tall content
+/// like fractions can grow the line's height.
+fn render_math_tokens(c: &cairo::Context, tokens: &[MathToken], start_x: f64, baseline_y: f64, size: f64, draw: bool) -> (f64, f64, f64) {
+    let mut x = start_x;
+    let mut extra_ascent = 0.0_f64;
+    let mut extra_descent = 0.0_f64;
+    for token in tokens {
+        match token {
+            MathToken::Text(t) => {
+                let w = measure_text(c, t, size, false, true, false);
+                if draw {
+                    draw_text_run(c, x, baseline_y, t, size, false, true, false);
+                }
+                x += w;
+            }
+            MathToken::Sup(t) => {
+                let sup_size = size * 0.65;
+                let sup_baseline = baseline_y - size * 0.35;
+                let w = measure_text(c, t, sup_size, false, true, false);
+                if draw {
+                    draw_text_run(c, x, sup_baseline, t, sup_size, false, true, false);
+                }
+                extra_ascent = extra_ascent.max(size * 0.35);
+                x += w;
+            }
+            MathToken::Sub(t) => {
+                let sub_size = size * 0.65;
+                let sub_baseline = baseline_y + size * 0.25;
+                let w = measure_text(c, t, sub_size, false, true, false);
+                if draw {
+                    draw_text_run(c, x, sub_baseline, t, sub_size, false, true, false);
+                }
+                extra_descent = extra_descent.max(size * 0.25);
+                x += w;
+            }
+            MathToken::Frac(a, b) => {
+                let frac_size = size * 0.8;
+                let w_a = measure_text(c, a, frac_size, false, true, false);
+                let w_b = measure_text(c, b, frac_size, false, true, false);
+                let w = w_a.max(w_b) + size * 0.2;
+                let gap = size * 0.12;
+                if draw {
+                    draw_text_run(c, x + (w - w_a) / 2.0, baseline_y - gap, a, frac_size, false, true, false);
+                    draw_text_run(c, x + (w - w_b) / 2.0, baseline_y + gap + frac_size * 0.75, b, frac_size, false, true, false);
+                    c.set_line_width((size * 0.04).max(0.5));
+                    c.move_to(x, baseline_y - gap * 0.3);
+                    c.line_to(x + w, baseline_y - gap * 0.3);
+                    let _ = c.stroke();
+                }
+                extra_ascent = extra_ascent.max(frac_size + gap);
+                extra_descent = extra_descent.max(gap + frac_size * 0.75);
+                x += w;
+            }
+            MathToken::Sqrt(a) => {
+                let w_a = measure_text(c, a, size, false, true, false);
+                let pad = size * 0.15;
+                let radical_w = size * 0.5;
+                if draw {
+                    draw_text_run(c, x + radical_w, baseline_y, a, size, false, true, false);
+                    c.set_line_width((size * 0.04).max(0.5));
+                    c.move_to(x, baseline_y - size * 0.1);
+                    c.line_to(x + radical_w * 0.35, baseline_y + size * 0.15);
+                    c.line_to(x + radical_w * 0.55, baseline_y - size * 0.65);
+                    c.line_to(x + radical_w + w_a + pad, baseline_y - size * 0.65);
+                    let _ = c.stroke();
+                }
+                extra_ascent = extra_ascent.max(size * 0.65);
+                x += radical_w + w_a + pad;
+            }
+        }
+    }
+    (x - start_x, extra_ascent, extra_descent)
+}
+
+/// Lays out a Markdown box's lines starting at page-local `(x, y)`
+/// (top-left), optionally painting them, and returns the box's total (width,
+/// height). Shared by both measurement (`annotation_bounds`) and rendering
+/// (`draw_annotation`) via the `draw` flag, so the two can never disagree.
+fn layout_and_draw_markdown(c: &cairo::Context, x: f64, y: f64, base_size: f64, source: &str, draw: bool) -> (f64, f64) {
+    if draw {
+        // Nothing else in this function sets a color, so this covers every
+        // text run, rule, and fraction bar drawn below.
+        c.set_source_rgba(0.0, 0.0, 0.0, 1.0);
+    }
+    let lines = parse_markdown_lines(source);
+    let (_, base_line_height) = line_metrics(c, base_size);
+
+    let mut cursor_y = y;
+    let mut max_width = 0.0_f64;
+
+    for line in &lines {
+        let size = base_size * line.size_scale;
+        let (ascent, line_height) = line_metrics(c, size);
+
+        if line.rule {
+            if draw {
+                c.set_line_width(1.0);
+                c.move_to(x, cursor_y + line_height / 2.0);
+                c.line_to(x + max_width.max(base_size * 10.0), cursor_y + line_height / 2.0);
+                let _ = c.stroke();
+            }
+            cursor_y += line_height;
+            continue;
+        }
+
+        let indent = line.indent as f64 * base_size * 1.2;
+        let mut content_x = x + indent;
+        let baseline = cursor_y + ascent;
+
+        if let Some(prefix) = &line.prefix {
+            let w = measure_text(c, prefix, size, false, false, false);
+            if draw {
+                draw_text_run(c, content_x, baseline, prefix, size, false, false, false);
+            }
+            content_x += w + base_size * 0.3;
+        }
+
+        // Measure first (needed for extra ascent/descent from tall math before
+        // we know this line's baseline is "final"), then draw at that baseline.
+        let mut extra_ascent = 0.0_f64;
+        let mut extra_descent = 0.0_f64;
+        let mut probe_x = content_x;
+        for piece in &line.pieces {
+            match piece {
+                MdPiece::Run(r) => probe_x += measure_text(c, &r.text, size, r.bold, r.italic, r.mono),
+                MdPiece::Math(expr) => {
+                    let tokens = parse_math(expr);
+                    let (w, ea, ed) = render_math_tokens(c, &tokens, probe_x, baseline, size, false);
+                    probe_x += w;
+                    extra_ascent = extra_ascent.max(ea);
+                    extra_descent = extra_descent.max(ed);
+                }
+            }
+        }
+        max_width = max_width.max(probe_x - x);
+
+        if draw {
+            let mut dx = content_x;
+            for piece in &line.pieces {
+                match piece {
+                    MdPiece::Run(r) => {
+                        draw_text_run(c, dx, baseline, &r.text, size, r.bold, r.italic, r.mono);
+                        dx += measure_text(c, &r.text, size, r.bold, r.italic, r.mono);
+                    }
+                    MdPiece::Math(expr) => {
+                        let tokens = parse_math(expr);
+                        let (w, ..) = render_math_tokens(c, &tokens, dx, baseline, size, true);
+                        dx += w;
+                    }
+                }
+            }
+        }
+
+        cursor_y += line_height + extra_ascent + extra_descent;
+    }
+
+    ((max_width).max(base_size * 2.0), (cursor_y - y).max(base_line_height))
+}
+
+fn measure_markdown(size: f64, source: &str) -> (f64, f64) {
+    with_scratch(|c| layout_and_draw_markdown(c, 0.0, 0.0, size, source, false), (MIN_BOX_WIDTH, size))
+}
+
+// --- end Markdown rendering ---------------------------------------------
+
 /// Dispatches an annotation to its renderer. Context in page-point space.
 fn draw_annotation(c: &cairo::Context, kind: &AnnotationKind) {
     match kind {
         AnnotationKind::Text(t) => draw_glyphs(c, t.x, t.y, t.size, &ann_glyphs(t)),
         AnnotationKind::Stroke(s) => draw_stroke(c, &s.points, s.color, s.width),
         AnnotationKind::Shape(s) => draw_shape(c, s),
+        AnnotationKind::Markdown(m) => {
+            let _ = layout_and_draw_markdown(c, m.x, m.y, m.size, &m.source, true);
+        }
     }
 }
 
@@ -2546,6 +3144,10 @@ fn annotation_bounds(kind: &AnnotationKind) -> (f64, f64, f64, f64) {
         AnnotationKind::Stroke(s) => bounds_of_points(&s.points),
         AnnotationKind::Shape(s) => {
             (s.x0.min(s.x1), s.y0.min(s.y1), (s.x1 - s.x0).abs(), (s.y1 - s.y0).abs())
+        }
+        AnnotationKind::Markdown(m) => {
+            let (w, h) = measure_markdown(m.size, &m.source);
+            (m.x, m.y, w, h)
         }
     }
 }
@@ -2588,6 +3190,12 @@ fn translate_annotation(kind: &AnnotationKind, dx: f64, dy: f64) -> AnnotationKi
             s.y0 += dy;
             s.y1 += dy;
             AnnotationKind::Shape(s)
+        }
+        AnnotationKind::Markdown(m) => {
+            let mut m = m.clone();
+            m.x += dx;
+            m.y += dy;
+            AnnotationKind::Markdown(m)
         }
     }
 }
@@ -2692,7 +3300,7 @@ fn draw_shape(c: &cairo::Context, s: &ShapeAnnotation) {
 /// geometry. Text is ignored - it has its own selection/delete.
 fn eraser_hits(kind: &AnnotationKind, px: f64, py: f64, radius: f64) -> bool {
     match kind {
-        AnnotationKind::Text(_) => false,
+        AnnotationKind::Text(_) | AnnotationKind::Markdown(_) => false,
         AnnotationKind::Stroke(s) => {
             point_near_polyline(&s.points, false, px, py, radius + s.width / 2.0)
         }
@@ -2825,11 +3433,17 @@ fn plus_cursor() -> Option<gdk::Cursor> {
 }
 
 fn draw_overlay(c: &cairo::Context, page: &Page, index: usize, zoom: f64, overlay: &Overlay) {
-    if overlay.text_mode {
+    // Outline every box the active Text/Markdown tool could edit, so the user
+    // can see where a click will land.
+    if let Some(kind) = overlay.place_kind {
         for annotation in &page.annotations {
-            if let AnnotationKind::Text(t) = &annotation.kind {
-                let (w, h) = measure_glyphs(t.size, &ann_glyphs(t));
-                stroke_box(c, t.x, t.y, w, h, zoom, BOX_ANNOTATION);
+            let matches = matches!(
+                (&annotation.kind, kind),
+                (AnnotationKind::Text(_), TextEditKind::Text) | (AnnotationKind::Markdown(_), TextEditKind::Markdown)
+            );
+            if matches {
+                let (x, y, w, h) = annotation_bounds(&annotation.kind);
+                stroke_box(c, x, y, w, h, zoom, BOX_ANNOTATION);
             }
         }
     }
@@ -3041,6 +3655,7 @@ mod tests {
             anchor: None,
             id: Uuid::new_v4(),
             original: None,
+            kind: TextEditKind::Text,
         }
     }
 
@@ -3209,6 +3824,136 @@ mod tests {
         let data = surface.data().unwrap();
         let non_white = data.iter().filter(|&&b| b != 0xFF).count();
         assert!(non_white > 0, "text should render as dark pixels on the white page");
+    }
+
+    #[test]
+    fn markdown_annotation_renders_pixels() {
+        let mut page = a4_page();
+        page.annotations.push(Annotation {
+            id: Uuid::new_v4(),
+            kind: AnnotationKind::Markdown(MarkdownAnnotation {
+                x: 50.0,
+                y: 50.0,
+                size: 16.0,
+                source: "# Heading\n\nSome **bold** text and $\\frac{a}{b}$".to_string(),
+            }),
+        });
+        let mut cache = HashMap::new();
+        let (pw, ph) = (A4.0.ceil() as i32, A4.1.ceil() as i32);
+        let mut surface = page_surface(None, &mut cache, 0, &page, 1.0, pw, ph).unwrap();
+        drop(cache);
+        surface.flush();
+
+        let data = surface.data().unwrap();
+        let non_white = data.iter().filter(|&&b| b != 0xFF).count();
+        assert!(non_white > 0, "markdown (incl. a fraction) should render as dark pixels");
+    }
+
+    #[test]
+    fn markdown_bounds_grow_with_more_lines() {
+        let short = annotation_bounds(&AnnotationKind::Markdown(MarkdownAnnotation {
+            x: 0.0,
+            y: 0.0,
+            size: 16.0,
+            source: "one line".to_string(),
+        }));
+        let long = annotation_bounds(&AnnotationKind::Markdown(MarkdownAnnotation {
+            x: 0.0,
+            y: 0.0,
+            size: 16.0,
+            source: "# Title\n\nline one\nline two\nline three".to_string(),
+        }));
+        assert!(long.3 > short.3, "more lines/a heading should take more height");
+    }
+
+    #[test]
+    fn split_math_finds_inline_and_block_delimiters() {
+        let parts = split_math("area is $\\pi r^2$ or $$E=mc^2$$ done");
+        let plain: Vec<&str> =
+            parts.iter().filter_map(|p| if let MathSplit::Plain(t) = p { Some(t.as_str()) } else { None }).collect();
+        let math: Vec<&str> =
+            parts.iter().filter_map(|p| if let MathSplit::Math(t) = p { Some(t.as_str()) } else { None }).collect();
+        assert_eq!(plain, vec!["area is ", " or ", " done"]);
+        assert_eq!(math, vec!["\\pi r^2", "E=mc^2"]);
+    }
+
+    #[test]
+    fn split_math_treats_unterminated_dollar_as_plain() {
+        // May come back as one or more Plain pieces - what matters is nothing
+        // becomes Math and the text isn't lost or reordered.
+        let parts = split_math("cost: $5 please");
+        assert!(parts.iter().all(|p| matches!(p, MathSplit::Plain(_))));
+        let joined: String = parts
+            .iter()
+            .map(|p| match p {
+                MathSplit::Plain(t) => t.as_str(),
+                MathSplit::Math(_) => unreachable!(),
+            })
+            .collect();
+        assert_eq!(joined, "cost: $5 please");
+    }
+
+    #[test]
+    fn parse_math_handles_frac_sup_sub_and_symbols() {
+        let tokens = parse_math("\\frac{a}{b} + x^2_i \\alpha");
+        let kinds: Vec<&str> = tokens
+            .iter()
+            .map(|t| match t {
+                MathToken::Text(_) => "text",
+                MathToken::Sup(_) => "sup",
+                MathToken::Sub(_) => "sub",
+                MathToken::Frac(..) => "frac",
+                MathToken::Sqrt(_) => "sqrt",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["frac", "text", "sup", "sub", "text"]);
+        let MathToken::Frac(a, b) = &tokens[0] else { unreachable!() };
+        assert_eq!((a.as_str(), b.as_str()), ("a", "b"));
+        let MathToken::Text(last) = &tokens[4] else { unreachable!() };
+        assert!(last.contains('\u{03b1}'), "\\alpha should resolve to the Greek letter, got {last:?}");
+    }
+
+    #[test]
+    fn parse_math_falls_back_to_literal_for_unknown_commands() {
+        let tokens = parse_math("\\nope");
+        let MathToken::Text(t) = &tokens[0] else { unreachable!() };
+        assert_eq!(t, "nope", "unknown commands still render as legible text");
+    }
+
+    #[test]
+    fn parse_markdown_lines_scales_headings_and_flags_styles() {
+        let lines = parse_markdown_lines("# Title\n**bold** and *italic*");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].size_scale, heading_scale(HeadingLevel::H1));
+        let MdPiece::Run(title) = &lines[0].pieces[0] else { unreachable!() };
+        assert_eq!(title.text, "Title");
+
+        assert_eq!(lines[1].size_scale, 1.0);
+        let bold_run = lines[1].pieces.iter().find_map(|p| match p {
+            MdPiece::Run(r) if r.text.contains("bold") => Some(r),
+            _ => None,
+        });
+        assert!(bold_run.is_some_and(|r| r.bold && !r.italic));
+        let italic_run = lines[1].pieces.iter().find_map(|p| match p {
+            MdPiece::Run(r) if r.text.contains("italic") => Some(r),
+            _ => None,
+        });
+        assert!(italic_run.is_some_and(|r| r.italic && !r.bold));
+    }
+
+    #[test]
+    fn parse_markdown_lines_list_items_get_prefixes() {
+        let lines = parse_markdown_lines("- one\n- two\n\n1. first\n2. second");
+        let bullets: Vec<&str> = lines.iter().filter_map(|l| l.prefix.as_deref()).collect();
+        assert_eq!(bullets, vec!["\u{2022}", "\u{2022}", "1.", "2."]);
+    }
+
+    #[test]
+    fn parse_markdown_lines_treats_bare_newline_as_hard_break() {
+        // Unlike CommonMark's "soft break = space", a single Enter here is a
+        // new line - this app's boxes never word-wrap.
+        let lines = parse_markdown_lines("first\nsecond");
+        assert_eq!(lines.len(), 2);
     }
 
     #[test]
