@@ -2184,15 +2184,13 @@ fn hit_test(pages: &[Page], zoom: f64, width: f64, x: f64, y: f64) -> Option<(us
     None
 }
 
-/// Topmost text annotation whose box contains the page-local point (in points).
-/// Only text is box-selectable; strokes/shapes are edited only via the eraser.
+/// Topmost annotation (any kind) whose bounding box contains the page-local
+/// point (in points).
 fn annotation_at(page: &Page, lx: f64, ly: f64) -> Option<usize> {
     for (i, annotation) in page.annotations.iter().enumerate().rev() {
-        if let AnnotationKind::Text(t) = &annotation.kind {
-            let (w, h) = measure_glyphs(t.size, &ann_glyphs(t));
-            if lx >= t.x && lx <= t.x + w && ly >= t.y && ly <= t.y + h {
-                return Some(i);
-            }
+        let (x, y, w, h) = annotation_bounds(&annotation.kind);
+        if lx >= x && lx <= x + w && ly >= y && ly <= y + h {
+            return Some(i);
         }
     }
     None
@@ -3071,6 +3069,36 @@ mod tests {
         let page = text_page(100.0, 200.0, "Hello");
         assert_eq!(annotation_at(&page, 101.0, 201.0), Some(0));
         assert_eq!(annotation_at(&page, 10.0, 10.0), None);
+    }
+
+    #[test]
+    fn annotation_at_also_hits_strokes_and_shapes() {
+        // Strokes/shapes must be clickable too, not just text (select/move/lasso
+        // all rely on this hit-test).
+        let mut page = a4_page();
+        page.annotations.push(Annotation {
+            id: Uuid::new_v4(),
+            kind: AnnotationKind::Stroke(StrokeAnnotation {
+                points: vec![(10.0, 10.0), (50.0, 10.0)],
+                color: Color::BLACK,
+                width: 2.0,
+            }),
+        });
+        page.annotations.push(Annotation {
+            id: Uuid::new_v4(),
+            kind: AnnotationKind::Shape(ShapeAnnotation {
+                shape: ShapeKind::Rectangle,
+                x0: 100.0,
+                y0: 100.0,
+                x1: 150.0,
+                y1: 150.0,
+                color: Color::BLACK,
+                width: 1.0,
+            }),
+        });
+        assert_eq!(annotation_at(&page, 30.0, 10.0), Some(0), "inside the stroke's bounds");
+        assert_eq!(annotation_at(&page, 120.0, 120.0), Some(1), "inside the shape");
+        assert_eq!(annotation_at(&page, 300.0, 300.0), None, "empty area");
     }
 
     #[test]
