@@ -28,6 +28,11 @@ const TEXT_SIZE: f64 = 16.0;
 const MIN_BOX_WIDTH: f64 = 4.0;
 /// Squared pixel distance a press must move before it counts as a drag (not a click).
 const DRAG_THRESHOLD_SQ: f64 = 9.0;
+/// Pixel radius (independent of zoom) around a selected Latex box's
+/// bottom-right corner that starts a resize instead of a move.
+const RESIZE_HANDLE_HIT_PX: f64 = 10.0;
+const LATEX_MIN_SIZE: f64 = 4.0;
+const LATEX_MAX_SIZE: f64 = 300.0;
 // Canvas backdrop behind the pages, per theme (r, g, b).
 const CANVAS_BG_DARK: (f64, f64, f64) = (0.18, 0.18, 0.20);
 const CANVAS_BG_LIGHT: (f64, f64, f64) = (0.86, 0.86, 0.88);
@@ -274,12 +279,22 @@ fn glyphs_from_plain(source: &str) -> Vec<Glyph> {
 }
 
 /// An annotation lifted out of the model while being dragged (any kind).
-/// `orig` is the untranslated snapshot taken at drag start, so each frame's
-/// position is `translate(orig, clamped total offset)` - never accumulated.
+/// `orig` is the untranslated/unresized snapshot taken at drag start, so each
+/// frame's state is `apply(orig, total offset)` - never accumulated.
 struct DragState {
     page: usize,
     annotation: Annotation,
     orig: AnnotationKind,
+    kind: DragKind,
+}
+
+/// Whether an in-progress `dragging` lift is a move, or - for a Latex box's
+/// bottom-right handle - a resize that rescales `size`, anchored at the
+/// box's own top-left corner (its `x, y` fields never change).
+#[derive(Clone, Copy)]
+enum DragKind {
+    Move,
+    Resize { orig_dist: f64, orig_size: f64 },
 }
 
 const PEN_WIDTH: f64 = 3.0;
@@ -1723,8 +1738,15 @@ impl Canvas {
         }
 
         if self.state.borrow().place_kind.is_some() {
-            // Text/Markdown tool active but nothing is being edited yet (about
-            // to place a new box on click) - there is no box to drag.
+            // Text/Markdown/Latex tool active but nothing is being edited yet
+            // (about to place a new box on click) - there is no box to drag.
+            return;
+        }
+
+        // A drag starting on the selected Latex box's bottom-right handle
+        // rescales it instead of moving it.
+        if let Some((page, index, orig_dist, orig_size)) = self.latex_resize_hit(x, y) {
+            self.begin_resize(page, index, orig_dist, orig_size);
             return;
         }
 
@@ -1792,28 +1814,81 @@ impl Canvas {
         let mut st = self.state.borrow_mut();
         let State { doc, dragging, .. } = &mut *st;
         if let Some(ds) = dragging {
-            let (pw, ph) = doc
-                .as_ref()
-                .and_then(|d| d.pages.get(ds.page))
-                .map(|p| (p.width, p.height))
-                .unwrap_or(A4);
-            // Keep the whole box on the page so it can't slip behind it. Always
-            // translates from `orig` (the pre-drag snapshot) so repeated clamping
-            // never accumulates drift.
-            let (bx, by, bw, bh) = annotation_bounds(&ds.orig);
-            let (dx, dy) = clamp_translate(bx, by, bw, bh, offset_x / zoom, offset_y / zoom, pw, ph);
-            ds.annotation.kind = translate_annotation(&ds.orig, dx, dy);
+            match ds.kind {
+                DragKind::Move => {
+                    let (pw, ph) = doc
+                        .as_ref()
+                        .and_then(|d| d.pages.get(ds.page))
+                        .map(|p| (p.width, p.height))
+                        .unwrap_or(A4);
+                    // Keep the whole box on the page so it can't slip behind it. Always
+                    // translates from `orig` (the pre-drag snapshot) so repeated clamping
+                    // never accumulates drift.
+                    let (bx, by, bw, bh) = annotation_bounds(&ds.orig);
+                    let (dx, dy) = clamp_translate(bx, by, bw, bh, offset_x / zoom, offset_y / zoom, pw, ph);
+                    ds.annotation.kind = translate_annotation(&ds.orig, dx, dy);
+                }
+                DragKind::Resize { orig_dist, orig_size } => {
+                    if let AnnotationKind::Latex(l) = &ds.orig {
+                        let (bx, by, bw, bh) = annotation_bounds(&ds.orig);
+                        let (cx, cy) = (bx + bw, by + bh);
+                        let (nx, ny) = (cx + offset_x / zoom, cy + offset_y / zoom);
+                        let new_dist = ((nx - bx).powi(2) + (ny - by).powi(2)).sqrt().max(1.0);
+                        let mut l = l.clone();
+                        l.size = (orig_size * (new_dist / orig_dist)).clamp(LATEX_MIN_SIZE, LATEX_MAX_SIZE);
+                        ds.annotation.kind = AnnotationKind::Latex(l);
+                    }
+                }
+            }
             drop(st);
             self.area.queue_draw();
         }
     }
 
     fn lift_for_drag(&self) {
-        let mut st = self.state.borrow_mut();
-        let Some((page, index)) = st.drag_start else {
+        let Some((page, index)) = self.state.borrow_mut().drag_start.take() else {
             return;
         };
-        // Snapshot before lifting so the whole move is one undo entry.
+        self.lift_annotation(page, index, DragKind::Move);
+    }
+
+    /// Whether widget-space point `(x, y)` lands on the resize handle of the
+    /// currently-selected Latex box (only Latex boxes are resizable this way,
+    /// since their bounds are entirely derived from the font size). Returns
+    /// `(page, annotation index, distance from anchor to handle, current size)`.
+    fn latex_resize_hit(&self, x: f64, y: f64) -> Option<(usize, usize, f64, f64)> {
+        let (page, lx, ly) = self.page_hit(x, y)?;
+        let st = self.state.borrow();
+        let (sel_page, id) = st.selected?;
+        if sel_page != page {
+            return None;
+        }
+        let doc = st.doc.as_ref()?;
+        let (index, annotation) = doc.pages.get(page)?.annotations.iter().enumerate().find(|(_, a)| a.id == id)?;
+        let AnnotationKind::Latex(l) = &annotation.kind else {
+            return None;
+        };
+        let (bx, by, bw, bh) = annotation_bounds(&annotation.kind);
+        let (cx, cy) = (bx + bw, by + bh);
+        let radius = RESIZE_HANDLE_HIT_PX / st.zoom;
+        if (lx - cx).powi(2) + (ly - cy).powi(2) > radius * radius {
+            return None;
+        }
+        let orig_dist = ((cx - bx).powi(2) + (cy - by).powi(2)).sqrt().max(1.0);
+        Some((page, index, orig_dist, l.size))
+    }
+
+    fn begin_resize(&self, page: usize, index: usize, orig_dist: f64, orig_size: f64) {
+        self.lift_annotation(page, index, DragKind::Resize { orig_dist, orig_size });
+    }
+
+    /// Removes annotation `index` on `page` from the model into `dragging`
+    /// (one undo entry for the whole gesture), so a move/resize preview can
+    /// be drawn via the overlay each frame without re-baking the cached page
+    /// raster.
+    fn lift_annotation(&self, page: usize, index: usize, kind: DragKind) {
+        let mut st = self.state.borrow_mut();
+        // Snapshot before lifting so the whole gesture is one undo entry.
         let snapshot = st.doc.as_ref().map(|d| d.pages.clone());
         let removed = match st.doc.as_mut() {
             Some(doc) if page < doc.pages.len() && index < doc.pages[page].annotations.len() => {
@@ -1827,9 +1902,8 @@ impl Canvas {
             }
             st.cache.remove(&page);
             let orig = annotation.kind.clone();
-            st.dragging = Some(DragState { page, annotation, orig });
+            st.dragging = Some(DragState { page, annotation, orig, kind });
         }
-        st.drag_start = None;
     }
 
     /// Records where a Lasso-tool press landed; the actual marquee/group-move
