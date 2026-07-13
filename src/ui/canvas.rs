@@ -10,8 +10,8 @@ use uuid::Uuid;
 
 use crate::engine::OpenDocument;
 use crate::engine::document::{
-    A4, Annotation, AnnotationKind, Color, Document, Page, PageKind, ShapeAnnotation, ShapeKind,
-    StrokeAnnotation, TextAnnotation, TextRun, TextStyle,
+    A4, Annotation, AnnotationKind, Color, Document, Page, PageKind, PagePattern, ShapeAnnotation,
+    ShapeKind, StrokeAnnotation, TextAnnotation, TextRun, TextStyle,
 };
 use crate::engine::pdf::PdfDocument;
 
@@ -352,6 +352,9 @@ struct State {
     shape_color: Color,
     shape_width: f64,
     eraser_width: f64,
+    /// Ruling applied to newly inserted blank pages (and, when set via
+    /// `set_blank_pattern`, retroactively to the current blank page).
+    blank_pattern: PagePattern,
 }
 
 /// Where an insert/delete acts relative to the current page.
@@ -420,6 +423,7 @@ impl Canvas {
             shape_color: Color::BLACK,
             shape_width: SHAPE_WIDTH,
             eraser_width: ERASER_WIDTH,
+            blank_pattern: PagePattern::Plain,
         }));
 
         {
@@ -749,13 +753,14 @@ impl Canvas {
                 .and_then(|d| d.pages.get(current).or_else(|| d.pages.last()))
                 .map(|p| (p.width, p.height))
                 .unwrap_or(A4);
+            let pattern = st.blank_pattern;
             let doc = st.doc.get_or_insert_with(Document::new);
             let at = match rel {
                 _ if doc.pages.is_empty() => 0,
                 Relative::Before => current,
                 Relative::After => current + 1,
             };
-            doc.insert_blank_page(at, w, h, Color::WHITE);
+            doc.insert_blank_page(at, w, h, Color::WHITE, pattern);
             st.cache.clear();
         }
         self.update_layout();
@@ -838,6 +843,36 @@ impl Canvas {
             st.doc.as_ref().and_then(|d| d.pages.get(idx)).map(|p| &p.kind),
             Some(PageKind::Blank { .. })
         )
+    }
+
+    /// Ruling used for newly inserted blank pages.
+    pub fn blank_pattern(&self) -> PagePattern {
+        self.state.borrow().blank_pattern
+    }
+
+    /// Sets the ruling for newly inserted blank pages; if the current page is
+    /// itself blank, restyles it too. Earlier pages are left untouched.
+    pub fn set_blank_pattern(&self, pattern: PagePattern) {
+        let idx = self.current_index();
+        let is_blank = self.current_page_is_blank();
+        if is_blank {
+            self.record_change();
+        }
+        {
+            let mut st = self.state.borrow_mut();
+            st.blank_pattern = pattern;
+            if is_blank {
+                if let Some(Page { kind: PageKind::Blank { pattern: p, .. }, .. }) =
+                    st.doc.as_mut().and_then(|d| d.pages.get_mut(idx))
+                {
+                    *p = pattern;
+                }
+                st.cache.remove(&idx);
+            }
+        }
+        if is_blank {
+            self.update_layout();
+        }
     }
 
     /// Resizes the current page (blank pages only). One undo entry per call.
@@ -1817,6 +1852,59 @@ fn draw(state: &Rc<RefCell<State>>, ctx: &cairo::Context, width: i32) {
     }
 }
 
+/// Spacing (in page points) between grid lines / dots / ruled lines.
+const PATTERN_SPACING: f64 = 20.0;
+
+/// Draws a blank page's background ruling in page-point coordinates (the
+/// context must already be scaled to zoom).
+fn draw_page_pattern(c: &cairo::Context, pattern: PagePattern, width: f64, height: f64) {
+    match pattern {
+        PagePattern::Plain => {}
+        PagePattern::Grid => {
+            c.set_source_rgba(0.0, 0.0, 0.0, 0.12);
+            c.set_line_width(0.5);
+            let mut x = PATTERN_SPACING;
+            while x < width {
+                c.move_to(x, 0.0);
+                c.line_to(x, height);
+                x += PATTERN_SPACING;
+            }
+            let mut y = PATTERN_SPACING;
+            while y < height {
+                c.move_to(0.0, y);
+                c.line_to(width, y);
+                y += PATTERN_SPACING;
+            }
+            let _ = c.stroke();
+        }
+        PagePattern::Dotted => {
+            c.set_source_rgba(0.0, 0.0, 0.0, 0.35);
+            let mut y = PATTERN_SPACING;
+            while y < height {
+                let mut x = PATTERN_SPACING;
+                while x < width {
+                    c.arc(x, y, 0.6, 0.0, std::f64::consts::TAU);
+                    let _ = c.fill();
+                    x += PATTERN_SPACING;
+                }
+                y += PATTERN_SPACING;
+            }
+        }
+        PagePattern::Lined => {
+            c.set_source_rgba(0.0, 0.0, 0.0, 0.15);
+            c.set_line_width(0.5);
+            let spacing = PATTERN_SPACING * 1.5;
+            let mut y = spacing;
+            while y < height {
+                c.move_to(0.0, y);
+                c.line_to(width, y);
+                y += spacing;
+            }
+            let _ = c.stroke();
+        }
+    }
+}
+
 fn page_surface(
     pdf: Option<&PdfDocument>,
     cache: &mut HashMap<usize, cairo::ImageSurface>,
@@ -1846,11 +1934,12 @@ fn page_surface(
                     pdf.render_page(*page_index, &c);
                 }
             }
-            PageKind::Blank { color } => {
+            PageKind::Blank { color, pattern } => {
                 let Color { r, g, b, a } = *color;
                 c.set_source_rgba(r, g, b, a);
                 let _ = c.paint();
                 c.scale(zoom, zoom);
+                draw_page_pattern(&c, *pattern, page.width, page.height);
             }
         }
         for annotation in &page.annotations {
@@ -2228,7 +2317,7 @@ mod tests {
 
     fn a4_page() -> Page {
         Page {
-            kind: PageKind::Blank { color: Color::WHITE },
+            kind: PageKind::Blank { color: Color::WHITE, pattern: PagePattern::Plain },
             width: A4.0,
             height: A4.1,
             annotations: vec![],

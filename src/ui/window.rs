@@ -6,7 +6,7 @@ use adw::prelude::*;
 use gtk::{gdk, gio};
 
 use crate::engine::OpenDocument;
-use crate::engine::document::{A4, Color, Document, FILE_EXTENSION, ShapeKind};
+use crate::engine::document::{A4, Color, Document, FILE_EXTENSION, PagePattern, ShapeKind};
 use crate::engine::pdf::PdfDocument;
 use crate::engine::storage;
 use crate::ui::canvas::{Canvas, Relative, Tool};
@@ -36,7 +36,7 @@ struct Tab {
 impl Tab {
     fn blank() -> Self {
         let mut model = Document::new();
-        model.insert_blank_page(0, A4.0, A4.1, Color::WHITE);
+        model.insert_blank_page(0, A4.0, A4.1, Color::WHITE, PagePattern::Plain);
         Tab {
             saved_snapshot: Some(model.clone()),
             model,
@@ -809,7 +809,7 @@ fn build_details_panel(canvas: &Canvas) -> (gtk::Stack, gtk::Button, gtk::Button
     // Same width for every page (consistent panel), but height follows each page's elements.
     stack.set_hhomogeneous(true);
     stack.set_vhomogeneous(false);
-    let (pages_page, add_page_button, remove_page_button) = page_pages();
+    let (pages_page, add_page_button, remove_page_button) = page_pages(canvas);
     stack.add_named(&pages_page, Some("pages"));
     stack.add_named(&page_pen(canvas), Some("pen"));
     stack.add_named(&page_shapes(canvas), Some("shapes"));
@@ -973,12 +973,36 @@ fn size_stepper(
 /// "Pages" tool page: insert/delete the current page. Left click acts on the
 /// current page directly; right click opens a before/after choice (wired in
 /// `build()`, once `WindowUi` exists).
-fn page_pages() -> (gtk::Box, gtk::Button, gtk::Button) {
+/// Page patterns offered by the dropdown, in display order.
+const PAGE_PATTERNS: [(&str, PagePattern); 4] = [
+    ("Leer", PagePattern::Plain),
+    ("Kariert", PagePattern::Grid),
+    ("Gepunktet", PagePattern::Dotted),
+    ("Liniert", PagePattern::Lined),
+];
+
+fn page_pages(canvas: &Canvas) -> (gtk::Box, gtk::Button, gtk::Button) {
     let page = detail_column();
     let add = flat_icon_button("inkpdf-page-add", "Insert page after current");
     let remove = flat_icon_button("inkpdf-page-remove", "Delete current page");
     page.append(&add);
     page.append(&remove);
+
+    page.append(&hsep());
+    let labels: [&str; 4] = std::array::from_fn(|i| PAGE_PATTERNS[i].0);
+    let pattern_dropdown = gtk::DropDown::from_strings(&labels);
+    let current = PAGE_PATTERNS.iter().position(|(_, p)| *p == canvas.blank_pattern()).unwrap_or(0);
+    pattern_dropdown.set_selected(current as u32);
+    {
+        let canvas = canvas.clone();
+        pattern_dropdown.connect_selected_notify(move |dd| {
+            if let Some((_, pattern)) = PAGE_PATTERNS.get(dd.selected() as usize) {
+                canvas.set_blank_pattern(*pattern);
+            }
+        });
+    }
+    page.append(&pattern_dropdown);
+
     (page, add, remove)
 }
 

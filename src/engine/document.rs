@@ -64,10 +64,24 @@ impl Default for TextStyle {
 /// Default blank-page size in PDF points (A4), used when no page exists to match.
 pub const A4: (f64, f64) = (595.0, 842.0);
 
+/// Background ruling drawn on a blank page.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
+pub enum PagePattern {
+    #[default]
+    Plain,
+    Grid,
+    Dotted,
+    Lined,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum PageKind {
     Pdf { page_index: usize },
-    Blank { color: Color },
+    Blank {
+        color: Color,
+        #[serde(default)]
+        pattern: PagePattern,
+    },
 }
 
 /// A run of text sharing one style.
@@ -165,9 +179,9 @@ impl Document {
         Self { source: None, pages: Vec::new() }
     }
 
-    pub fn insert_blank_page(&mut self, at: usize, width: f64, height: f64, color: Color) {
+    pub fn insert_blank_page(&mut self, at: usize, width: f64, height: f64, color: Color, pattern: PagePattern) {
         let page = Page {
-            kind: PageKind::Blank { color },
+            kind: PageKind::Blank { color, pattern },
             width,
             height,
             annotations: Vec::new(),
@@ -189,14 +203,14 @@ mod tests {
     #[test]
     fn insert_blank_page_adds_page_at_index() {
         let mut doc = Document::new();
-        doc.insert_blank_page(0, 595.0, 842.0, Color::WHITE);
-        doc.insert_blank_page(1, 200.0, 300.0, Color::WHITE);
+        doc.insert_blank_page(0, 595.0, 842.0, Color::WHITE, PagePattern::Plain);
+        doc.insert_blank_page(1, 200.0, 300.0, Color::WHITE, PagePattern::Plain);
 
         assert_eq!(doc.pages.len(), 2);
         assert_eq!(doc.pages[1].width, 200.0);
         assert!(matches!(doc.pages[1].kind, PageKind::Blank { .. }));
         // Out-of-range index is clamped to the end.
-        doc.insert_blank_page(999, 100.0, 100.0, Color::WHITE);
+        doc.insert_blank_page(999, 100.0, 100.0, Color::WHITE, PagePattern::Plain);
         assert_eq!(doc.pages.len(), 3);
         assert_eq!(doc.pages[2].width, 100.0);
     }
