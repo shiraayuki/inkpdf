@@ -41,7 +41,14 @@ struct Tab {
 impl Tab {
     fn blank() -> Self {
         let mut model = Document::new();
-        model.insert_blank_page(0, A4.0, A4.1, Color::WHITE, PagePattern::Plain, DEFAULT_PATTERN_SPACING);
+        model.insert_blank_page(
+            0,
+            A4.0,
+            A4.1,
+            Color::WHITE,
+            PagePattern::Plain,
+            DEFAULT_PATTERN_SPACING,
+        );
         Tab {
             saved_snapshot: Some(model.clone()),
             model,
@@ -101,7 +108,9 @@ impl WindowUi {
 
     /// Whether the active tab's document differs from its last loaded/saved snapshot.
     fn is_dirty(&self) -> bool {
-        let saved = self.tabs.borrow()[self.active_tab.get()].saved_snapshot.clone();
+        let saved = self.tabs.borrow()[self.active_tab.get()]
+            .saved_snapshot
+            .clone();
         match (self.canvas.document(), saved) {
             (Some(current), Some(saved)) => current != saved,
             (Some(_), None) => true,
@@ -118,7 +127,11 @@ impl WindowUi {
             None => "Unbenannt".to_string(),
         };
         self.title.set_title(&label);
-        self.title.set_subtitle(path.map(|p| p.display().to_string()).unwrap_or_default().as_str());
+        self.title.set_subtitle(
+            path.map(|p| p.display().to_string())
+                .unwrap_or_default()
+                .as_str(),
+        );
         self.with_active_tab(|t| t.label = label);
         self.rebuild_tab_bar();
     }
@@ -190,8 +203,13 @@ impl WindowUi {
     /// tab is replaced rather than leaving it around unused; else opens a
     /// fresh tab.
     pub(crate) fn open_from_browser(&self, path: &Path, force_new_tab: bool) {
-        let is_inkpdf = path.extension().is_some_and(|e| e.eq_ignore_ascii_case(FILE_EXTENSION));
-        if !force_new_tab && is_inkpdf && let Some(idx) = self.tab_index_for_path(path) {
+        let is_inkpdf = path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case(FILE_EXTENSION));
+        if !force_new_tab
+            && is_inkpdf
+            && let Some(idx) = self.tab_index_for_path(path)
+        {
             self.switch_to_tab(idx);
             return;
         }
@@ -207,10 +225,13 @@ impl WindowUi {
     /// (symlink/relative-path safe via canonicalization), if any.
     fn tab_index_for_path(&self, path: &Path) -> Option<usize> {
         let target = std::fs::canonicalize(path).ok()?;
-        self.tabs
-            .borrow()
-            .iter()
-            .position(|t| t.save_path.as_deref().and_then(|p| std::fs::canonicalize(p).ok()).as_ref() == Some(&target))
+        self.tabs.borrow().iter().position(|t| {
+            t.save_path
+                .as_deref()
+                .and_then(|p| std::fs::canonicalize(p).ok())
+                .as_ref()
+                == Some(&target)
+        })
     }
 
     /// Whether the active tab is still exactly the pristine blank page it
@@ -240,10 +261,16 @@ impl WindowUi {
         let (model, pdf, zoom, path) = {
             let mut tabs = self.tabs.borrow_mut();
             let tab = &mut tabs[new_idx];
-            (tab.model.clone(), tab.pdf.take(), tab.zoom, tab.save_path.clone())
+            (
+                tab.model.clone(),
+                tab.pdf.take(),
+                tab.zoom,
+                tab.save_path.clone(),
+            )
         };
         self.active_tab.set(new_idx);
-        self.canvas.set_open_document_with_zoom(OpenDocument { model, pdf }, zoom);
+        self.canvas
+            .set_open_document_with_zoom(OpenDocument { model, pdf }, zoom);
         self.show_title(path.as_deref());
     }
 
@@ -278,11 +305,15 @@ impl WindowUi {
             .modal(true)
             .build();
         let ui = self.clone();
-        dialog.choose(Some(&self.window), gio::Cancellable::NONE, move |response| {
-            if let Ok(1) = response {
-                ui.close_tab_now(idx);
-            }
-        });
+        dialog.choose(
+            Some(&self.window),
+            gio::Cancellable::NONE,
+            move |response| {
+                if let Ok(1) = response {
+                    ui.close_tab_now(idx);
+                }
+            },
+        );
     }
 
     fn close_tab_now(&self, idx: usize) {
@@ -296,9 +327,15 @@ impl WindowUi {
             let (model, pdf, zoom, path) = {
                 let mut tabs = self.tabs.borrow_mut();
                 let tab = &mut tabs[new_active];
-                (tab.model.clone(), tab.pdf.take(), tab.zoom, tab.save_path.clone())
+                (
+                    tab.model.clone(),
+                    tab.pdf.take(),
+                    tab.zoom,
+                    tab.save_path.clone(),
+                )
             };
-            self.canvas.set_open_document_with_zoom(OpenDocument { model, pdf }, zoom);
+            self.canvas
+                .set_open_document_with_zoom(OpenDocument { model, pdf }, zoom);
             self.show_title(path.as_deref());
         } else {
             if active > idx {
@@ -326,7 +363,10 @@ impl WindowUi {
             chip.add_css_class("inkpdf-tab");
             chip.set_hexpand(true);
 
-            let label = gtk::Button::builder().label(tab.label.as_str()).css_classes(["flat"]).build();
+            let label = gtk::Button::builder()
+                .label(tab.label.as_str())
+                .css_classes(["flat"])
+                .build();
             label.add_css_class("inkpdf-tab-label");
             label.set_hexpand(true);
             if i == active {
@@ -355,6 +395,17 @@ pub fn build(app: &adw::Application) -> WindowUi {
 
     let header = adw::HeaderBar::new();
     header.set_title_widget(Some(&title));
+
+    // File-browser toggle: packed first so it sits at the very left of the
+    // header, ahead of open/save/new-tab. It's only wired up further down
+    // (see near `register_shortcuts`) once `split_view`/`ui` exist - the
+    // widget itself doesn't need them yet.
+    let browser_toggle = gtk::ToggleButton::builder()
+        .icon_name("sidebar-show-symbolic")
+        .tooltip_text("Dateien")
+        .css_classes(["flat"])
+        .build();
+    header.pack_start(&browser_toggle);
 
     let open_button = gtk::Button::builder()
         .icon_name("document-open-symbolic")
@@ -602,16 +653,10 @@ pub fn build(app: &adw::Application) -> WindowUi {
     // opens it straight into a new tab (see FileBrowser::new / open_path_in_new_tab).
     let file_browser = crate::ui::file_browser::FileBrowser::new(&ui);
     split_view.set_sidebar(Some(&file_browser.widget));
-    let browser_toggle = gtk::ToggleButton::builder()
-        .icon_name("sidebar-show-symbolic")
-        .tooltip_text("Dateien")
-        .css_classes(["flat"])
-        .build();
     {
         let split_view = split_view.clone();
         browser_toggle.connect_toggled(move |btn| split_view.set_show_sidebar(btn.is_active()));
     }
-    header.pack_start(&browser_toggle);
 
     register_shortcuts(app, &window, &ui);
 
@@ -646,8 +691,16 @@ pub fn build(app: &adw::Application) -> WindowUi {
             show_menu(
                 &anchor,
                 vec![
-                    ("Insert before current page", true, Box::new(move || before.insert_page(Relative::Before))),
-                    ("Insert after current page", true, Box::new(move || after.insert_page(Relative::After))),
+                    (
+                        "Insert before current page",
+                        true,
+                        Box::new(move || before.insert_page(Relative::Before)),
+                    ),
+                    (
+                        "Insert after current page",
+                        true,
+                        Box::new(move || after.insert_page(Relative::After)),
+                    ),
                 ],
             );
         });
@@ -665,8 +718,16 @@ pub fn build(app: &adw::Application) -> WindowUi {
             show_menu(
                 &anchor,
                 vec![
-                    ("Delete page before current", before_ok, Box::new(move || before.canvas.delete_page(Relative::Before))),
-                    ("Delete page after current", after_ok, Box::new(move || after.canvas.delete_page(Relative::After))),
+                    (
+                        "Delete page before current",
+                        before_ok,
+                        Box::new(move || before.canvas.delete_page(Relative::Before)),
+                    ),
+                    (
+                        "Delete page after current",
+                        after_ok,
+                        Box::new(move || after.canvas.delete_page(Relative::After)),
+                    ),
                 ],
             );
         });
@@ -706,14 +767,18 @@ fn open_entry(ui: &WindowUi) {
 
     let ui = ui.clone();
     let parent = ui.window.clone();
-    dialog.choose(Some(&parent), gio::Cancellable::NONE, move |response| match response {
-        Ok(1) => {
-            ui.new_tab();
-            open_dialog(&ui);
-        }
-        Ok(2) => confirm_unsaved_then(&ui, open_dialog),
-        _ => {}
-    });
+    dialog.choose(
+        Some(&parent),
+        gio::Cancellable::NONE,
+        move |response| match response {
+            Ok(1) => {
+                ui.new_tab();
+                open_dialog(&ui);
+            }
+            Ok(2) => confirm_unsaved_then(&ui, open_dialog),
+            _ => {}
+        },
+    );
 }
 
 fn open_dialog(ui: &WindowUi) {
@@ -758,7 +823,9 @@ fn save_dialog_then(ui: &WindowUi, and_then: impl Fn(&WindowUi) + 'static) {
 
     // Default the file name to the opened document's name (with the .inkpdf ext).
     let title = ui.title.title();
-    let stem = Path::new(title.as_str()).file_stem().map(|s| s.to_string_lossy().into_owned());
+    let stem = Path::new(title.as_str())
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned());
     let initial = match stem {
         Some(s) if !s.is_empty() && title != "Unbenannt" => format!("{s}.{FILE_EXTENSION}"),
         _ => format!("untitled.{FILE_EXTENSION}"),
@@ -816,11 +883,15 @@ fn confirm_unsaved_then(ui: &WindowUi, and_then: impl Fn(&WindowUi) + 'static) {
 
     let ui = ui.clone();
     let parent = ui.window.clone();
-    dialog.choose(Some(&parent), gio::Cancellable::NONE, move |response| match response {
-        Ok(1) => and_then(&ui),
-        Ok(2) => ui.save_then(and_then),
-        _ => {}
-    });
+    dialog.choose(
+        Some(&parent),
+        gio::Cancellable::NONE,
+        move |response| match response {
+            Ok(1) => and_then(&ui),
+            Ok(2) => ui.save_then(and_then),
+            _ => {}
+        },
+    );
 }
 
 /// Ensures the path ends in `.inkpdf`.
@@ -859,10 +930,25 @@ fn build_tool_strip(canvas: &Canvas, details: &gtk::Stack) -> gtk::Box {
         ("inkpdf-pen-symbolic", "Pen", Tool::Pen, "pen"),
         ("inkpdf-shapes-symbolic", "Shapes", Tool::Shape, "shapes"),
         ("inkpdf-text-symbolic", "Text", Tool::Text, "text"),
-        ("inkpdf-select-symbolic", "Select (drag to lasso strokes/shapes)", Tool::Lasso, "lasso"),
+        (
+            "inkpdf-select-symbolic",
+            "Select (drag to lasso strokes/shapes)",
+            Tool::Lasso,
+            "lasso",
+        ),
         ("inkpdf-eraser-symbolic", "Eraser", Tool::Eraser, "eraser"),
-        ("inkpdf-markdown-symbolic", "Markdown (Shift+Enter renders)", Tool::Markdown, "markdown"),
-        ("inkpdf-latex-symbolic", "LaTeX (Shift+Enter renders)", Tool::Latex, "latex"),
+        (
+            "inkpdf-markdown-symbolic",
+            "Markdown (Shift+Enter renders)",
+            Tool::Markdown,
+            "markdown",
+        ),
+        (
+            "inkpdf-latex-symbolic",
+            "LaTeX (Shift+Enter renders)",
+            Tool::Latex,
+            "latex",
+        ),
         ("inkpdf-pages-symbolic", "Pages", Tool::Pages, "pages"),
     ];
 
@@ -870,7 +956,10 @@ fn build_tool_strip(canvas: &Canvas, details: &gtk::Stack) -> gtk::Box {
         tools
             .iter()
             .map(|(icon, tip, _, _)| {
-                let button = gtk::ToggleButton::builder().icon_name(*icon).tooltip_text(*tip).build();
+                let button = gtk::ToggleButton::builder()
+                    .icon_name(*icon)
+                    .tooltip_text(*tip)
+                    .build();
                 button.add_css_class("flat");
                 button.add_css_class("circular");
                 strip.append(&button);
@@ -948,7 +1037,10 @@ fn detail_column() -> gtk::Box {
 }
 
 fn flat_icon_button(icon: &str, tip: &str) -> gtk::Button {
-    let button = gtk::Button::builder().icon_name(icon).tooltip_text(tip).build();
+    let button = gtk::Button::builder()
+        .icon_name(icon)
+        .tooltip_text(tip)
+        .build();
     button.add_css_class("flat");
     button.add_css_class("circular");
     button
@@ -979,7 +1071,10 @@ fn value_stepper() -> (gtk::Box, gtk::Label, gtk::Button, gtk::Button) {
 }
 
 fn flat_toggle(icon: &str, tip: &str) -> gtk::ToggleButton {
-    let button = gtk::ToggleButton::builder().icon_name(icon).tooltip_text(tip).build();
+    let button = gtk::ToggleButton::builder()
+        .icon_name(icon)
+        .tooltip_text(tip)
+        .build();
     button.add_css_class("flat");
     button.add_css_class("circular");
     button
@@ -1049,7 +1144,12 @@ fn size_stepper(
         let value = value.clone();
         let on_change = on_change.clone();
         move |entry: &gtk::Entry| {
-            let parsed = entry.text().trim().replace(',', ".").parse::<f64>().unwrap_or(value.get());
+            let parsed = entry
+                .text()
+                .trim()
+                .replace(',', ".")
+                .parse::<f64>()
+                .unwrap_or(value.get());
             let v = parsed.clamp(min, max);
             value.set(v);
             entry.set_text(&fmt_size(v, decimals));
@@ -1109,7 +1209,10 @@ const PATTERN_THUMB: (i32, i32) = (28, 36);
 /// unlike a dropdown, whose width would jump around with the selected label.
 fn pattern_thumbnail(pattern: PagePattern) -> gtk::DrawingArea {
     let (w, h) = PATTERN_THUMB;
-    let area = gtk::DrawingArea::builder().content_width(w).content_height(h).build();
+    let area = gtk::DrawingArea::builder()
+        .content_width(w)
+        .content_height(h)
+        .build();
     area.set_draw_func(move |_, c, w, h| {
         c.set_source_rgb(1.0, 1.0, 1.0);
         let _ = c.paint();
@@ -1137,7 +1240,10 @@ fn page_pages(canvas: &Canvas) -> (gtk::Box, gtk::Button, gtk::Button) {
     page.append(&hsep());
     let mut group: Option<gtk::ToggleButton> = None;
     for (label, pattern) in PAGE_PATTERNS {
-        let toggle = gtk::ToggleButton::builder().tooltip_text(label).css_classes(["flat"]).build();
+        let toggle = gtk::ToggleButton::builder()
+            .tooltip_text(label)
+            .css_classes(["flat"])
+            .build();
         toggle.set_child(Some(&pattern_thumbnail(pattern)));
         if let Some(first) = &group {
             toggle.set_group(Some(first));
@@ -1167,7 +1273,9 @@ fn page_pages(canvas: &Canvas) -> (gtk::Box, gtk::Button, gtk::Button) {
                     vec![(
                         "Auf alle Seiten anwenden",
                         true,
-                        Box::new(move || canvas.apply_blank_style_to_all(pattern, canvas.pattern_spacing())),
+                        Box::new(move || {
+                            canvas.apply_blank_style_to_all(pattern, canvas.pattern_spacing())
+                        }),
                     )],
                 );
             });
@@ -1178,7 +1286,9 @@ fn page_pages(canvas: &Canvas) -> (gtk::Box, gtk::Button, gtk::Button) {
     {
         let canvas = canvas.clone();
         let spacing = canvas.pattern_spacing();
-        page.append(&size_stepper(spacing, 4.0, 60.0, 1.0, 0, move |v| canvas.set_pattern_spacing(v)));
+        page.append(&size_stepper(spacing, 4.0, 60.0, 1.0, 0, move |v| {
+            canvas.set_pattern_spacing(v)
+        }));
     }
 
     (page, add, remove)
@@ -1196,7 +1306,9 @@ fn page_pen(canvas: &Canvas) -> gtk::Box {
 
     {
         let canvas = canvas.clone();
-        page.append(&size_stepper(3.0, 0.5, 20.0, 0.5, 1, move |v| canvas.set_pen_width(v)));
+        page.append(&size_stepper(3.0, 0.5, 20.0, 0.5, 1, move |v| {
+            canvas.set_pen_width(v)
+        }));
     }
     page
 }
@@ -1237,7 +1349,9 @@ fn page_shapes(canvas: &Canvas) -> gtk::Box {
 
     {
         let canvas = canvas.clone();
-        page.append(&size_stepper(3.0, 1.0, 20.0, 1.0, 0, move |v| canvas.set_shape_width(v)));
+        page.append(&size_stepper(3.0, 1.0, 20.0, 1.0, 0, move |v| {
+            canvas.set_shape_width(v)
+        }));
     }
     page
 }
@@ -1254,7 +1368,11 @@ fn page_lasso(canvas: &Canvas) -> gtk::Box {
 
     let modes: [(&str, &str, LassoShape); 2] = [
         ("inkpdf-rect-symbolic", "Rechteck-Auswahl", LassoShape::Rect),
-        ("inkpdf-lasso-symbolic", "Freihand-Lasso", LassoShape::Freeform),
+        (
+            "inkpdf-lasso-symbolic",
+            "Freihand-Lasso",
+            LassoShape::Freeform,
+        ),
     ];
     let mut group: Option<gtk::ToggleButton> = None;
     for (icon, tip, shape) in modes {
@@ -1292,18 +1410,25 @@ fn page_text(canvas: &Canvas) -> gtk::Box {
             let parent = btn.root().and_downcast::<gtk::Window>();
             let canvas = canvas.clone();
             let initial: Option<&gtk::pango::FontFamily> = None;
-            dialog.choose_family(parent.as_ref(), initial, gio::Cancellable::NONE, move |res| {
-                if let Ok(family) = res {
-                    canvas.set_text_font(family.name().to_string());
-                }
-            });
+            dialog.choose_family(
+                parent.as_ref(),
+                initial,
+                gio::Cancellable::NONE,
+                move |res| {
+                    if let Ok(family) = res {
+                        canvas.set_text_font(family.name().to_string());
+                    }
+                },
+            );
         });
     }
     page.append(&font);
 
     {
         let canvas = canvas.clone();
-        page.append(&size_stepper(16.0, 8.0, 72.0, 1.0, 0, move |v| canvas.set_text_size(v)));
+        page.append(&size_stepper(16.0, 8.0, 72.0, 1.0, 0, move |v| {
+            canvas.set_text_size(v)
+        }));
     }
 
     let color = color_button();
@@ -1318,9 +1443,21 @@ fn page_text(canvas: &Canvas) -> gtk::Box {
     page.append(&hsep());
     let styles: [(&str, &str, fn(&Canvas)); 4] = [
         ("format-text-bold-symbolic", "Fett", Canvas::toggle_bold),
-        ("format-text-italic-symbolic", "Kursiv", Canvas::toggle_italic),
-        ("format-text-underline-symbolic", "Unterstrichen", Canvas::toggle_underline),
-        ("format-text-strikethrough-symbolic", "Durchgestrichen", Canvas::toggle_strikethrough),
+        (
+            "format-text-italic-symbolic",
+            "Kursiv",
+            Canvas::toggle_italic,
+        ),
+        (
+            "format-text-underline-symbolic",
+            "Unterstrichen",
+            Canvas::toggle_underline,
+        ),
+        (
+            "format-text-strikethrough-symbolic",
+            "Durchgestrichen",
+            Canvas::toggle_strikethrough,
+        ),
     ];
     for (icon, tip, action) in styles {
         let button = flat_icon_button(icon, tip);
@@ -1353,7 +1490,9 @@ fn page_text(canvas: &Canvas) -> gtk::Box {
 fn page_eraser(canvas: &Canvas) -> gtk::Box {
     let page = detail_column();
     let canvas = canvas.clone();
-    page.append(&size_stepper(10.0, 1.0, 40.0, 0.5, 1, move |v| canvas.set_eraser_width(v)));
+    page.append(&size_stepper(10.0, 1.0, 40.0, 0.5, 1, move |v| {
+        canvas.set_eraser_width(v)
+    }));
     page
 }
 
@@ -1367,7 +1506,9 @@ fn page_markdown(canvas: &Canvas) -> gtk::Box {
     let page = detail_column();
     {
         let canvas = canvas.clone();
-        page.append(&size_stepper(16.0, 8.0, 72.0, 1.0, 0, move |v| canvas.set_text_size(v)));
+        page.append(&size_stepper(16.0, 8.0, 72.0, 1.0, 0, move |v| {
+            canvas.set_text_size(v)
+        }));
     }
     page
 }
@@ -1380,7 +1521,9 @@ fn page_latex(canvas: &Canvas) -> gtk::Box {
     let page = detail_column();
     {
         let canvas = canvas.clone();
-        page.append(&size_stepper(16.0, 8.0, 72.0, 1.0, 0, move |v| canvas.set_text_size(v)));
+        page.append(&size_stepper(16.0, 8.0, 72.0, 1.0, 0, move |v| {
+            canvas.set_text_size(v)
+        }));
     }
     let hint = caption("Rechtsklick + ziehen in der Box: Größe ändern");
     hint.set_wrap(true);
@@ -1447,7 +1590,9 @@ fn load_css() {
 
 /// Runs `on_press` when the widget receives a right-click.
 pub(crate) fn add_secondary_click(widget: &impl IsA<gtk::Widget>, on_press: impl Fn() + 'static) {
-    let gesture = gtk::GestureClick::builder().button(gdk::BUTTON_SECONDARY).build();
+    let gesture = gtk::GestureClick::builder()
+        .button(gdk::BUTTON_SECONDARY)
+        .build();
     gesture.connect_pressed(move |_, _, _, _| on_press());
     widget.add_controller(gesture);
 }
@@ -1460,7 +1605,10 @@ pub(crate) fn show_menu(anchor: &impl IsA<gtk::Widget>, items: Vec<MenuItem>) {
     let popover = gtk::Popover::builder().autohide(true).build();
 
     for (label, enabled, callback) in items {
-        let item = gtk::Button::builder().label(label).sensitive(enabled).build();
+        let item = gtk::Button::builder()
+            .label(label)
+            .sensitive(enabled)
+            .build();
         item.add_css_class("flat");
         let popover = popover.clone();
         item.connect_clicked(move |_| {
