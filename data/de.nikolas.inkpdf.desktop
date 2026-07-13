@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=inkpdf
+Comment=PDF viewer and annotator
+Exec=inkpdf %f
+Icon=de.nikolas.inkpdf
+Terminal=false
+Categories=Office;Viewer;
+MimeType=application/pdf;application/x-inkpdf;
+StartupNotify=true

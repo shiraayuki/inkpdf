@@ -1,0 +1,76 @@
+{
+    "app-id": "de.nikolas.inkpdf",
+    "runtime": "org.gnome.Platform",
+    "runtime-version": "49",
+    "sdk": "org.gnome.Sdk",
+    "sdk-extensions": [
+        "org.freedesktop.Sdk.Extension.rust-stable"
+    ],
+    "command": "inkpdf",
+    "finish-args": [
+        "--share=ipc",
+        "--socket=wayland",
+        "--socket=fallback-x11",
+        "--device=dri",
+        "--filesystem=home"
+    ],
+    "build-options": {
+        "append-path": "/usr/lib/sdk/rust-stable/bin"
+    },
+    "modules": [
+        {
+            "name": "poppler",
+            "buildsystem": "cmake-ninja",
+            "config-opts": [
+                "-DCMAKE_BUILD_TYPE=Release",
+                "-DENABLE_GLIB=ON",
+                "-DENABLE_CPP=OFF",
+                "-DENABLE_QT5=OFF",
+                "-DENABLE_QT6=OFF",
+                "-DENABLE_BOOST=OFF",
+                "-DENABLE_UTILS=OFF",
+                "-DENABLE_GOBJECT_INTROSPECTION=OFF",
+                "-DENABLE_NSS3=OFF",
+                "-DENABLE_GPGME=OFF",
+                "-DENABLE_LIBCURL=OFF",
+                "-DBUILD_GTK_TESTS=OFF",
+                "-DBUILD_QT5_TESTS=OFF",
+                "-DBUILD_QT6_TESTS=OFF",
+                "-DBUILD_CPP_TESTS=OFF",
+                "-DBUILD_MANUAL_TESTS=OFF"
+            ],
+            "sources": [
+                {
+                    "type": "archive",
+                    "url": "https://poppler.freedesktop.org/poppler-26.07.0.tar.xz",
+                    "sha256": "304832f48f8a47fdca90c6b6d1f684e68f37c10c9a0726f345f4ca9df4ca01e2"
+                }
+            ]
+        },
+        {
+            "name": "inkpdf",
+            "buildsystem": "simple",
+            "build-options": {
+                "env": {
+                    "CARGO_HOME": "/run/build/inkpdf/cargo"
+                }
+            },
+            "build-commands": [
+                "cargo --offline build --release",
+                "install -Dm755 target/release/inkpdf /app/bin/inkpdf",
+                "install -Dm644 data/de.nikolas.inkpdf.desktop /app/share/applications/de.nikolas.inkpdf.desktop",
+                "install -Dm644 data/de.nikolas.inkpdf.metainfo.xml /app/share/metainfo/de.nikolas.inkpdf.metainfo.xml",
+                "install -Dm644 data/icons/hicolor/scalable/apps/de.nikolas.inkpdf.svg /app/share/icons/hicolor/scalable/apps/de.nikolas.inkpdf.svg",
+                "mkdir -p /app/share/inkpdf/icons/hicolor/scalable/actions",
+                "cp data/icons/hicolor/scalable/actions/*.svg /app/share/inkpdf/icons/hicolor/scalable/actions/"
+            ],
+            "sources": [
+                {
+                    "type": "dir",
+                    "path": "."
+                },
+                "cargo-sources.json"
+            ]
+        }
+    ]
+}

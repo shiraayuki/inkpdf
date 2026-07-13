@@ -1675,8 +1675,22 @@ fn load_css() {
         );
 
         // Bundled tool icons (under a hicolor tree, so every theme finds them).
-        let icons = concat!(env!("CARGO_MANIFEST_DIR"), "/data/icons");
-        gtk::IconTheme::for_display(&display).add_search_path(icons);
+        // `add_search_path` is a no-op for a path that doesn't exist, so it's
+        // safe to register both candidates unconditionally: the installed
+        // location (relative to the running binary - works for both the
+        // Flatpak's /app prefix and a hypothetical system package) and the
+        // `cargo run`-from-checkout location. These deliberately live under
+        // `share/inkpdf/icons`, not the shared `share/icons` hicolor tree -
+        // Flatpak's export step silently drops icon files there unless
+        // their name matches the app ID, which our per-tool icon names don't.
+        let icon_theme = gtk::IconTheme::for_display(&display);
+        if let Some(installed) = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().and_then(|bin| bin.parent()).map(|prefix| prefix.join("share/inkpdf/icons")))
+        {
+            icon_theme.add_search_path(&installed);
+        }
+        icon_theme.add_search_path(concat!(env!("CARGO_MANIFEST_DIR"), "/data/icons"));
     });
 }
 

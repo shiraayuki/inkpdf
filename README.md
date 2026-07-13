@@ -1,0 +1,69 @@
+# inkpdf
+
+A PDF viewer and annotator for Linux. Open a PDF (or start from a blank page) and draw, type,
+or sketch on top with a pen, shapes, text, Markdown, or LaTeX math boxes — annotations live in
+their own layer over the rendered PDF, and export back into a real, flattened PDF file.
+
+Built with Rust, GTK4, and libadwaita. Inspired by [Rnote](https://github.com/flxzt/rnote)'s
+simplicity, with room to grow toward Xournal++-style depth.
+
+## Features
+
+- **Open PDFs or start blank** — view and annotate existing PDFs, or start from a blank page
+  with a choice of plain, grid, dotted, or lined patterns.
+- **Pen** with live stroke smoothing (via `ink-stroke-modeler`, the same smoothing Rnote uses),
+  rendered as vector strokes, not raster ink.
+- **Shapes** — rectangle, ellipse, and line, with adjustable color and stroke width.
+- **Text** — multi-line text boxes with bold, italic, underline, strikethrough, custom color,
+  and font selection.
+- **Markdown** boxes — headings, bold/italic, lists, code, rules, and inline LaTeX math
+  (`$...$` / `$$...$$`) rendered live.
+- **Dedicated LaTeX boxes** — a box that's entirely math mode, no `$...$` needed; resize a
+  formula that's gotten too small by right-click-dragging inside it.
+- **Eraser** and a **lasso** tool for rectangular or freeform multi-selection, with bulk
+  restyling (color, width) across a whole selection.
+- **Undo/redo** across every tool.
+- **Tabs** — multiple documents open at once.
+- **Built-in file browser** — a slide-in sidebar to open files without a dialog.
+- **Own file format** (`.inkpdf`) — gzip-compressed JSON that embeds the source PDF, so a saved
+  file is fully self-contained.
+- **PDF export** — flattens the background and every annotation into a real, standalone PDF.
+- **Sandboxed PDF parsing** — all PDF parsing/rendering runs in a separate process, restricted
+  via Landlock and seccomp, so a malicious or malformed PDF can't do anything with the app's
+  own privileges.
+- Light/dark theme, persisted tool defaults, and zoom controls.
+
+## Installation
+
+inkpdf currently only targets Linux. There's no packaged release yet — build it from source:
+
+### Dependencies
+
+- Rust (stable, edition 2024 support required — 1.85+)
+- `gtk4`, `libadwaita`, `poppler-glib` (development packages)
+
+On Arch Linux:
+
+```sh
+sudo pacman -S gtk4 libadwaita poppler-glib
+```
+
+### Build
+
+```sh
+git clone <this-repo-url>
+cd inkpdf
+cargo build --release
+./target/release/inkpdf
+```
+
+A Flatpak manifest (`de.nikolas.inkpdf.json`) is also included in the repo for building a
+sandboxed package locally with `flatpak-builder`.
+
+## Screenshots
+
+<!-- TODO: add screenshots -->
+
+![Main window](docs/screenshots/main-window.png)
+![Annotating a PDF](docs/screenshots/annotating.png)
+![LaTeX box](docs/screenshots/latex-box.png)

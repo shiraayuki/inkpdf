@@ -1,5 +1,9 @@
 /target
 
+# Flatpak build artifacts (local only, not part of the source)
+/build-dir
+/.flatpak-builder
+
 # Claude-Projektkontext (nicht committen)
 /CLAUDE.md
 

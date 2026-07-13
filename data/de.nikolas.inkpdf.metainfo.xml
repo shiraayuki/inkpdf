@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>de.nikolas.inkpdf</id>
+  <name>inkpdf</name>
+  <summary>PDF viewer and annotator</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>
+      inkpdf is a PDF viewer and annotator: open a PDF or start from a blank
+      page, then draw, type, or sketch on top with a pen, shapes, text,
+      Markdown, or LaTeX math boxes. Annotations live in their own layer over
+      the rendered PDF and export back into a real, flattened PDF file.
+    </p>
+  </description>
+  <launchable type="desktop-id">de.nikolas.inkpdf.desktop</launchable>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-07-13"/>
+  </releases>
+</component>
