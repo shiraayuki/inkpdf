@@ -1,42 +1,112 @@
 {
-  "engine/document.rs": {
-    "mtime": 1783875556.5584548,
-    "ast_hash": "5e2288c3ed4b0224befc4b118fa201a0",
-    "semantic_hash": "5e2288c3ed4b0224befc4b118fa201a0"
+  "src/engine/document.rs": {
+    "mtime": 1783930314.8313804,
+    "ast_hash": "2ed228c6959f3917c2037e9f2e1b07c1",
+    "semantic_hash": ""
   },
-  "engine/mod.rs": {
+  "src/engine/mod.rs": {
     "mtime": 1783854585.463261,
     "ast_hash": "c3b1631e5d5e8dcbf7402807203ba3aa",
-    "semantic_hash": "c3b1631e5d5e8dcbf7402807203ba3aa"
+    "semantic_hash": ""
   },
-  "engine/pdf.rs": {
+  "src/engine/pdf.rs": {
     "mtime": 1783854537.3085887,
     "ast_hash": "a034f8f2e6bee1f24f8537232cd5b539",
-    "semantic_hash": "a034f8f2e6bee1f24f8537232cd5b539"
+    "semantic_hash": ""
   },
-  "engine/storage.rs": {
-    "mtime": 1783875568.4473891,
-    "ast_hash": "c24a5abb35300ba145ca15e0128135c5",
-    "semantic_hash": "c24a5abb35300ba145ca15e0128135c5"
+  "src/engine/storage.rs": {
+    "mtime": 1783930321.986231,
+    "ast_hash": "1a884d0fcaacbacd0fa95ee8fd6943dc",
+    "semantic_hash": ""
   },
-  "main.rs": {
+  "src/main.rs": {
     "mtime": 1783853955.7925522,
     "ast_hash": "7d9a75c9d4e38d2cfd996650e4027c11",
-    "semantic_hash": "7d9a75c9d4e38d2cfd996650e4027c11"
+    "semantic_hash": ""
   },
-  "ui/canvas.rs": {
-    "mtime": 1783886302.63891,
-    "ast_hash": "f802845f77e33a8c07ee2b695080fae1",
-    "semantic_hash": "f802845f77e33a8c07ee2b695080fae1"
+  "src/ui/canvas.rs": {
+    "mtime": 1783931683.3760464,
+    "ast_hash": "155f950bb4db935bffc59e809502f7ad",
+    "semantic_hash": ""
   },
-  "ui/mod.rs": {
+  "src/ui/mod.rs": {
     "mtime": 1783853898.274945,
     "ast_hash": "5a3efbaf26b25bbcd0a9838e7ccc6576",
-    "semantic_hash": "5a3efbaf26b25bbcd0a9838e7ccc6576"
+    "semantic_hash": ""
   },
-  "ui/window.rs": {
-    "mtime": 1783886288.443972,
-    "ast_hash": "9daf7f2521be7a86accd19a7ac552cdf",
-    "semantic_hash": "9daf7f2521be7a86accd19a7ac552cdf"
+  "src/ui/window.rs": {
+    "mtime": 1783931882.2518466,
+    "ast_hash": "f67c8adc8a18209394e31544597a6b97",
+    "semantic_hash": ""
+  },
+  "data/icons/hicolor/scalable/actions/inkpdf-ellipse-symbolic.svg": {
+    "mtime": 1783870141.8031027,
+    "ast_hash": "29f0ee46ea4a18d0ef687027436ced3a",
+    "semantic_hash": ""
+  },
+  "data/icons/hicolor/scalable/actions/inkpdf-eraser-symbolic.svg": {
+    "mtime": 1783869518.2815385,
+    "ast_hash": "0e709c2d6f7614920130cdf4c4193fd3",
+    "semantic_hash": ""
+  },
+  "data/icons/hicolor/scalable/actions/inkpdf-line-symbolic.svg": {
+    "mtime": 1783870142.0037346,
+    "ast_hash": "98b006cda56dfbd2a3aadd7fc41ddd8a",
+    "semantic_hash": ""
+  },
+  "data/icons/hicolor/scalable/actions/inkpdf-markdown-symbolic.svg": {
+    "mtime": 1783869518.5004742,
+    "ast_hash": "106120bd323ad6cc25a7303b92f567f4",
+    "semantic_hash": ""
+  },
+  "data/icons/hicolor/scalable/actions/inkpdf-page-add.svg": {
+    "mtime": 1783928990.6148784,
+    "ast_hash": "685df20431a150de6e076d9fa5b72936",
+    "semantic_hash": ""
+  },
+  "data/icons/hicolor/scalable/actions/inkpdf-page-remove.svg": {
+    "mtime": 1783928994.9559693,
+    "ast_hash": "4f2a8a0a7cfa09c4567d88a6c720ba2c",
+    "semantic_hash": ""
+  },
+  "data/icons/hicolor/scalable/actions/inkpdf-pages-symbolic.svg": {
+    "mtime": 1783928804.519881,
+    "ast_hash": "44dcdb57aa19ed6e234219ea49bb6a0c",
+    "semantic_hash": ""
+  },
+  "data/icons/hicolor/scalable/actions/inkpdf-pen-symbolic.svg": {
+    "mtime": 1783869517.6248782,
+    "ast_hash": "c46367bc71886df5662ea5559b250772",
+    "semantic_hash": ""
+  },
+  "data/icons/hicolor/scalable/actions/inkpdf-rect-symbolic.svg": {
+    "mtime": 1783870141.6211877,
+    "ast_hash": "43b0d8be8643219e1ea5b0408590a089",
+    "semantic_hash": ""
+  },
+  "data/icons/hicolor/scalable/actions/inkpdf-redo-symbolic.svg": {
+    "mtime": 1783869518.8977075,
+    "ast_hash": "1dc3672cb16232ecce8aa034259ec1f0",
+    "semantic_hash": ""
+  },
+  "data/icons/hicolor/scalable/actions/inkpdf-settings-symbolic.svg": {
+    "mtime": 1783928810.9889386,
+    "ast_hash": "316602fa344c837ba224142cd1b14f2d",
+    "semantic_hash": ""
+  },
+  "data/icons/hicolor/scalable/actions/inkpdf-shapes-symbolic.svg": {
+    "mtime": 1783869517.8456466,
+    "ast_hash": "cb345bb29aab0d6d80d0d433998156d1",
+    "semantic_hash": ""
+  },
+  "data/icons/hicolor/scalable/actions/inkpdf-text-symbolic.svg": {
+    "mtime": 1783869518.0594323,
+    "ast_hash": "93ceeec92e94e6409054e7d7918d8e12",
+    "semantic_hash": ""
+  },
+  "data/icons/hicolor/scalable/actions/inkpdf-undo-symbolic.svg": {
+    "mtime": 1783869518.724136,
+    "ast_hash": "50499aa05f6d9d2f4d0459b6a5dfcc45",
+    "semantic_hash": ""
   }
 }

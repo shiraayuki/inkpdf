@@ -13,6 +13,52 @@ pub struct Color {
 
 impl Color {
     pub const WHITE: Color = Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
+    pub const BLACK: Color = Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
+}
+
+impl Default for Color {
+    fn default() -> Self {
+        Color::BLACK
+    }
+}
+
+fn default_font() -> String {
+    "Sans".to_string()
+}
+
+/// Visual style of a text span: color, font family, optional highlight, and
+/// bold/italic/underline/strikethrough. New fields carry serde defaults so older
+/// `.inkpdf` files (which only stored `color`) still load.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct TextStyle {
+    #[serde(default)]
+    pub color: Color,
+    #[serde(default = "default_font")]
+    pub font: String,
+    #[serde(default)]
+    pub highlight: Option<Color>,
+    #[serde(default)]
+    pub bold: bool,
+    #[serde(default)]
+    pub italic: bool,
+    #[serde(default)]
+    pub underline: bool,
+    #[serde(default)]
+    pub strikethrough: bool,
+}
+
+impl Default for TextStyle {
+    fn default() -> Self {
+        Self {
+            color: Color::BLACK,
+            font: default_font(),
+            highlight: None,
+            bold: false,
+            italic: false,
+            underline: false,
+            strikethrough: false,
+        }
+    }
 }
 
 /// Default blank-page size in PDF points (A4), used when no page exists to match.
@@ -24,14 +70,16 @@ pub enum PageKind {
     Blank { color: Color },
 }
 
-/// A run of text sharing one color.
+/// A run of text sharing one style.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct TextRun {
     pub text: String,
-    pub color: Color,
+    #[serde(flatten)]
+    pub style: TextStyle,
 }
 
-/// A text box: `runs` hold colored spans (so different passages can be colored).
+/// A text box: `runs` hold styled spans (so different passages can differ in
+/// color, font, highlight, or weight).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct TextAnnotation {
     pub x: f64,
@@ -41,11 +89,11 @@ pub struct TextAnnotation {
 }
 
 impl TextAnnotation {
-    /// The characters with their colors, flattened across runs.
-    pub fn glyphs(&self) -> Vec<(char, Color)> {
+    /// The characters with their styles, flattened across runs.
+    pub fn glyphs(&self) -> Vec<(char, TextStyle)> {
         self.runs
             .iter()
-            .flat_map(|run| run.text.chars().map(|ch| (ch, run.color)))
+            .flat_map(|run| run.text.chars().map(|ch| (ch, run.style.clone())))
             .collect()
     }
 }

@@ -11,6 +11,7 @@ use uuid::Uuid;
 use crate::engine::OpenDocument;
 use crate::engine::document::{
     A4, Annotation, AnnotationKind, Color, Document, Page, PageKind, TextAnnotation, TextRun,
+    TextStyle,
 };
 use crate::engine::pdf::PdfDocument;
 
@@ -19,7 +20,6 @@ const MIN_ZOOM: f64 = 0.1;
 const MAX_ZOOM: f64 = 6.0;
 const ZOOM_STEP: f64 = 1.25;
 const TEXT_SIZE: f64 = 16.0;
-const TEXT_COLOR: Color = Color { r: 0.0, g: 0.0, b: 0.0, a: 1.0 };
 const MIN_BOX_WIDTH: f64 = 4.0;
 /// Squared pixel distance a press must move before it counts as a drag (not a click).
 const DRAG_THRESHOLD_SQ: f64 = 9.0;
@@ -28,11 +28,11 @@ const BOX_ACTIVE: (f64, f64, f64, f64) = (0.20, 0.51, 0.92, 1.0);
 const BOX_ANNOTATION: (f64, f64, f64, f64) = (0.55, 0.55, 0.60, 0.9);
 const SELECTION_FILL: (f64, f64, f64, f64) = (0.20, 0.51, 0.92, 0.30);
 
-/// A single character with its own color.
-#[derive(Clone, Copy)]
+/// A single character with its own style (color, font, highlight, weight).
+#[derive(Clone)]
 struct Glyph {
     ch: char,
-    color: Color,
+    style: TextStyle,
 }
 
 /// A text box currently being typed. `x`/`y` are the top-left anchor in page points.
@@ -70,9 +70,9 @@ impl TextEdit {
         }
     }
 
-    fn insert(&mut self, ch: char, color: Color) {
+    fn insert(&mut self, ch: char, style: TextStyle) {
         self.delete_selection();
-        self.glyphs.insert(self.cursor, Glyph { ch, color });
+        self.glyphs.insert(self.cursor, Glyph { ch, style });
         self.cursor += 1;
         self.anchor = None;
     }
@@ -133,6 +133,40 @@ impl TextEdit {
         self.set_cursor(p, extend);
     }
 
+    /// Word boundary to the left of `pos`: skip whitespace, then the word itself.
+    fn word_left(&self, pos: usize) -> usize {
+        let mut i = pos;
+        while i > 0 && self.glyphs[i - 1].ch.is_whitespace() {
+            i -= 1;
+        }
+        while i > 0 && !self.glyphs[i - 1].ch.is_whitespace() {
+            i -= 1;
+        }
+        i
+    }
+
+    /// Word boundary to the right of `pos`: skip whitespace, then the word itself.
+    fn word_right(&self, pos: usize) -> usize {
+        let mut i = pos;
+        while i < self.glyphs.len() && self.glyphs[i].ch.is_whitespace() {
+            i += 1;
+        }
+        while i < self.glyphs.len() && !self.glyphs[i].ch.is_whitespace() {
+            i += 1;
+        }
+        i
+    }
+
+    fn move_word_left(&mut self, extend: bool) {
+        let p = self.word_left(self.cursor);
+        self.set_cursor(p, extend);
+    }
+
+    fn move_word_right(&mut self, extend: bool) {
+        let p = self.word_right(self.cursor);
+        self.set_cursor(p, extend);
+    }
+
     fn move_home(&mut self, extend: bool) {
         let p = self.line_start(self.cursor);
         self.set_cursor(p, extend);
@@ -178,11 +212,11 @@ impl TextEdit {
         self.cursor = self.glyphs.len();
     }
 
-    /// Applies a color to the selected glyphs; returns whether anything was colored.
-    fn color_selection(&mut self, color: Color) -> bool {
+    /// Applies `f` to every selected glyph's style; returns whether a selection existed.
+    fn style_selection(&mut self, f: impl Fn(&mut TextStyle)) -> bool {
         if let Some((s, e)) = self.selection() {
             for g in &mut self.glyphs[s..e] {
-                g.color = color;
+                f(&mut g.style);
             }
             true
         } else {
@@ -190,13 +224,13 @@ impl TextEdit {
         }
     }
 
-    /// Merges consecutive same-color glyphs into runs for storage.
+    /// Merges consecutive same-style glyphs into runs for storage.
     fn to_runs(&self) -> Vec<TextRun> {
         let mut runs: Vec<TextRun> = Vec::new();
         for g in &self.glyphs {
             match runs.last_mut() {
-                Some(last) if last.color == g.color => last.text.push(g.ch),
-                _ => runs.push(TextRun { text: g.ch.to_string(), color: g.color }),
+                Some(last) if last.style == g.style => last.text.push(g.ch),
+                _ => runs.push(TextRun { text: g.ch.to_string(), style: g.style.clone() }),
             }
         }
         runs
@@ -242,8 +276,9 @@ struct State {
     selected: Option<(usize, Uuid)>,
     /// Font size for new text boxes (and the one being edited).
     text_size: f64,
-    /// Font color for new text / new typing (and for coloring a selection).
-    text_color: Color,
+    /// Style for newly typed characters (color, font, weight). Also applied to the
+    /// current selection when a style control changes.
+    text_style: TextStyle,
 }
 
 /// Where an insert/delete acts relative to the current page.
@@ -300,7 +335,7 @@ impl Canvas {
             text_drag: None,
             selected: None,
             text_size: TEXT_SIZE,
-            text_color: TEXT_COLOR,
+            text_style: TextStyle::default(),
         }));
 
         {
@@ -399,14 +434,87 @@ impl Canvas {
         self.area.queue_draw();
     }
 
-    /// Sets the font color. While editing: colors the selection if there is one,
-    /// otherwise this becomes the color for newly typed characters.
+    /// Sets the font color: becomes the color for newly typed characters and, while
+    /// editing, recolors the current selection.
     pub fn set_text_color(&self, color: Color) {
+        self.apply_style(move |s| s.color = color);
+    }
+
+    /// Sets the font family (see `set_text_color` for the new-text/selection split).
+    pub fn set_text_font(&self, font: String) {
+        self.apply_style(move |s| s.font = font.clone());
+    }
+
+    pub fn toggle_bold(&self) {
+        self.toggle_style(|s| s.bold, |s, on| s.bold = on);
+    }
+
+    pub fn toggle_italic(&self) {
+        self.toggle_style(|s| s.italic, |s, on| s.italic = on);
+    }
+
+    pub fn toggle_underline(&self) {
+        self.toggle_style(|s| s.underline, |s, on| s.underline = on);
+    }
+
+    pub fn toggle_strikethrough(&self) {
+        self.toggle_style(|s| s.strikethrough, |s, on| s.strikethrough = on);
+    }
+
+    /// Flips a boolean style attribute. With a selection: turns it on unless every
+    /// selected glyph already has it (then off), editor-style. Without a selection:
+    /// flips it for newly typed characters.
+    fn toggle_style(&self, get: impl Fn(&TextStyle) -> bool, set: impl Fn(&mut TextStyle, bool)) {
         {
             let mut st = self.state.borrow_mut();
-            st.text_color = color;
+            let State { editing, text_style, .. } = &mut *st;
+            match editing.as_mut().and_then(|ed| ed.selection().map(|sel| (ed, sel))) {
+                Some((ed, (s, e))) => {
+                    let target = !ed.glyphs[s..e].iter().all(|g| get(&g.style));
+                    for g in &mut ed.glyphs[s..e] {
+                        set(&mut g.style, target);
+                    }
+                    set(text_style, target);
+                }
+                None => {
+                    let target = !get(text_style);
+                    set(text_style, target);
+                }
+            }
+        }
+        self.area.queue_draw();
+    }
+
+    /// Applies the highlight (marker) color to the current selection. The marker is
+    /// selection-only, so with nothing selected this does nothing.
+    pub fn set_highlight(&self, color: Color) {
+        {
+            let mut st = self.state.borrow_mut();
             if let Some(ed) = st.editing.as_mut() {
-                ed.color_selection(color);
+                ed.style_selection(|s| s.highlight = Some(color));
+            }
+        }
+        self.area.queue_draw();
+    }
+
+    /// Removes the highlight from the current selection.
+    pub fn clear_highlight(&self) {
+        {
+            let mut st = self.state.borrow_mut();
+            if let Some(ed) = st.editing.as_mut() {
+                ed.style_selection(|s| s.highlight = None);
+            }
+        }
+        self.area.queue_draw();
+    }
+
+    /// Updates the current typing style and applies the same change to the selection.
+    fn apply_style(&self, f: impl Fn(&mut TextStyle)) {
+        {
+            let mut st = self.state.borrow_mut();
+            f(&mut st.text_style);
+            if let Some(ed) = st.editing.as_mut() {
+                ed.style_selection(&f);
             }
         }
         self.area.queue_draw();
@@ -616,27 +724,20 @@ impl Canvas {
         self.area.queue_draw();
     }
 
-    /// If a box is being edited and (page, lx, ly) lands inside it, moves the caret there.
+    /// Whether a box is being edited and (page, lx, ly) lands inside it. The caret
+    /// itself is placed by the drag gesture's `drag_begin` (which fires on press,
+    /// before this click handler), so this only reports the hit and must not move
+    /// the caret - doing so would clear the selection anchor that `drag_begin` set.
     fn click_in_editing(&self, page: usize, lx: f64, ly: f64) -> bool {
-        let cursor = {
-            let st = self.state.borrow();
-            let Some(ed) = st.editing.as_ref() else {
-                return false;
-            };
-            if ed.page != page {
-                return false;
-            }
-            let (w, h) = measure_glyphs(ed.size, &ed.glyphs);
-            if lx < ed.x || lx > ed.x + w || ly < ed.y || ly > ed.y + h {
-                return false;
-            }
-            cursor_at(ed.size, &ed.glyphs, lx - ed.x, ly - ed.y)
+        let st = self.state.borrow();
+        let Some(ed) = st.editing.as_ref() else {
+            return false;
         };
-        if let Some(ed) = self.state.borrow_mut().editing.as_mut() {
-            ed.set_cursor(cursor, false);
+        if ed.page != page {
+            return false;
         }
-        self.area.queue_draw();
-        true
+        let (w, h) = measure_glyphs(ed.size, &ed.glyphs);
+        lx >= ed.x && lx <= ed.x + w && ly >= ed.y && ly <= ed.y + h
     }
 
     fn start_new_text(&self, page: usize, lx: f64, ly: f64) {
@@ -726,14 +827,18 @@ impl Canvas {
                 if ctrl {
                     self.commit_editing();
                 } else {
-                    let color = self.state.borrow().text_color;
-                    self.edit_mut(move |ed| ed.insert('\n', color));
+                    let style = self.state.borrow().text_style.clone();
+                    self.edit_mut(move |ed| ed.insert('\n', style));
                 }
             }
             gdk::Key::BackSpace => self.edit_mut(TextEdit::backspace),
             gdk::Key::Delete | gdk::Key::KP_Delete => self.edit_mut(TextEdit::delete_forward),
-            gdk::Key::Left | gdk::Key::KP_Left => self.edit_mut(move |ed| ed.move_left(extend)),
-            gdk::Key::Right | gdk::Key::KP_Right => self.edit_mut(move |ed| ed.move_right(extend)),
+            gdk::Key::Left | gdk::Key::KP_Left => {
+                self.edit_mut(move |ed| if ctrl { ed.move_word_left(extend) } else { ed.move_left(extend) })
+            }
+            gdk::Key::Right | gdk::Key::KP_Right => {
+                self.edit_mut(move |ed| if ctrl { ed.move_word_right(extend) } else { ed.move_right(extend) })
+            }
             gdk::Key::Up | gdk::Key::KP_Up => self.edit_mut(move |ed| ed.move_up(extend)),
             gdk::Key::Down | gdk::Key::KP_Down => self.edit_mut(move |ed| ed.move_down(extend)),
             gdk::Key::Home | gdk::Key::KP_Home => self.edit_mut(move |ed| ed.move_home(extend)),
@@ -741,8 +846,8 @@ impl Canvas {
             gdk::Key::a | gdk::Key::A if ctrl => self.edit_mut(TextEdit::select_all),
             _ => match keyval.to_unicode() {
                 Some(ch) if !ch.is_control() => {
-                    let color = self.state.borrow().text_color;
-                    self.edit_mut(move |ed| ed.insert(ch, color));
+                    let style = self.state.borrow().text_style.clone();
+                    self.edit_mut(move |ed| ed.insert(ch, style));
                 }
                 _ => return glib::Propagation::Proceed,
             },
@@ -1003,7 +1108,26 @@ fn annotation_at(page: &Page, lx: f64, ly: f64) -> Option<usize> {
 }
 
 fn ann_glyphs(t: &TextAnnotation) -> Vec<Glyph> {
-    t.glyphs().into_iter().map(|(ch, color)| Glyph { ch, color }).collect()
+    t.glyphs().into_iter().map(|(ch, style)| Glyph { ch, style }).collect()
+}
+
+/// Selects a glyph's font family, slant, and weight on the context.
+fn apply_glyph_font(c: &cairo::Context, size: f64, style: &TextStyle) {
+    let slant = if style.italic { cairo::FontSlant::Italic } else { cairo::FontSlant::Normal };
+    let weight = if style.bold { cairo::FontWeight::Bold } else { cairo::FontWeight::Normal };
+    c.select_font_face(&style.font, slant, weight);
+    c.set_font_size(size);
+}
+
+/// Reference (ascent, line height) at `size` from the default font, so every glyph
+/// on a line shares one baseline regardless of its family or weight.
+fn line_metrics(c: &cairo::Context, size: f64) -> (f64, f64) {
+    c.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Normal);
+    c.set_font_size(size);
+    match c.font_extents() {
+        Ok(e) => (e.ascent(), e.height().max(1.0)),
+        Err(_) => (size * 0.8, size.max(1.0)),
+    }
 }
 
 /// Per-caret x positions and line indices for a glyph run (index 0..=len).
@@ -1015,8 +1139,7 @@ struct TextLayout {
 }
 
 fn layout(c: &cairo::Context, size: f64, glyphs: &[Glyph]) -> TextLayout {
-    c.set_font_size(size);
-    let line_height = c.font_extents().map(|e| e.height()).unwrap_or(size).max(1.0);
+    let (_ascent, line_height) = line_metrics(c, size);
     let mut positions = Vec::with_capacity(glyphs.len() + 1);
     let mut x = 0.0_f64;
     let mut line = 0usize;
@@ -1028,6 +1151,7 @@ fn layout(c: &cairo::Context, size: f64, glyphs: &[Glyph]) -> TextLayout {
             line += 1;
             x = 0.0;
         } else {
+            apply_glyph_font(c, size, &g.style);
             let adv = c.text_extents(&g.ch.to_string()).map(|e| e.x_advance()).unwrap_or(0.0);
             x += adv;
             max_width = max_width.max(x);
@@ -1189,23 +1313,49 @@ fn page_surface(
     Some(surface)
 }
 
-/// Draws glyphs (each with its own color), honoring newlines. Context in page-point space.
+/// Draws glyphs (each with its own style: color, font, highlight, weight, decoration),
+/// honoring newlines. Context in page-point space.
 fn draw_glyphs(c: &cairo::Context, x: f64, y: f64, size: f64, glyphs: &[Glyph]) {
-    c.set_font_size(size);
-    let Ok(fe) = c.font_extents() else {
-        return;
-    };
-    let mut baseline = y + fe.ascent();
-    c.move_to(x, baseline);
+    let (ascent, line_height) = line_metrics(c, size);
+    let mut gx = x;
+    let mut line_top = y;
     for g in glyphs {
         if g.ch == '\n' {
-            baseline += fe.height();
-            c.move_to(x, baseline);
+            gx = x;
+            line_top += line_height;
             continue;
         }
-        let Color { r, g: gg, b, a } = g.color;
+        apply_glyph_font(c, size, &g.style);
+        let adv = c.text_extents(&g.ch.to_string()).map(|e| e.x_advance()).unwrap_or(0.0);
+
+        if let Some(h) = g.style.highlight {
+            c.set_source_rgba(h.r, h.g, h.b, h.a);
+            c.rectangle(gx, line_top, adv, line_height);
+            let _ = c.fill();
+        }
+
+        let baseline = line_top + ascent;
+        let Color { r, g: gg, b, a } = g.style.color;
         c.set_source_rgba(r, gg, b, a);
+        c.move_to(gx, baseline);
         let _ = c.show_text(&g.ch.to_string());
+
+        if g.style.underline || g.style.strikethrough {
+            c.set_line_width((size * 0.06).max(0.5));
+            if g.style.underline {
+                let uy = baseline + size * 0.12;
+                c.move_to(gx, uy);
+                c.line_to(gx + adv, uy);
+                let _ = c.stroke();
+            }
+            if g.style.strikethrough {
+                let sy = baseline - ascent * 0.32;
+                c.move_to(gx, sy);
+                c.line_to(gx + adv, sy);
+                let _ = c.stroke();
+            }
+        }
+        gx += adv;
     }
 }
 
@@ -1331,14 +1481,14 @@ mod tests {
                 x,
                 y,
                 size: TEXT_SIZE,
-                runs: vec![TextRun { text: content.into(), color: TEXT_COLOR }],
+                runs: vec![TextRun { text: content.into(), style: TextStyle::default() }],
             }),
         });
         page
     }
 
     fn glyphs_of(s: &str) -> Vec<Glyph> {
-        s.chars().map(|ch| Glyph { ch, color: TEXT_COLOR }).collect()
+        s.chars().map(|ch| Glyph { ch, style: TextStyle::default() }).collect()
     }
 
     fn empty_edit() -> TextEdit {
@@ -1386,12 +1536,12 @@ mod tests {
     fn text_edit_insert_delete_and_navigate() {
         let mut ed = empty_edit();
         for ch in "abc".chars() {
-            ed.insert(ch, TEXT_COLOR);
+            ed.insert(ch, TextStyle::default());
         }
         assert_eq!((text_of(&ed), ed.cursor), ("abc".to_string(), 3));
 
         ed.move_left(false);
-        ed.insert('X', TEXT_COLOR);
+        ed.insert('X', TextStyle::default());
         assert_eq!((text_of(&ed), ed.cursor), ("abXc".to_string(), 3));
 
         ed.backspace();
@@ -1426,16 +1576,45 @@ mod tests {
         assert_eq!(ed.selection(), Some((1, 3)));
 
         let red = Color { r: 1.0, g: 0.0, b: 0.0, a: 1.0 };
-        assert!(ed.color_selection(red));
-        assert_eq!(ed.glyphs[0].color, TEXT_COLOR);
-        assert_eq!(ed.glyphs[1].color, red);
-        assert_eq!(ed.glyphs[2].color, red);
-        assert_eq!(ed.glyphs[3].color, TEXT_COLOR);
+        assert!(ed.style_selection(|s| s.color = red));
+        assert_eq!(ed.glyphs[0].style.color, Color::BLACK);
+        assert_eq!(ed.glyphs[1].style.color, red);
+        assert_eq!(ed.glyphs[2].style.color, red);
+        assert_eq!(ed.glyphs[3].style.color, Color::BLACK);
 
-        // Runs merge same-color neighbors.
+        // Runs merge same-style neighbors.
         let runs = ed.to_runs();
         assert_eq!(runs.len(), 3);
         assert_eq!(runs[1].text, "bc");
+    }
+
+    #[test]
+    fn ctrl_word_navigation_jumps_by_word() {
+        let mut ed = empty_edit();
+        ed.glyphs = glyphs_of("foo bar baz");
+        ed.cursor = ed.glyphs.len();
+        ed.move_word_left(false);
+        assert_eq!(ed.cursor, 8); // start of "baz"
+        ed.move_word_left(false);
+        assert_eq!(ed.cursor, 4); // start of "bar"
+        ed.move_word_right(false);
+        assert_eq!(ed.cursor, 7); // end of "bar"
+    }
+
+    #[test]
+    fn marker_and_bold_apply_to_selection() {
+        let mut ed = empty_edit();
+        ed.glyphs = glyphs_of("abcd");
+        ed.anchor = Some(1);
+        ed.cursor = 3; // "bc" selected
+
+        let yellow = Color { r: 1.0, g: 0.9, b: 0.2, a: 0.4 };
+        assert!(ed.style_selection(|s| s.highlight = Some(yellow)));
+        assert!(ed.style_selection(|s| s.bold = true));
+        assert_eq!(ed.glyphs[0].style.highlight, None);
+        assert_eq!(ed.glyphs[1].style.highlight, Some(yellow));
+        assert!(ed.glyphs[2].style.bold);
+        assert!(!ed.glyphs[3].style.bold);
     }
 
     #[test]
@@ -1444,7 +1623,7 @@ mod tests {
         ed.glyphs = glyphs_of("abcd");
         ed.anchor = Some(1);
         ed.cursor = 3; // "bc" selected
-        ed.insert('X', TEXT_COLOR);
+        ed.insert('X', TextStyle::default());
         assert_eq!(text_of(&ed), "aXd");
         assert_eq!(ed.cursor, 2);
     }
@@ -1468,5 +1647,45 @@ mod tests {
         let (_, one) = measure_glyphs(TEXT_SIZE, &glyphs_of("single line"));
         let (_, three) = measure_glyphs(TEXT_SIZE, &glyphs_of("line\ntwo\nthree"));
         assert!(three > one);
+    }
+
+    #[test]
+    fn highlighted_text_renders_marker_pixels() {
+        let mut page = a4_page();
+        page.annotations.push(Annotation {
+            id: Uuid::new_v4(),
+            kind: AnnotationKind::Text(TextAnnotation {
+                x: 50.0,
+                y: 50.0,
+                size: 32.0,
+                runs: vec![TextRun {
+                    text: "Hi".into(),
+                    style: TextStyle {
+                        highlight: Some(Color { r: 1.0, g: 0.9, b: 0.2, a: 1.0 }),
+                        ..Default::default()
+                    },
+                }],
+            }),
+        });
+        let mut cache = HashMap::new();
+        let (pw, ph) = (A4.0.ceil() as i32, A4.1.ceil() as i32);
+        let mut surface = page_surface(None, &mut cache, 0, &page, 1.0, pw, ph).unwrap();
+        drop(cache);
+        surface.flush();
+
+        // ARgb32 is BGRA in memory; look for a pixel that is strongly yellow
+        // (high red + green, low blue) — the marker fill behind the glyphs.
+        let stride = surface.stride() as usize;
+        let data = surface.data().unwrap();
+        let mut found = false;
+        for row in data.chunks_exact(stride) {
+            for px in row.chunks_exact(4) {
+                let (b, g, r) = (px[0], px[1], px[2]);
+                if r > 200 && g > 180 && b < 120 {
+                    found = true;
+                }
+            }
+        }
+        assert!(found, "marker highlight should paint yellow pixels");
     }
 }

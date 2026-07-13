@@ -343,12 +343,12 @@ fn build_tool_strip(canvas: &Canvas, details: &gtk::Stack) -> gtk::Box {
     strip.add_css_class("inkpdf-panel");
 
     let tools: [(&str, &str, Tool, &str); 6] = [
-        ("inkpdf-pages-symbolic", "Pages", Tool::Pages, "pages"),
         ("inkpdf-pen-symbolic", "Pen", Tool::Pen, "pen"),
         ("inkpdf-shapes-symbolic", "Shapes", Tool::Shape, "shapes"),
         ("inkpdf-text-symbolic", "Text", Tool::Text, "text"),
         ("inkpdf-eraser-symbolic", "Eraser", Tool::Eraser, "eraser"),
         ("inkpdf-markdown-symbolic", "Markdown text", Tool::Markdown, "markdown"),
+        ("inkpdf-pages-symbolic", "Pages", Tool::Pages, "pages"),
     ];
 
     let buttons: Rc<Vec<gtk::ToggleButton>> = Rc::new(
@@ -441,12 +441,26 @@ fn flat_toggle(icon: &str, tip: &str) -> gtk::ToggleButton {
 }
 
 fn color_button() -> gtk::ColorDialogButton {
+    swatch_button(gdk::RGBA::new(0.0, 0.0, 0.0, 1.0)) // default black everywhere
+}
+
+/// A square color swatch button with the given initial color.
+fn swatch_button(initial: gdk::RGBA) -> gtk::ColorDialogButton {
     let button = gtk::ColorDialogButton::new(Some(gtk::ColorDialog::new()));
-    button.set_rgba(&gdk::RGBA::new(0.0, 0.0, 0.0, 1.0)); // default black everywhere
+    button.set_rgba(&initial);
     button.set_size_request(SWATCH, SWATCH);
     button.set_halign(gtk::Align::Center);
     button.set_valign(gtk::Align::Center);
     button
+}
+
+fn color_from_rgba(rgba: &gdk::RGBA) -> Color {
+    Color {
+        r: rgba.red() as f64,
+        g: rgba.green() as f64,
+        b: rgba.blue() as f64,
+        a: rgba.alpha() as f64,
+    }
 }
 
 fn hsep() -> gtk::Separator {
@@ -539,8 +553,8 @@ fn size_stepper(
 /// `build()`, once `WindowUi` exists).
 fn page_pages() -> (gtk::Box, gtk::Button, gtk::Button) {
     let page = detail_column();
-    let add = flat_icon_button("inkpdf-page-add-symbolic", "Insert page after current");
-    let remove = flat_icon_button("inkpdf-page-remove-symbolic", "Delete current page");
+    let add = flat_icon_button("inkpdf-page-add", "Insert page after current");
+    let remove = flat_icon_button("inkpdf-page-remove", "Delete current page");
     page.append(&add);
     page.append(&remove);
     (page, add, remove)
@@ -574,6 +588,27 @@ fn page_shapes() -> gtk::Box {
 
 fn page_text(canvas: &Canvas) -> gtk::Box {
     let page = detail_column();
+
+    // Font family: a compact icon button opening the system family picker. Only the
+    // family is applied (size/style come from our own controls). A FontDialogButton
+    // would show the full font name and blow up the panel width.
+    let font = flat_icon_button("font-x-generic-symbolic", "Schriftart");
+    {
+        let canvas = canvas.clone();
+        font.connect_clicked(move |btn| {
+            let dialog = gtk::FontDialog::new();
+            let parent = btn.root().and_downcast::<gtk::Window>();
+            let canvas = canvas.clone();
+            let initial: Option<&gtk::pango::FontFamily> = None;
+            dialog.choose_family(parent.as_ref(), initial, gio::Cancellable::NONE, move |res| {
+                if let Ok(family) = res {
+                    canvas.set_text_font(family.name().to_string());
+                }
+            });
+        });
+    }
+    page.append(&font);
+
     {
         let canvas = canvas.clone();
         page.append(&size_stepper(16.0, 8.0, 72.0, 1.0, 0, move |v| canvas.set_text_size(v)));
@@ -582,23 +617,44 @@ fn page_text(canvas: &Canvas) -> gtk::Box {
     let color = color_button();
     {
         let canvas = canvas.clone();
-        color.connect_rgba_notify(move |btn| {
-            let rgba = btn.rgba();
-            canvas.set_text_color(Color {
-                r: rgba.red() as f64,
-                g: rgba.green() as f64,
-                b: rgba.blue() as f64,
-                a: rgba.alpha() as f64,
-            });
-        });
+        color.connect_rgba_notify(move |btn| canvas.set_text_color(color_from_rgba(&btn.rgba())));
     }
     page.append(&color);
 
+    // Plain (momentary) buttons, not toggles: they act on the selection and must not
+    // stick in a blue :checked state.
     page.append(&hsep());
-    page.append(&flat_toggle("format-text-bold-symbolic", "Fett"));
-    page.append(&flat_toggle("format-text-italic-symbolic", "Kursiv"));
-    page.append(&flat_toggle("format-text-underline-symbolic", "Unterstrichen"));
-    page.append(&flat_toggle("format-text-strikethrough-symbolic", "Durchgestrichen"));
+    let styles: [(&str, &str, fn(&Canvas)); 4] = [
+        ("format-text-bold-symbolic", "Fett", Canvas::toggle_bold),
+        ("format-text-italic-symbolic", "Kursiv", Canvas::toggle_italic),
+        ("format-text-underline-symbolic", "Unterstrichen", Canvas::toggle_underline),
+        ("format-text-strikethrough-symbolic", "Durchgestrichen", Canvas::toggle_strikethrough),
+    ];
+    for (icon, tip, action) in styles {
+        let button = flat_icon_button(icon, tip);
+        let canvas = canvas.clone();
+        button.connect_clicked(move |_| action(&canvas));
+        page.append(&button);
+    }
+
+    // Marker (highlighter): the swatch picks the color, the apply button paints it
+    // onto the selection, the clear button removes it.
+    page.append(&hsep());
+    let marker = swatch_button(gdk::RGBA::new(1.0, 0.9, 0.2, 0.4));
+    page.append(&marker);
+    let apply = flat_icon_button("object-select-symbolic", "Markieren");
+    {
+        let canvas = canvas.clone();
+        let marker = marker.clone();
+        apply.connect_clicked(move |_| canvas.set_highlight(color_from_rgba(&marker.rgba())));
+    }
+    page.append(&apply);
+    let clear = flat_icon_button("edit-clear-symbolic", "Marker entfernen");
+    {
+        let canvas = canvas.clone();
+        clear.connect_clicked(move |_| canvas.clear_highlight());
+    }
+    page.append(&clear);
     page
 }
 
