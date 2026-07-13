@@ -25,6 +25,9 @@ pub struct WindowUi {
     /// The `.inkpdf` file the document saves to on plain "Save" (None until it has
     /// one: a fresh doc, or a PDF that has not yet been saved as `.inkpdf`).
     save_path: Rc<RefCell<Option<PathBuf>>>,
+    /// Snapshot of the document as it was last loaded/saved, to detect unsaved
+    /// changes (`is_dirty`) before an action that would discard them.
+    saved_snapshot: Rc<RefCell<Option<Document>>>,
 }
 
 impl WindowUi {
@@ -42,6 +45,7 @@ impl WindowUi {
 
         match opened {
             Ok(open) => {
+                *self.saved_snapshot.borrow_mut() = Some(open.model.clone());
                 self.canvas.set_open_document(open);
                 // Only an .inkpdf becomes the plain-save target; a PDF must be
                 // "saved as" a new .inkpdf first.
@@ -49,6 +53,15 @@ impl WindowUi {
                 self.show_title(Some(path));
             }
             Err(err) => show_error(&self.window, &format!("{err:#}")),
+        }
+    }
+
+    /// Whether the current document differs from the last loaded/saved snapshot.
+    fn is_dirty(&self) -> bool {
+        match (self.canvas.document(), self.saved_snapshot.borrow().as_ref()) {
+            (Some(current), Some(saved)) => current != *saved,
+            (Some(_), None) => true,
+            (None, _) => false,
         }
     }
 
@@ -69,17 +82,27 @@ impl WindowUi {
 
     /// Plain save: write to the known file if there is one, else fall back to "save as".
     fn save(&self) {
+        self.save_then(|_| {});
+    }
+
+    /// Like `save`, but calls `and_then` once the save has actually completed
+    /// (immediately for a known path, or after the async "save as" dialog).
+    fn save_then(&self, and_then: impl Fn(&WindowUi) + 'static) {
         let path = self.save_path.borrow().clone();
         match path {
             Some(path) => {
                 let Some(model) = self.canvas.document() else {
                     return;
                 };
-                if let Err(err) = storage::save(&model, &path) {
-                    show_error(&self.window, &format!("{err:#}"));
+                match storage::save(&model, &path) {
+                    Ok(()) => {
+                        *self.saved_snapshot.borrow_mut() = Some(model);
+                        and_then(self);
+                    }
+                    Err(err) => show_error(&self.window, &format!("{err:#}")),
                 }
             }
-            None => save_dialog(self),
+            None => save_dialog_then(self, and_then),
         }
     }
 
@@ -268,11 +291,13 @@ pub fn build(app: &adw::Application) -> WindowUi {
         canvas: canvas.clone(),
         title,
         save_path: Rc::new(RefCell::new(None)),
+        saved_snapshot: Rc::new(RefCell::new(None)),
     };
 
     // Start on a fresh blank A4 page.
     let mut blank = Document::new();
     blank.insert_blank_page(0, A4.0, A4.1, Color::WHITE);
+    *ui.saved_snapshot.borrow_mut() = Some(blank.clone());
     canvas.set_open_document(OpenDocument { model: blank, pdf: None });
     ui.show_title(None);
 
@@ -280,7 +305,7 @@ pub fn build(app: &adw::Application) -> WindowUi {
 
     {
         let ui = ui.clone();
-        open_button.connect_clicked(move |_| open_dialog(&ui));
+        open_button.connect_clicked(move |_| confirm_unsaved_then(&ui, open_dialog));
     }
     {
         let ui = ui.clone();
@@ -338,7 +363,7 @@ pub fn build(app: &adw::Application) -> WindowUi {
 /// Wires Ctrl+O / Ctrl+S / Ctrl+Shift+S to open, save, and save-as.
 fn register_shortcuts(app: &adw::Application, window: &adw::ApplicationWindow, ui: &WindowUi) {
     let actions: [(&str, &str, Box<dyn Fn(&WindowUi)>); 3] = [
-        ("open", "<Control>o", Box::new(open_dialog)),
+        ("open", "<Control>o", Box::new(|ui: &WindowUi| confirm_unsaved_then(ui, open_dialog))),
         ("save", "<Control>s", Box::new(|ui: &WindowUi| ui.save())),
         ("save-as", "<Control><Shift>s", Box::new(save_dialog)),
     ];
@@ -382,6 +407,11 @@ fn open_dialog(ui: &WindowUi) {
 }
 
 fn save_dialog(ui: &WindowUi) {
+    save_dialog_then(ui, |_| {});
+}
+
+/// Like `save_dialog`, but calls `and_then` once the file has actually been written.
+fn save_dialog_then(ui: &WindowUi, and_then: impl Fn(&WindowUi) + 'static) {
     let Some(model) = ui.canvas.document() else {
         return;
     };
@@ -416,10 +446,38 @@ fn save_dialog(ui: &WindowUi) {
         match storage::save(&model, &path) {
             Ok(()) => {
                 *ui.save_path.borrow_mut() = Some(path.clone());
+                *ui.saved_snapshot.borrow_mut() = Some(model.clone());
                 ui.show_title(Some(&path));
+                and_then(&ui);
             }
             Err(err) => show_error(&ui.window, &format!("{err:#}")),
         }
+    });
+}
+
+/// If the current document has unsaved changes, asks the user whether to save,
+/// discard, or cancel before proceeding; otherwise proceeds straight away.
+fn confirm_unsaved_then(ui: &WindowUi, and_then: impl Fn(&WindowUi) + 'static) {
+    if !ui.is_dirty() {
+        and_then(ui);
+        return;
+    }
+
+    let dialog = gtk::AlertDialog::builder()
+        .message("Ungespeicherte Änderungen")
+        .detail("Das aktuelle Dokument hat ungespeicherte Änderungen. Möchtest du sie speichern, bevor du fortfährst?")
+        .buttons(["Abbrechen", "Verwerfen", "Speichern"])
+        .cancel_button(0)
+        .default_button(2)
+        .modal(true)
+        .build();
+
+    let ui = ui.clone();
+    let parent = ui.window.clone();
+    dialog.choose(Some(&parent), gio::Cancellable::NONE, move |response| match response {
+        Ok(1) => and_then(&ui),
+        Ok(2) => ui.save_then(and_then),
+        _ => {}
     });
 }
 
