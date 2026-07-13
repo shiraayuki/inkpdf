@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use gtk::cairo;
 use gtk::gdk;
+use gtk::gio;
 use gtk::glib;
 use gtk::prelude::*;
 use ink_stroke_modeler_rs::{ModelerInput, ModelerInputEventType, ModelerParams, StrokeModeler};
@@ -1460,6 +1461,46 @@ impl Canvas {
     }
 
     /// Mutates the active edit (if any) and requests a redraw.
+    /// Puts the current selection's text (if any) on the system clipboard.
+    fn copy_selection_to_clipboard(&self) {
+        let text = self.state.borrow().editing.as_ref().and_then(|ed| {
+            ed.selection().map(|(s, e)| ed.glyphs[s..e].iter().map(|g| g.ch).collect::<String>())
+        });
+        if let Some(text) = text
+            && !text.is_empty()
+        {
+            self.area.clipboard().set_text(&text);
+        }
+    }
+
+    fn cut_selection_to_clipboard(&self) {
+        self.copy_selection_to_clipboard();
+        self.edit_mut(|ed| {
+            ed.delete_selection();
+        });
+    }
+
+    /// Inserts the clipboard's text at the cursor (replacing any selection),
+    /// preserving embedded newlines/tabs so multi-line pastes land as actual
+    /// line breaks rather than being silently stripped like other control
+    /// characters. Clipboard reads are async in GTK4, so this only queues the
+    /// insert - it lands once the read completes.
+    fn paste_from_clipboard(&self) {
+        let this = self.clone();
+        self.area.clipboard().read_text_async(gio::Cancellable::NONE, move |result| {
+            let Ok(Some(text)) = result else {
+                return;
+            };
+            let text = text.replace("\r\n", "\n").replace('\r', "\n");
+            let style = this.state.borrow().text_style.clone();
+            this.edit_mut(move |ed| {
+                for ch in text.chars().filter(|c| *c == '\n' || *c == '\t' || !c.is_control()) {
+                    ed.insert(ch, style.clone());
+                }
+            });
+        });
+    }
+
     fn edit_mut(&self, f: impl FnOnce(&mut TextEdit)) {
         if let Some(ed) = self.state.borrow_mut().editing.as_mut() {
             f(ed);
@@ -1542,6 +1583,9 @@ impl Canvas {
             gdk::Key::Home | gdk::Key::KP_Home => self.edit_mut(move |ed| ed.move_home(extend)),
             gdk::Key::End | gdk::Key::KP_End => self.edit_mut(move |ed| ed.move_end(extend)),
             gdk::Key::a | gdk::Key::A if ctrl => self.edit_mut(TextEdit::select_all),
+            gdk::Key::c | gdk::Key::C if ctrl => self.copy_selection_to_clipboard(),
+            gdk::Key::x | gdk::Key::X if ctrl => self.cut_selection_to_clipboard(),
+            gdk::Key::v | gdk::Key::V if ctrl => self.paste_from_clipboard(),
             _ => match keyval.to_unicode() {
                 Some(ch) if !ch.is_control() => {
                     let style = self.state.borrow().text_style.clone();
