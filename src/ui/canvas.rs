@@ -10,8 +10,8 @@ use uuid::Uuid;
 
 use crate::engine::OpenDocument;
 use crate::engine::document::{
-    A4, Annotation, AnnotationKind, Color, Document, Page, PageKind, TextAnnotation, TextRun,
-    TextStyle,
+    A4, Annotation, AnnotationKind, Color, Document, Page, PageKind, ShapeAnnotation, ShapeKind,
+    StrokeAnnotation, TextAnnotation, TextRun, TextStyle,
 };
 use crate::engine::pdf::PdfDocument;
 
@@ -249,6 +249,19 @@ struct DragState {
     orig_y: f64,
 }
 
+const PEN_WIDTH: f64 = 3.0;
+const SHAPE_WIDTH: f64 = 3.0;
+const ERASER_WIDTH: f64 = 10.0;
+
+/// An in-progress drawing/erasing gesture (page-local coordinates in points).
+enum Draw {
+    Stroke { page: usize, points: Vec<(f64, f64)>, color: Color, width: f64 },
+    Shape { page: usize, shape: ShapeKind, start: (f64, f64), end: (f64, f64), color: Color, width: f64 },
+    /// Erasing: `baseline` is the page snapshot before this drag, recorded on commit
+    /// if anything was actually removed.
+    Erase { baseline: Vec<Page>, changed: bool },
+}
+
 /// Max snapshots kept per direction (older ones are dropped).
 const HISTORY_LIMIT: usize = 100;
 
@@ -292,6 +305,7 @@ struct Overlay<'a> {
     editing: Option<&'a TextEdit>,
     dragging: Option<&'a DragState>,
     selected: Option<(usize, Uuid)>,
+    drawing: Option<&'a Draw>,
 }
 
 struct State {
@@ -321,6 +335,18 @@ struct State {
     /// Page snapshot taken when the current edit session began, so the whole
     /// session (typing + styling) collapses into one undo entry on commit.
     edit_baseline: Option<Vec<Page>>,
+    /// The active tool (drives drawing, erasing, and the cursor).
+    tool: Tool,
+    /// In-progress pen stroke / shape / erase gesture.
+    draw_op: Option<Draw>,
+    /// Widget-space start point of the active draw gesture (offsets are relative to it).
+    draw_origin: (f64, f64),
+    pen_color: Color,
+    pen_width: f64,
+    shape_kind: ShapeKind,
+    shape_color: Color,
+    shape_width: f64,
+    eraser_width: f64,
 }
 
 /// Where an insert/delete acts relative to the current page.
@@ -380,6 +406,15 @@ impl Canvas {
             text_style: TextStyle::default(),
             history: History::default(),
             edit_baseline: None,
+            tool: Tool::Select,
+            draw_op: None,
+            draw_origin: (0.0, 0.0),
+            pen_color: Color::BLACK,
+            pen_width: PEN_WIDTH,
+            shape_kind: ShapeKind::Rectangle,
+            shape_color: Color::BLACK,
+            shape_width: SHAPE_WIDTH,
+            eraser_width: ERASER_WIDTH,
         }));
 
         {
@@ -439,6 +474,7 @@ impl Canvas {
             st.selected = None;
             st.history = History::default();
             st.edit_baseline = None;
+            st.draw_op = None;
             st.doc = Some(open.model);
             st.pdf = open.pdf;
             st.zoom = 1.0;
@@ -514,9 +550,12 @@ impl Canvas {
         self.area.queue_draw();
     }
 
-    /// Selects the active tool. Only `Text` has behavior for now.
+    /// Selects the active tool.
     pub fn set_tool(&self, tool: Tool) {
+        // Leaving text editing commits it; other tools have no pending state here.
         self.set_text_mode(tool == Tool::Text);
+        self.state.borrow_mut().tool = tool;
+        self.update_cursor();
     }
 
     /// Sets the font size for new text boxes and the one currently being edited.
@@ -528,7 +567,33 @@ impl Canvas {
                 ed.size = size;
             }
         }
+        self.update_cursor();
         self.area.queue_draw();
+    }
+
+    pub fn set_pen_color(&self, color: Color) {
+        self.state.borrow_mut().pen_color = color;
+    }
+
+    pub fn set_pen_width(&self, width: f64) {
+        self.state.borrow_mut().pen_width = width;
+    }
+
+    pub fn set_shape_kind(&self, kind: ShapeKind) {
+        self.state.borrow_mut().shape_kind = kind;
+    }
+
+    pub fn set_shape_color(&self, color: Color) {
+        self.state.borrow_mut().shape_color = color;
+    }
+
+    pub fn set_shape_width(&self, width: f64) {
+        self.state.borrow_mut().shape_width = width;
+    }
+
+    pub fn set_eraser_width(&self, width: f64) {
+        self.state.borrow_mut().eraser_width = width;
+        self.update_cursor();
     }
 
     /// Sets the font color: becomes the color for newly typed characters and, while
@@ -702,6 +767,7 @@ impl Canvas {
             st.zoom = new;
             st.cache.clear();
         }
+        self.update_cursor();
         self.update_layout();
     }
 
@@ -768,6 +834,11 @@ impl Canvas {
 
     fn on_click(&self, n_press: i32, x: f64, y: f64) {
         self.area.grab_focus();
+
+        // Drawing/erasing tools act via the drag gesture, not clicks.
+        if matches!(self.state.borrow().tool, Tool::Pen | Tool::Shape | Tool::Eraser) {
+            return;
+        }
 
         // Clicking inside the box being edited just moves the caret.
         if let Some((page, lx, ly)) = self.page_hit(x, y)
@@ -847,10 +918,14 @@ impl Canvas {
             let mut st = self.state.borrow_mut();
             st.selected = None;
             let size = st.text_size;
+            // The I-beam cursor is centered on the click, so center the text line on
+            // it too (place the box top half a line up) — the text then sits inside
+            // the caret stroke instead of below it.
+            let y = (ly - text_line_height(size) / 2.0).max(0.0);
             st.editing = Some(TextEdit {
                 page,
                 x: lx,
-                y: ly,
+                y,
                 size,
                 glyphs: Vec::new(),
                 cursor: 0,
@@ -879,6 +954,14 @@ impl Canvas {
         };
         let (x, y, size, glyphs, id) = match &annotation.kind {
             AnnotationKind::Text(t) => (t.x, t.y, t.size, ann_glyphs(t), annotation.id),
+            // Only text is editable; restore anything else and bail.
+            _ => {
+                let mut st = self.state.borrow_mut();
+                if let Some(p) = st.doc.as_mut().and_then(|d| d.pages.get_mut(page)) {
+                    p.annotations.insert(index.min(p.annotations.len()), annotation);
+                }
+                return;
+            }
         };
         {
             let mut st = self.state.borrow_mut();
@@ -1028,6 +1111,13 @@ impl Canvas {
     fn on_drag_begin(&self, x: f64, y: f64) {
         self.state.borrow_mut().drag_start = None;
 
+        // Drawing/erasing tools start their gesture here.
+        let tool = self.state.borrow().tool;
+        if matches!(tool, Tool::Pen | Tool::Shape | Tool::Eraser) {
+            self.begin_draw(tool, x, y);
+            return;
+        }
+
         // A drag inside the box being edited selects text. This applies whenever
         // an edit is active, not just with the Text tool - editing can also start
         // from a Select-mode double-click, which never sets `text_mode`.
@@ -1075,8 +1165,9 @@ impl Canvas {
                     .as_ref()
                     .and_then(|d| d.pages.get(page))
                     .and_then(|p| p.annotations.get(index))
-                    .map(|a| match &a.kind {
-                        AnnotationKind::Text(t) => (t.x, t.y, a.id),
+                    .and_then(|a| match &a.kind {
+                        AnnotationKind::Text(t) => Some((t.x, t.y, a.id)),
+                        _ => None,
                     })
             };
             if let Some((ox, oy, id)) = info {
@@ -1090,6 +1181,12 @@ impl Canvas {
     }
 
     fn on_drag_update(&self, offset_x: f64, offset_y: f64) {
+        // Drawing/erasing: the gesture owns the pointer while draw_op is active.
+        if self.state.borrow().draw_op.is_some() {
+            self.update_draw(offset_x, offset_y);
+            return;
+        }
+
         // Text drag-select: extend the selection to the current point.
         let text_drag = self.state.borrow().text_drag;
         if let Some((sx, sy)) = text_drag {
@@ -1126,13 +1223,11 @@ impl Canvas {
                 .and_then(|d| d.pages.get(ds.page))
                 .map(|p| (p.width, p.height))
                 .unwrap_or(A4);
-            match &mut ds.annotation.kind {
-                AnnotationKind::Text(t) => {
-                    // Keep the whole box on the page so it can't slip behind it.
-                    let (bw, bh) = measure_glyphs(t.size, &ann_glyphs(t));
-                    t.x = (ds.orig_x + offset_x / zoom).clamp(0.0, (pw - bw).max(0.0));
-                    t.y = (ds.orig_y + offset_y / zoom).clamp(0.0, (ph - bh).max(0.0));
-                }
+            if let AnnotationKind::Text(t) = &mut ds.annotation.kind {
+                // Keep the whole box on the page so it can't slip behind it.
+                let (bw, bh) = measure_glyphs(t.size, &ann_glyphs(t));
+                t.x = (ds.orig_x + offset_x / zoom).clamp(0.0, (pw - bw).max(0.0));
+                t.y = (ds.orig_y + offset_y / zoom).clamp(0.0, (ph - bh).max(0.0));
             }
             drop(st);
             self.area.queue_draw();
@@ -1163,6 +1258,11 @@ impl Canvas {
     }
 
     fn on_drag_end(&self) {
+        if self.state.borrow().draw_op.is_some() {
+            self.finish_draw();
+            return;
+        }
+
         let (dragging, was_text_drag) = {
             let mut st = self.state.borrow_mut();
             st.drag_start = None;
@@ -1184,6 +1284,196 @@ impl Canvas {
             drop(st);
             self.area.queue_draw();
         }
+    }
+
+    /// Width/height in points of a page.
+    fn page_size(&self, page: usize) -> Option<(f64, f64)> {
+        let st = self.state.borrow();
+        st.doc.as_ref()?.pages.get(page).map(|p| (p.width, p.height))
+    }
+
+    /// Maps a widget-space point to page-local points for a specific page (unclamped).
+    fn page_local(&self, page: usize, wx: f64, wy: f64) -> Option<(f64, f64)> {
+        let st = self.state.borrow();
+        let doc = st.doc.as_ref()?;
+        let z = st.zoom;
+        let width = self.area.width() as f64;
+        let mut top = PAGE_GAP;
+        for (i, p) in doc.pages.iter().enumerate() {
+            if i == page {
+                let left = (width - p.width * z) / 2.0;
+                return Some(((wx - left) / z, (wy - top) / z));
+            }
+            top += p.height * z + PAGE_GAP;
+        }
+        None
+    }
+
+    /// Starts a pen/shape/erase gesture at the pressed point.
+    fn begin_draw(&self, tool: Tool, x: f64, y: f64) {
+        let Some((page, lx, ly)) = self.page_hit(x, y) else {
+            return;
+        };
+        {
+            let mut st = self.state.borrow_mut();
+            st.draw_origin = (x, y);
+            st.selected = None;
+            let op = match tool {
+                Tool::Pen => {
+                    Draw::Stroke { page, points: vec![(lx, ly)], color: st.pen_color, width: st.pen_width }
+                }
+                Tool::Shape => Draw::Shape {
+                    page,
+                    shape: st.shape_kind,
+                    start: (lx, ly),
+                    end: (lx, ly),
+                    color: st.shape_color,
+                    width: st.shape_width,
+                },
+                _ => Draw::Erase {
+                    baseline: st.doc.as_ref().map(|d| d.pages.clone()).unwrap_or_default(),
+                    changed: false,
+                },
+            };
+            st.draw_op = Some(op);
+        }
+        if tool == Tool::Eraser {
+            self.erase_at(page, lx, ly);
+        }
+        self.area.queue_draw();
+    }
+
+    /// Extends the active pen/shape/erase gesture to the current point.
+    fn update_draw(&self, offset_x: f64, offset_y: f64) {
+        let (wx, wy) = {
+            let st = self.state.borrow();
+            (st.draw_origin.0 + offset_x, st.draw_origin.1 + offset_y)
+        };
+        enum Act {
+            Stroke(usize),
+            Shape(usize),
+            Erase,
+        }
+        let act = match &self.state.borrow().draw_op {
+            Some(Draw::Stroke { page, .. }) => Act::Stroke(*page),
+            Some(Draw::Shape { page, .. }) => Act::Shape(*page),
+            Some(Draw::Erase { .. }) => Act::Erase,
+            None => return,
+        };
+        match act {
+            Act::Stroke(page) => {
+                if let Some((lx, ly)) = self.clamped_local(page, wx, wy)
+                    && let Some(Draw::Stroke { points, .. }) = self.state.borrow_mut().draw_op.as_mut()
+                {
+                    points.push((lx, ly));
+                }
+            }
+            Act::Shape(page) => {
+                if let Some((lx, ly)) = self.clamped_local(page, wx, wy)
+                    && let Some(Draw::Shape { end, .. }) = self.state.borrow_mut().draw_op.as_mut()
+                {
+                    *end = (lx, ly);
+                }
+            }
+            Act::Erase => {
+                if let Some((page, lx, ly)) = self.page_hit(wx, wy) {
+                    self.erase_at(page, lx, ly);
+                }
+            }
+        }
+        self.area.queue_draw();
+    }
+
+    /// Page-local point clamped to the page bounds (so drawing can't leave the page).
+    fn clamped_local(&self, page: usize, wx: f64, wy: f64) -> Option<(f64, f64)> {
+        let (lx, ly) = self.page_local(page, wx, wy)?;
+        let (pw, ph) = self.page_size(page)?;
+        Some((lx.clamp(0.0, pw), ly.clamp(0.0, ph)))
+    }
+
+    /// Removes strokes/shapes on `page` within the eraser radius of the point.
+    fn erase_at(&self, page: usize, lx: f64, ly: f64) {
+        let radius = self.state.borrow().eraser_width / 2.0;
+        let mut st = self.state.borrow_mut();
+        let State { doc, draw_op, cache, .. } = &mut *st;
+        let Some(p) = doc.as_mut().and_then(|d| d.pages.get_mut(page)) else {
+            return;
+        };
+        let before = p.annotations.len();
+        p.annotations.retain(|a| !eraser_hits(&a.kind, lx, ly, radius));
+        if p.annotations.len() != before {
+            cache.remove(&page);
+            if let Some(Draw::Erase { changed, .. }) = draw_op {
+                *changed = true;
+            }
+        }
+    }
+
+    /// Commits the active pen/shape/erase gesture into the model (one undo entry).
+    fn finish_draw(&self) {
+        let op = self.state.borrow_mut().draw_op.take();
+        self.state.borrow_mut().draw_origin = (0.0, 0.0);
+        let Some(op) = op else {
+            return;
+        };
+        match op {
+            Draw::Stroke { page, points, color, width } => {
+                if points.is_empty() {
+                    return;
+                }
+                self.record_change();
+                self.push_annotation(page, AnnotationKind::Stroke(StrokeAnnotation { points, color, width }));
+            }
+            Draw::Shape { page, shape, start, end, color, width } => {
+                // Ignore accidental zero-size shapes.
+                if (start.0 - end.0).abs() < 1.0 && (start.1 - end.1).abs() < 1.0 {
+                    return;
+                }
+                self.record_change();
+                self.push_annotation(
+                    page,
+                    AnnotationKind::Shape(ShapeAnnotation {
+                        shape,
+                        x0: start.0,
+                        y0: start.1,
+                        x1: end.0,
+                        y1: end.1,
+                        color,
+                        width,
+                    }),
+                );
+            }
+            Draw::Erase { baseline, changed } => {
+                if changed {
+                    self.state.borrow_mut().history.record(baseline);
+                }
+            }
+        }
+        self.area.queue_draw();
+    }
+
+    fn push_annotation(&self, page: usize, kind: AnnotationKind) {
+        let mut st = self.state.borrow_mut();
+        if let Some(p) = st.doc.as_mut().and_then(|d| d.pages.get_mut(page)) {
+            p.annotations.push(Annotation { id: Uuid::new_v4(), kind });
+        }
+        st.cache.remove(&page);
+    }
+
+    /// Sets the pointer cursor to match the active tool (sized to the tool where it
+    /// makes sense: text caret to font size, eraser ring to eraser size).
+    fn update_cursor(&self) {
+        let (tool, z, text_size, eraser_width) = {
+            let st = self.state.borrow();
+            (st.tool, st.zoom, st.text_size, st.eraser_width)
+        };
+        let cursor = match tool {
+            Tool::Text => text_cursor((text_line_height(text_size) * z).round() as i32),
+            Tool::Eraser => circle_cursor((eraser_width * z).round() as i32),
+            Tool::Pen | Tool::Shape => plus_cursor(),
+            Tool::Select | Tool::Markdown | Tool::Pages => None,
+        };
+        self.area.set_cursor(cursor.as_ref());
     }
 
     fn update_layout(&self) {
@@ -1228,14 +1518,13 @@ fn hit_test(pages: &[Page], zoom: f64, width: f64, x: f64, y: f64) -> Option<(us
 }
 
 /// Topmost text annotation whose box contains the page-local point (in points).
+/// Only text is box-selectable; strokes/shapes are edited only via the eraser.
 fn annotation_at(page: &Page, lx: f64, ly: f64) -> Option<usize> {
     for (i, annotation) in page.annotations.iter().enumerate().rev() {
-        match &annotation.kind {
-            AnnotationKind::Text(t) => {
-                let (w, h) = measure_glyphs(t.size, &ann_glyphs(t));
-                if lx >= t.x && lx <= t.x + w && ly >= t.y && ly <= t.y + h {
-                    return Some(i);
-                }
+        if let AnnotationKind::Text(t) = &annotation.kind {
+            let (w, h) = measure_glyphs(t.size, &ann_glyphs(t));
+            if lx >= t.x && lx <= t.x + w && ly >= t.y && ly <= t.y + h {
+                return Some(i);
             }
         }
     }
@@ -1306,6 +1595,11 @@ fn with_scratch<R>(f: impl FnOnce(&cairo::Context) -> R, fallback: R) -> R {
     f(&c)
 }
 
+/// Height of one text line (in points) for a given font size.
+fn text_line_height(size: f64) -> f64 {
+    with_scratch(|c| line_metrics(c, size).1, size.max(1.0))
+}
+
 /// Box (width, height) in points for a glyph run, honoring newlines.
 fn measure_glyphs(size: f64, glyphs: &[Glyph]) -> (f64, f64) {
     with_scratch(
@@ -1349,8 +1643,9 @@ fn draw(state: &Rc<RefCell<State>>, ctx: &cairo::Context, width: i32) {
     let _ = ctx.paint();
 
     let mut st = state.borrow_mut();
-    let State { doc, pdf, zoom, cache, text_mode, editing, current, dragging, selected, .. } =
-        &mut *st;
+    let State {
+        doc, pdf, zoom, cache, text_mode, editing, current, dragging, selected, draw_op, ..
+    } = &mut *st;
     let Some(doc) = doc.as_ref() else {
         return;
     };
@@ -1361,6 +1656,7 @@ fn draw(state: &Rc<RefCell<State>>, ctx: &cairo::Context, width: i32) {
         editing: editing.as_ref(),
         dragging: dragging.as_ref(),
         selected: *selected,
+        drawing: draw_op.as_ref(),
     };
 
     let (_x0, cy0, _x1, cy1) = ctx.clip_extents().unwrap_or((0.0, 0.0, f64::MAX, f64::MAX));
@@ -1438,9 +1734,7 @@ fn page_surface(
             }
         }
         for annotation in &page.annotations {
-            match &annotation.kind {
-                AnnotationKind::Text(t) => draw_glyphs(&c, t.x, t.y, t.size, &ann_glyphs(t)),
-            }
+            draw_annotation(&c, &annotation.kind);
         }
     }
 
@@ -1494,14 +1788,209 @@ fn draw_glyphs(c: &cairo::Context, x: f64, y: f64, size: f64, glyphs: &[Glyph]) 
     }
 }
 
+/// Dispatches an annotation to its renderer. Context in page-point space.
+fn draw_annotation(c: &cairo::Context, kind: &AnnotationKind) {
+    match kind {
+        AnnotationKind::Text(t) => draw_glyphs(c, t.x, t.y, t.size, &ann_glyphs(t)),
+        AnnotationKind::Stroke(s) => draw_stroke(c, &s.points, s.color, s.width),
+        AnnotationKind::Shape(s) => draw_shape(c, s),
+    }
+}
+
+/// Draws a freehand polyline with round caps/joins. A single point renders as a dot.
+fn draw_stroke(c: &cairo::Context, points: &[(f64, f64)], color: Color, width: f64) {
+    if points.is_empty() {
+        return;
+    }
+    c.set_source_rgba(color.r, color.g, color.b, color.a);
+    c.set_line_width(width.max(0.1));
+    c.set_line_cap(cairo::LineCap::Round);
+    c.set_line_join(cairo::LineJoin::Round);
+    if points.len() == 1 {
+        let (x, y) = points[0];
+        c.arc(x, y, (width / 2.0).max(0.1), 0.0, std::f64::consts::TAU);
+        let _ = c.fill();
+        return;
+    }
+    c.move_to(points[0].0, points[0].1);
+    for &(x, y) in &points[1..] {
+        c.line_to(x, y);
+    }
+    let _ = c.stroke();
+}
+
+/// Draws a rectangle, ellipse, or line outline.
+fn draw_shape(c: &cairo::Context, s: &ShapeAnnotation) {
+    c.set_source_rgba(s.color.r, s.color.g, s.color.b, s.color.a);
+    c.set_line_width(s.width.max(0.1));
+    c.set_line_cap(cairo::LineCap::Round);
+    c.set_line_join(cairo::LineJoin::Round);
+    let (x0, y0, x1, y1) = (s.x0, s.y0, s.x1, s.y1);
+    match s.shape {
+        ShapeKind::Rectangle => {
+            c.rectangle(x0.min(x1), y0.min(y1), (x1 - x0).abs(), (y1 - y0).abs());
+        }
+        ShapeKind::Ellipse => {
+            let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+            let (rx, ry) = ((x1 - x0).abs() / 2.0, (y1 - y0).abs() / 2.0);
+            if rx > 0.0 && ry > 0.0 {
+                let _ = c.save();
+                c.translate(cx, cy);
+                c.scale(rx, ry);
+                c.arc(0.0, 0.0, 1.0, 0.0, std::f64::consts::TAU);
+                let _ = c.restore();
+            }
+        }
+        ShapeKind::Line => {
+            c.move_to(x0, y0);
+            c.line_to(x1, y1);
+        }
+    }
+    let _ = c.stroke();
+}
+
+/// Whether the eraser (a disc of `radius` at px,py) touches this annotation's
+/// geometry. Text is ignored - it has its own selection/delete.
+fn eraser_hits(kind: &AnnotationKind, px: f64, py: f64, radius: f64) -> bool {
+    match kind {
+        AnnotationKind::Text(_) => false,
+        AnnotationKind::Stroke(s) => {
+            point_near_polyline(&s.points, false, px, py, radius + s.width / 2.0)
+        }
+        AnnotationKind::Shape(s) => {
+            let closed = !matches!(s.shape, ShapeKind::Line);
+            point_near_polyline(&shape_polyline(s), closed, px, py, radius + s.width / 2.0)
+        }
+    }
+}
+
+/// A shape's outline sampled as a polyline (for hit-testing).
+fn shape_polyline(s: &ShapeAnnotation) -> Vec<(f64, f64)> {
+    match s.shape {
+        ShapeKind::Rectangle => vec![(s.x0, s.y0), (s.x1, s.y0), (s.x1, s.y1), (s.x0, s.y1)],
+        ShapeKind::Line => vec![(s.x0, s.y0), (s.x1, s.y1)],
+        ShapeKind::Ellipse => {
+            let (cx, cy) = ((s.x0 + s.x1) / 2.0, (s.y0 + s.y1) / 2.0);
+            let (rx, ry) = ((s.x1 - s.x0).abs() / 2.0, (s.y1 - s.y0).abs() / 2.0);
+            (0..24)
+                .map(|i| {
+                    let a = i as f64 / 24.0 * std::f64::consts::TAU;
+                    (cx + rx * a.cos(), cy + ry * a.sin())
+                })
+                .collect()
+        }
+    }
+}
+
+/// Whether (px,py) is within `thr` of the polyline. `closed` adds the wrap segment.
+fn point_near_polyline(points: &[(f64, f64)], closed: bool, px: f64, py: f64, thr: f64) -> bool {
+    match points.len() {
+        0 => false,
+        1 => (points[0].0 - px).hypot(points[0].1 - py) <= thr,
+        _ => {
+            let n = points.len();
+            let last = if closed { n } else { n - 1 };
+            (0..last).any(|i| {
+                let a = points[i];
+                let b = points[(i + 1) % n];
+                dist_point_segment(px, py, a, b) <= thr
+            })
+        }
+    }
+}
+
+/// Distance from a point to a line segment a-b.
+fn dist_point_segment(px: f64, py: f64, a: (f64, f64), b: (f64, f64)) -> f64 {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let len_sq = dx * dx + dy * dy;
+    if len_sq <= f64::EPSILON {
+        return (px - a.0).hypot(py - a.1);
+    }
+    let t = (((px - a.0) * dx + (py - a.1) * dy) / len_sq).clamp(0.0, 1.0);
+    (px - (a.0 + t * dx)).hypot(py - (a.1 + t * dy))
+}
+
+/// Builds a cursor from a cairo-drawn ARGB surface. `hotspot` is in pixels.
+fn cursor_from_draw(
+    w: i32,
+    h: i32,
+    hotspot: (i32, i32),
+    draw: impl FnOnce(&cairo::Context),
+) -> Option<gdk::Cursor> {
+    let (w, h) = (w.clamp(1, 256), h.clamp(1, 256));
+    let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, w, h).ok()?;
+    {
+        let c = cairo::Context::new(&surface).ok()?;
+        draw(&c);
+    }
+    surface.flush();
+    let stride = surface.stride() as usize;
+    let data = surface.data().ok()?;
+    let bytes = glib::Bytes::from(&data[..]);
+    let texture =
+        gdk::MemoryTexture::new(w, h, gdk::MemoryFormat::B8g8r8a8Premultiplied, &bytes, stride);
+    Some(gdk::Cursor::from_texture(&texture, hotspot.0, hotspot.1, None))
+}
+
+/// Strokes the current path as a dark core with a light halo, so a cursor stays
+/// visible on both light and dark backgrounds.
+fn stroke_halo(c: &cairo::Context) {
+    c.set_line_cap(cairo::LineCap::Round);
+    c.set_source_rgba(1.0, 1.0, 1.0, 0.9);
+    c.set_line_width(3.0);
+    let _ = c.stroke_preserve();
+    c.set_source_rgba(0.0, 0.0, 0.0, 0.95);
+    c.set_line_width(1.3);
+    let _ = c.stroke();
+}
+
+/// Text caret cursor: a vertical I-beam whose height tracks the on-screen font size.
+fn text_cursor(height: i32) -> Option<gdk::Cursor> {
+    let h = height.clamp(8, 200);
+    let w = 9;
+    let cx = (w / 2) as f64;
+    cursor_from_draw(w, h, (w / 2, h / 2), move |c| {
+        let (top, bot) = (1.5, h as f64 - 1.5);
+        c.move_to(cx, top);
+        c.line_to(cx, bot);
+        c.move_to(cx - 3.0, top);
+        c.line_to(cx + 3.0, top);
+        c.move_to(cx - 3.0, bot);
+        c.line_to(cx + 3.0, bot);
+        stroke_halo(c);
+    })
+}
+
+/// Eraser cursor: a ring whose diameter tracks the on-screen eraser size.
+fn circle_cursor(diameter: i32) -> Option<gdk::Cursor> {
+    let d = diameter.clamp(6, 200);
+    let size = d + 4;
+    let center = size as f64 / 2.0;
+    cursor_from_draw(size, size, (size / 2, size / 2), move |c| {
+        c.arc(center, center, d as f64 / 2.0, 0.0, std::f64::consts::TAU);
+        stroke_halo(c);
+    })
+}
+
+/// Pen/shape cursor: a small, fixed-size "+".
+fn plus_cursor() -> Option<gdk::Cursor> {
+    let size = 17;
+    let m = size as f64 / 2.0;
+    cursor_from_draw(size, size, (size / 2, size / 2), move |c| {
+        c.move_to(2.0, m);
+        c.line_to(size as f64 - 2.0, m);
+        c.move_to(m, 2.0);
+        c.line_to(m, size as f64 - 2.0);
+        stroke_halo(c);
+    })
+}
+
 fn draw_overlay(c: &cairo::Context, page: &Page, index: usize, zoom: f64, overlay: &Overlay) {
     if overlay.text_mode {
         for annotation in &page.annotations {
-            match &annotation.kind {
-                AnnotationKind::Text(t) => {
-                    let (w, h) = measure_glyphs(t.size, &ann_glyphs(t));
-                    stroke_box(c, t.x, t.y, w, h, zoom, BOX_ANNOTATION);
-                }
+            if let AnnotationKind::Text(t) = &annotation.kind {
+                let (w, h) = measure_glyphs(t.size, &ann_glyphs(t));
+                stroke_box(c, t.x, t.y, w, h, zoom, BOX_ANNOTATION);
             }
         }
     }
@@ -1509,13 +1998,10 @@ fn draw_overlay(c: &cairo::Context, page: &Page, index: usize, zoom: f64, overla
     if let Some((sel_page, id)) = overlay.selected
         && sel_page == index
         && let Some(annotation) = page.annotations.iter().find(|a| a.id == id)
+        && let AnnotationKind::Text(t) = &annotation.kind
     {
-        match &annotation.kind {
-            AnnotationKind::Text(t) => {
-                let (w, h) = measure_glyphs(t.size, &ann_glyphs(t));
-                stroke_selection_handles(c, t.x, t.y, w, h, zoom);
-            }
-        }
+        let (w, h) = measure_glyphs(t.size, &ann_glyphs(t));
+        stroke_selection_handles(c, t.x, t.y, w, h, zoom);
     }
 
     if let Some(ed) = overlay.editing
@@ -1548,13 +2034,34 @@ fn draw_overlay(c: &cairo::Context, page: &Page, index: usize, zoom: f64, overla
 
     if let Some(ds) = overlay.dragging
         && ds.page == index
+        && let AnnotationKind::Text(t) = &ds.annotation.kind
     {
-        match &ds.annotation.kind {
-            AnnotationKind::Text(t) => {
-                draw_glyphs(c, t.x, t.y, t.size, &ann_glyphs(t));
-                let (w, h) = measure_glyphs(t.size, &ann_glyphs(t));
-                stroke_box(c, t.x, t.y, w, h, zoom, BOX_ACTIVE);
+        draw_glyphs(c, t.x, t.y, t.size, &ann_glyphs(t));
+        let (w, h) = measure_glyphs(t.size, &ann_glyphs(t));
+        stroke_box(c, t.x, t.y, w, h, zoom, BOX_ACTIVE);
+    }
+
+    // Live preview of the in-progress pen stroke or shape.
+    if let Some(draw) = overlay.drawing {
+        match draw {
+            Draw::Stroke { page, points, color, width } if *page == index => {
+                draw_stroke(c, points, *color, *width);
             }
+            Draw::Shape { page, shape, start, end, color, width } if *page == index => {
+                draw_shape(
+                    c,
+                    &ShapeAnnotation {
+                        shape: *shape,
+                        x0: start.0,
+                        y0: start.1,
+                        x1: end.0,
+                        y1: end.1,
+                        color: *color,
+                        width: *width,
+                    },
+                );
+            }
+            _ => {}
         }
     }
 }
@@ -1859,5 +2366,66 @@ mod tests {
             }
         }
         assert!(found, "marker highlight should paint yellow pixels");
+    }
+
+    #[test]
+    fn dist_point_segment_cases() {
+        let (a, b) = ((0.0, 0.0), (2.0, 0.0));
+        assert!(dist_point_segment(1.0, 0.0, a, b) < 1e-9); // on segment
+        assert!((dist_point_segment(1.0, 3.0, a, b) - 3.0).abs() < 1e-9); // perpendicular
+        assert!((dist_point_segment(5.0, 0.0, a, b) - 3.0).abs() < 1e-9); // past end -> endpoint
+    }
+
+    #[test]
+    fn eraser_hits_strokes_and_shapes_not_text() {
+        let stroke = AnnotationKind::Stroke(StrokeAnnotation {
+            points: vec![(0.0, 0.0), (10.0, 0.0)],
+            color: Color::BLACK,
+            width: 2.0,
+        });
+        assert!(eraser_hits(&stroke, 5.0, 1.0, 1.0), "within radius+halfwidth");
+        assert!(!eraser_hits(&stroke, 5.0, 10.0, 1.0), "too far");
+
+        let rect = AnnotationKind::Shape(ShapeAnnotation {
+            shape: ShapeKind::Rectangle,
+            x0: 0.0,
+            y0: 0.0,
+            x1: 10.0,
+            y1: 10.0,
+            color: Color::BLACK,
+            width: 1.0,
+        });
+        assert!(eraser_hits(&rect, 0.0, 5.0, 1.0), "on the left edge");
+        assert!(!eraser_hits(&rect, 5.0, 5.0, 1.0), "interior, not on the outline");
+
+        let text = AnnotationKind::Text(TextAnnotation {
+            x: 0.0,
+            y: 0.0,
+            size: 16.0,
+            runs: vec![],
+        });
+        assert!(!eraser_hits(&text, 0.0, 0.0, 100.0), "eraser never removes text");
+    }
+
+    #[test]
+    fn stroke_renders_dark_pixels() {
+        let mut page = a4_page();
+        page.annotations.push(Annotation {
+            id: Uuid::new_v4(),
+            kind: AnnotationKind::Stroke(StrokeAnnotation {
+                points: vec![(10.0, 10.0), (200.0, 200.0)],
+                color: Color::BLACK,
+                width: 4.0,
+            }),
+        });
+        let mut cache = HashMap::new();
+        let (pw, ph) = (A4.0.ceil() as i32, A4.1.ceil() as i32);
+        let mut surface = page_surface(None, &mut cache, 0, &page, 1.0, pw, ph).unwrap();
+        drop(cache);
+        surface.flush();
+
+        let data = surface.data().unwrap();
+        let dark = data.iter().filter(|&&b| b < 0x40).count();
+        assert!(dark > 0, "the stroke should paint dark pixels");
     }
 }

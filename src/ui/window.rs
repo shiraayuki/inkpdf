@@ -6,7 +6,7 @@ use adw::prelude::*;
 use gtk::{gdk, gio};
 
 use crate::engine::OpenDocument;
-use crate::engine::document::{Color, FILE_EXTENSION};
+use crate::engine::document::{Color, FILE_EXTENSION, ShapeKind};
 use crate::engine::storage;
 use crate::ui::canvas::{Canvas, Relative, Tool};
 
@@ -418,10 +418,10 @@ fn build_details_panel(canvas: &Canvas) -> (gtk::Stack, gtk::Button, gtk::Button
     stack.set_vhomogeneous(false);
     let (pages_page, add_page_button, remove_page_button) = page_pages();
     stack.add_named(&pages_page, Some("pages"));
-    stack.add_named(&page_pen(), Some("pen"));
-    stack.add_named(&page_shapes(), Some("shapes"));
+    stack.add_named(&page_pen(canvas), Some("pen"));
+    stack.add_named(&page_shapes(canvas), Some("shapes"));
     stack.add_named(&page_text(canvas), Some("text"));
-    stack.add_named(&page_eraser(), Some("eraser"));
+    stack.add_named(&page_eraser(canvas), Some("eraser"));
     stack.add_named(&page_markdown(), Some("markdown"));
     stack.set_visible_child_name("pen");
     (stack, add_page_button, remove_page_button)
@@ -565,29 +565,61 @@ fn page_pages() -> (gtk::Box, gtk::Button, gtk::Button) {
     (page, add, remove)
 }
 
-fn page_pen() -> gtk::Box {
+fn page_pen(canvas: &Canvas) -> gtk::Box {
     let page = detail_column();
-    page.append(&color_button());
-    page.append(&size_stepper(3.0, 0.5, 20.0, 0.5, 1, |_| {}));
+
+    let color = color_button();
+    {
+        let canvas = canvas.clone();
+        color.connect_rgba_notify(move |btn| canvas.set_pen_color(color_from_rgba(&btn.rgba())));
+    }
+    page.append(&color);
+
+    {
+        let canvas = canvas.clone();
+        page.append(&size_stepper(3.0, 0.5, 20.0, 0.5, 1, move |v| canvas.set_pen_width(v)));
+    }
     page
 }
 
-fn page_shapes() -> gtk::Box {
+fn page_shapes(canvas: &Canvas) -> gtk::Box {
     let page = detail_column();
 
-    let rect = flat_toggle("inkpdf-rect-symbolic", "Rechteck");
-    let ellipse = flat_toggle("inkpdf-ellipse-symbolic", "Ellipse");
-    let line = flat_toggle("inkpdf-line-symbolic", "Linie");
-    ellipse.set_group(Some(&rect));
-    line.set_group(Some(&rect));
-    rect.set_active(true);
-    page.append(&rect);
-    page.append(&ellipse);
-    page.append(&line);
+    let shapes: [(&str, &str, ShapeKind); 3] = [
+        ("inkpdf-rect-symbolic", "Rechteck", ShapeKind::Rectangle),
+        ("inkpdf-ellipse-symbolic", "Ellipse", ShapeKind::Ellipse),
+        ("inkpdf-line-symbolic", "Linie", ShapeKind::Line),
+    ];
+    let mut group: Option<gtk::ToggleButton> = None;
+    for (icon, tip, kind) in shapes {
+        let toggle = flat_toggle(icon, tip);
+        if let Some(first) = &group {
+            toggle.set_group(Some(first));
+        } else {
+            toggle.set_active(true);
+            group = Some(toggle.clone());
+        }
+        let canvas = canvas.clone();
+        toggle.connect_toggled(move |btn| {
+            if btn.is_active() {
+                canvas.set_shape_kind(kind);
+            }
+        });
+        page.append(&toggle);
+    }
 
     page.append(&hsep());
-    page.append(&color_button());
-    page.append(&size_stepper(3.0, 1.0, 20.0, 1.0, 0, |_| {}));
+    let color = color_button();
+    {
+        let canvas = canvas.clone();
+        color.connect_rgba_notify(move |btn| canvas.set_shape_color(color_from_rgba(&btn.rgba())));
+    }
+    page.append(&color);
+
+    {
+        let canvas = canvas.clone();
+        page.append(&size_stepper(3.0, 1.0, 20.0, 1.0, 0, move |v| canvas.set_shape_width(v)));
+    }
     page
 }
 
@@ -663,9 +695,10 @@ fn page_text(canvas: &Canvas) -> gtk::Box {
     page
 }
 
-fn page_eraser() -> gtk::Box {
+fn page_eraser(canvas: &Canvas) -> gtk::Box {
     let page = detail_column();
-    page.append(&size_stepper(10.0, 1.0, 40.0, 0.5, 1, |_| {}));
+    let canvas = canvas.clone();
+    page.append(&size_stepper(10.0, 1.0, 40.0, 0.5, 1, move |v| canvas.set_eraser_width(v)));
     page
 }
 

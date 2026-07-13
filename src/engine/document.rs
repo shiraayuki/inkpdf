@@ -98,9 +98,38 @@ impl TextAnnotation {
     }
 }
 
+/// A freehand pen stroke: a polyline in page points.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct StrokeAnnotation {
+    pub points: Vec<(f64, f64)>,
+    pub color: Color,
+    pub width: f64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+pub enum ShapeKind {
+    Rectangle,
+    Ellipse,
+    Line,
+}
+
+/// A shape defined by two corner points (page points).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ShapeAnnotation {
+    pub shape: ShapeKind,
+    pub x0: f64,
+    pub y0: f64,
+    pub x1: f64,
+    pub y1: f64,
+    pub color: Color,
+    pub width: f64,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum AnnotationKind {
     Text(TextAnnotation),
+    Stroke(StrokeAnnotation),
+    Shape(ShapeAnnotation),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
