@@ -492,6 +492,12 @@ impl Canvas {
     }
 
     pub fn set_open_document(&self, open: OpenDocument) {
+        self.set_open_document_with_zoom(open, 1.0);
+    }
+
+    /// Like `set_open_document`, but restores a specific zoom instead of resetting
+    /// to 1.0 (used when switching back to a tab that had its own zoom level).
+    pub fn set_open_document_with_zoom(&self, open: OpenDocument, zoom: f64) {
         {
             let mut st = self.state.borrow_mut();
             st.editing = None;
@@ -504,7 +510,7 @@ impl Canvas {
             st.draw_op = None;
             st.doc = Some(open.model);
             st.pdf = open.pdf;
-            st.zoom = 1.0;
+            st.zoom = zoom;
             st.cache.clear();
         }
         self.update_layout();
@@ -514,6 +520,17 @@ impl Canvas {
     pub fn document(&self) -> Option<Document> {
         self.commit_editing();
         self.state.borrow().doc.clone()
+    }
+
+    /// Takes the document + pdf handle out of the canvas (e.g. when switching away
+    /// from a tab), leaving the canvas without an open document. Unlike
+    /// `document()`, this does not clone: the pdf handle isn't `Clone`.
+    pub fn take_open_document(&self) -> Option<OpenDocument> {
+        self.commit_editing();
+        let mut st = self.state.borrow_mut();
+        let model = st.doc.take()?;
+        let pdf = st.pdf.take();
+        Some(OpenDocument { model, pdf })
     }
 
     /// Pushes the current page state onto the undo stack before a mutation.

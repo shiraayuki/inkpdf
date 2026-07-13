@@ -7,6 +7,7 @@ use gtk::{gdk, gio};
 
 use crate::engine::OpenDocument;
 use crate::engine::document::{A4, Color, Document, FILE_EXTENSION, ShapeKind};
+use crate::engine::pdf::PdfDocument;
 use crate::engine::storage;
 use crate::ui::canvas::{Canvas, Relative, Tool};
 
@@ -17,21 +18,48 @@ const SWATCH: i32 = 30;
 /// Points added/removed per click on the page width/height steppers.
 const PAGE_SIZE_STEP: f64 = 10.0;
 
+/// One open document. Only the active tab's document/pdf actually live in the
+/// `Canvas` at any time; `switch_to_tab` moves them in and out of here.
+struct Tab {
+    model: Document,
+    pdf: Option<PdfDocument>,
+    /// The `.inkpdf` file this tab saves to on plain "Save" (None until it has
+    /// one: a fresh doc, or a PDF that has not yet been saved as `.inkpdf`).
+    save_path: Option<PathBuf>,
+    /// Snapshot of the document as it was last loaded/saved, to detect unsaved
+    /// changes before an action that would discard them.
+    saved_snapshot: Option<Document>,
+    zoom: f64,
+    label: String,
+}
+
+impl Tab {
+    fn blank() -> Self {
+        let mut model = Document::new();
+        model.insert_blank_page(0, A4.0, A4.1, Color::WHITE);
+        Tab {
+            saved_snapshot: Some(model.clone()),
+            model,
+            pdf: None,
+            save_path: None,
+            zoom: 1.0,
+            label: "Unbenannt".to_string(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct WindowUi {
     window: adw::ApplicationWindow,
     canvas: Canvas,
     title: adw::WindowTitle,
-    /// The `.inkpdf` file the document saves to on plain "Save" (None until it has
-    /// one: a fresh doc, or a PDF that has not yet been saved as `.inkpdf`).
-    save_path: Rc<RefCell<Option<PathBuf>>>,
-    /// Snapshot of the document as it was last loaded/saved, to detect unsaved
-    /// changes (`is_dirty`) before an action that would discard them.
-    saved_snapshot: Rc<RefCell<Option<Document>>>,
+    tab_bar: gtk::Box,
+    tabs: Rc<RefCell<Vec<Tab>>>,
+    active_tab: Rc<Cell<usize>>,
 }
 
 impl WindowUi {
-    /// Loads a `.pdf` or `.inkpdf` file, dispatched by extension.
+    /// Loads a `.pdf` or `.inkpdf` file into the active tab, dispatched by extension.
     pub fn load_path(&self, path: &Path) {
         let is_inkpdf = path
             .extension()
@@ -45,39 +73,49 @@ impl WindowUi {
 
         match opened {
             Ok(open) => {
-                *self.saved_snapshot.borrow_mut() = Some(open.model.clone());
+                let save_path = is_inkpdf.then(|| path.to_path_buf());
+                self.with_active_tab(|t| {
+                    t.saved_snapshot = Some(open.model.clone());
+                    t.save_path = save_path;
+                });
                 self.canvas.set_open_document(open);
-                // Only an .inkpdf becomes the plain-save target; a PDF must be
-                // "saved as" a new .inkpdf first.
-                *self.save_path.borrow_mut() = is_inkpdf.then(|| path.to_path_buf());
                 self.show_title(Some(path));
             }
             Err(err) => show_error(&self.window, &format!("{err:#}")),
         }
     }
 
-    /// Whether the current document differs from the last loaded/saved snapshot.
+    fn with_active_tab<R>(&self, f: impl FnOnce(&mut Tab) -> R) -> R {
+        let mut tabs = self.tabs.borrow_mut();
+        f(&mut tabs[self.active_tab.get()])
+    }
+
+    fn save_path(&self) -> Option<PathBuf> {
+        self.tabs.borrow()[self.active_tab.get()].save_path.clone()
+    }
+
+    /// Whether the active tab's document differs from its last loaded/saved snapshot.
     fn is_dirty(&self) -> bool {
-        match (self.canvas.document(), self.saved_snapshot.borrow().as_ref()) {
-            (Some(current), Some(saved)) => current != *saved,
+        let saved = self.tabs.borrow()[self.active_tab.get()].saved_snapshot.clone();
+        match (self.canvas.document(), saved) {
+            (Some(current), Some(saved)) => current != saved,
             (Some(_), None) => true,
             (None, _) => false,
         }
     }
 
     /// Sets the header title to the file name and the subtitle to its full path
-    /// (or "Unbenannt" for a document with no file yet).
+    /// (or "Unbenannt" for a document with no file yet); keeps the active tab's
+    /// label and the tab bar in sync.
     fn show_title(&self, path: Option<&Path>) {
-        match path {
-            Some(p) => {
-                self.title.set_title(&file_label(p));
-                self.title.set_subtitle(&p.display().to_string());
-            }
-            None => {
-                self.title.set_title("Unbenannt");
-                self.title.set_subtitle("");
-            }
-        }
+        let label = match path {
+            Some(p) => file_label(p),
+            None => "Unbenannt".to_string(),
+        };
+        self.title.set_title(&label);
+        self.title.set_subtitle(path.map(|p| p.display().to_string()).unwrap_or_default().as_str());
+        self.with_active_tab(|t| t.label = label);
+        self.rebuild_tab_bar();
     }
 
     /// Plain save: write to the known file if there is one, else fall back to "save as".
@@ -88,7 +126,7 @@ impl WindowUi {
     /// Like `save`, but calls `and_then` once the save has actually completed
     /// (immediately for a known path, or after the async "save as" dialog).
     fn save_then(&self, and_then: impl Fn(&WindowUi) + 'static) {
-        let path = self.save_path.borrow().clone();
+        let path = self.save_path();
         match path {
             Some(path) => {
                 let Some(model) = self.canvas.document() else {
@@ -96,7 +134,7 @@ impl WindowUi {
                 };
                 match storage::save(&model, &path) {
                     Ok(()) => {
-                        *self.saved_snapshot.borrow_mut() = Some(model);
+                        self.with_active_tab(|t| t.saved_snapshot = Some(model));
                         and_then(self);
                     }
                     Err(err) => show_error(&self.window, &format!("{err:#}")),
@@ -108,6 +146,141 @@ impl WindowUi {
 
     fn insert_page(&self, rel: Relative) {
         self.canvas.insert_blank_page(rel);
+    }
+
+    /// Creates a fresh blank tab, stashes the previously active tab's live canvas
+    /// state, and makes the new tab active.
+    fn new_tab(&self) {
+        let idx = {
+            let mut tabs = self.tabs.borrow_mut();
+            tabs.push(Tab::blank());
+            tabs.len() - 1
+        };
+        self.switch_to_tab(idx);
+    }
+
+    /// Switches the canvas to a different tab, stashing the current tab's live
+    /// state (document, pdf handle, zoom) back into its slot first.
+    fn switch_to_tab(&self, new_idx: usize) {
+        let old_idx = self.active_tab.get();
+        if new_idx == old_idx {
+            return;
+        }
+
+        if let Some(open) = self.canvas.take_open_document() {
+            let zoom = self.canvas.zoom();
+            let mut tabs = self.tabs.borrow_mut();
+            tabs[old_idx].model = open.model;
+            tabs[old_idx].pdf = open.pdf;
+            tabs[old_idx].zoom = zoom;
+        }
+
+        let (model, pdf, zoom, path) = {
+            let mut tabs = self.tabs.borrow_mut();
+            let tab = &mut tabs[new_idx];
+            (tab.model.clone(), tab.pdf.take(), tab.zoom, tab.save_path.clone())
+        };
+        self.active_tab.set(new_idx);
+        self.canvas.set_open_document_with_zoom(OpenDocument { model, pdf }, zoom);
+        self.show_title(path.as_deref());
+    }
+
+    /// Closes a tab, asking for confirmation first if it has unsaved changes.
+    /// No-op if it's the only remaining tab.
+    fn close_tab(&self, idx: usize) {
+        if self.tabs.borrow().len() <= 1 {
+            return;
+        }
+
+        let dirty = if idx == self.active_tab.get() {
+            self.is_dirty()
+        } else {
+            let tabs = self.tabs.borrow();
+            match &tabs[idx].saved_snapshot {
+                Some(saved) => tabs[idx].model != *saved,
+                None => true,
+            }
+        };
+
+        if !dirty {
+            self.close_tab_now(idx);
+            return;
+        }
+
+        let dialog = gtk::AlertDialog::builder()
+            .message("Ungespeicherte Änderungen")
+            .detail("Dieser Tab hat ungespeicherte Änderungen. Trotzdem schließen?")
+            .buttons(["Abbrechen", "Schließen"])
+            .cancel_button(0)
+            .default_button(0)
+            .modal(true)
+            .build();
+        let ui = self.clone();
+        dialog.choose(Some(&self.window), gio::Cancellable::NONE, move |response| {
+            if let Ok(1) = response {
+                ui.close_tab_now(idx);
+            }
+        });
+    }
+
+    fn close_tab_now(&self, idx: usize) {
+        let active = self.active_tab.get();
+        self.tabs.borrow_mut().remove(idx);
+        let count = self.tabs.borrow().len();
+
+        if active == idx {
+            let new_active = idx.min(count - 1);
+            self.active_tab.set(new_active);
+            let (model, pdf, zoom, path) = {
+                let mut tabs = self.tabs.borrow_mut();
+                let tab = &mut tabs[new_active];
+                (tab.model.clone(), tab.pdf.take(), tab.zoom, tab.save_path.clone())
+            };
+            self.canvas.set_open_document_with_zoom(OpenDocument { model, pdf }, zoom);
+            self.show_title(path.as_deref());
+        } else {
+            if active > idx {
+                self.active_tab.set(active - 1);
+            }
+            self.rebuild_tab_bar();
+        }
+    }
+
+    /// Rebuilds the tab strip under the header from the current tab list.
+    fn rebuild_tab_bar(&self) {
+        while let Some(child) = self.tab_bar.first_child() {
+            self.tab_bar.remove(&child);
+        }
+        let tabs = self.tabs.borrow();
+        let active = self.active_tab.get();
+        let show_close = tabs.len() > 1;
+
+        for (i, tab) in tabs.iter().enumerate() {
+            let chip = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            chip.add_css_class("inkpdf-tab");
+
+            let label = gtk::Button::builder().label(tab.label.as_str()).css_classes(["flat"]).build();
+            label.add_css_class("inkpdf-tab-label");
+            if i == active {
+                label.add_css_class("active");
+            }
+            {
+                let ui = self.clone();
+                label.connect_clicked(move |_| ui.switch_to_tab(i));
+            }
+            chip.append(&label);
+
+            if show_close {
+                let close = flat_icon_button("window-close-symbolic", "Tab schließen");
+                {
+                    let ui = self.clone();
+                    close.connect_clicked(move |_| ui.close_tab(i));
+                }
+                chip.append(&close);
+            }
+
+            self.tab_bar.append(&chip);
+        }
     }
 }
 
@@ -275,8 +448,12 @@ pub fn build(app: &adw::Application) -> WindowUi {
     // Keep the group alive for the app's lifetime (widgets don't own it).
     std::mem::forget(panel_group);
 
+    let tab_bar = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    tab_bar.add_css_class("inkpdf-tab-bar");
+
     let content = adw::ToolbarView::new();
     content.add_top_bar(&header);
+    content.add_top_bar(&tab_bar);
     content.set_content(Some(&overlay));
 
     let window = adw::ApplicationWindow::builder()
@@ -290,22 +467,25 @@ pub fn build(app: &adw::Application) -> WindowUi {
         window: window.clone(),
         canvas: canvas.clone(),
         title,
-        save_path: Rc::new(RefCell::new(None)),
-        saved_snapshot: Rc::new(RefCell::new(None)),
+        tab_bar,
+        tabs: Rc::new(RefCell::new(vec![Tab::blank()])),
+        active_tab: Rc::new(Cell::new(0)),
     };
 
-    // Start on a fresh blank A4 page.
-    let mut blank = Document::new();
-    blank.insert_blank_page(0, A4.0, A4.1, Color::WHITE);
-    *ui.saved_snapshot.borrow_mut() = Some(blank.clone());
-    canvas.set_open_document(OpenDocument { model: blank, pdf: None });
+    // Start on the first (blank) tab.
+    let (model, pdf, zoom) = {
+        let mut tabs = ui.tabs.borrow_mut();
+        let tab = &mut tabs[0];
+        (tab.model.clone(), tab.pdf.take(), tab.zoom)
+    };
+    canvas.set_open_document_with_zoom(OpenDocument { model, pdf }, zoom);
     ui.show_title(None);
 
     register_shortcuts(app, &window, &ui);
 
     {
         let ui = ui.clone();
-        open_button.connect_clicked(move |_| confirm_unsaved_then(&ui, open_dialog));
+        open_button.connect_clicked(move |_| open_entry(&ui));
     }
     {
         let ui = ui.clone();
@@ -363,7 +543,7 @@ pub fn build(app: &adw::Application) -> WindowUi {
 /// Wires Ctrl+O / Ctrl+S / Ctrl+Shift+S to open, save, and save-as.
 fn register_shortcuts(app: &adw::Application, window: &adw::ApplicationWindow, ui: &WindowUi) {
     let actions: [(&str, &str, Box<dyn Fn(&WindowUi)>); 3] = [
-        ("open", "<Control>o", Box::new(|ui: &WindowUi| confirm_unsaved_then(ui, open_dialog))),
+        ("open", "<Control>o", Box::new(open_entry)),
         ("save", "<Control>s", Box::new(|ui: &WindowUi| ui.save())),
         ("save-as", "<Control><Shift>s", Box::new(save_dialog)),
     ];
@@ -374,6 +554,30 @@ fn register_shortcuts(app: &adw::Application, window: &adw::ApplicationWindow, u
         window.add_action(&action);
         app.set_accels_for_action(&format!("win.{name}"), &[accel]);
     }
+}
+
+/// Entry point for "Open": asks whether to replace the active tab's document or
+/// open the new file in a fresh tab, then proceeds accordingly.
+fn open_entry(ui: &WindowUi) {
+    let dialog = gtk::AlertDialog::builder()
+        .message("Neues Dokument öffnen")
+        .detail("Soll das aktuelle Dokument ersetzt oder in einem neuen Tab geöffnet werden?")
+        .buttons(["Abbrechen", "Neuer Tab", "Ersetzen"])
+        .cancel_button(0)
+        .default_button(2)
+        .modal(true)
+        .build();
+
+    let ui = ui.clone();
+    let parent = ui.window.clone();
+    dialog.choose(Some(&parent), gio::Cancellable::NONE, move |response| match response {
+        Ok(1) => {
+            ui.new_tab();
+            open_dialog(&ui);
+        }
+        Ok(2) => confirm_unsaved_then(&ui, open_dialog),
+        _ => {}
+    });
 }
 
 fn open_dialog(ui: &WindowUi) {
@@ -445,8 +649,10 @@ fn save_dialog_then(ui: &WindowUi, and_then: impl Fn(&WindowUi) + 'static) {
 
         match storage::save(&model, &path) {
             Ok(()) => {
-                *ui.save_path.borrow_mut() = Some(path.clone());
-                *ui.saved_snapshot.borrow_mut() = Some(model.clone());
+                ui.with_active_tab(|t| {
+                    t.save_path = Some(path.clone());
+                    t.saved_snapshot = Some(model.clone());
+                });
                 ui.show_title(Some(&path));
                 and_then(&ui);
             }
@@ -919,6 +1125,16 @@ const PANEL_CSS: &str = "\
   margin: 4px 10px; \
 }\
 .inkpdf-panel button:checked { \
+  background-color: @accent_bg_color; \
+  color: @accent_fg_color; \
+}\
+.inkpdf-tab-bar { \
+  padding: 0 8px 6px 8px; \
+}\
+.inkpdf-tab-label { \
+  border-radius: 8px; \
+}\
+.inkpdf-tab-label.active { \
   background-color: @accent_bg_color; \
   color: @accent_fg_color; \
 }";
