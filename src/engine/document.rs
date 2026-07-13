@@ -159,12 +159,25 @@ pub struct MarkdownAnnotation {
     pub source: String,
 }
 
+/// A box dedicated to a single LaTeX-math expression (no `$...$` delimiters
+/// needed - the whole box is math mode). `source` may contain several
+/// newline-separated expressions, stacked. Same basic subset as Markdown's
+/// inline math (see `parse_math`), just without needing a Markdown wrapper.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct LatexAnnotation {
+    pub x: f64,
+    pub y: f64,
+    pub size: f64,
+    pub source: String,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum AnnotationKind {
     Text(TextAnnotation),
     Stroke(StrokeAnnotation),
     Shape(ShapeAnnotation),
     Markdown(MarkdownAnnotation),
+    Latex(LatexAnnotation),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

@@ -855,13 +855,14 @@ fn build_tool_strip(canvas: &Canvas, details: &gtk::Stack) -> gtk::Box {
     let strip = gtk::Box::new(gtk::Orientation::Vertical, 6);
     strip.add_css_class("inkpdf-panel");
 
-    let tools: [(&str, &str, Tool, &str); 7] = [
+    let tools: [(&str, &str, Tool, &str); 8] = [
         ("inkpdf-pen-symbolic", "Pen", Tool::Pen, "pen"),
         ("inkpdf-shapes-symbolic", "Shapes", Tool::Shape, "shapes"),
         ("inkpdf-text-symbolic", "Text", Tool::Text, "text"),
         ("inkpdf-select-symbolic", "Select (drag to lasso strokes/shapes)", Tool::Lasso, "lasso"),
         ("inkpdf-eraser-symbolic", "Eraser", Tool::Eraser, "eraser"),
         ("inkpdf-markdown-symbolic", "Markdown (Shift+Enter renders)", Tool::Markdown, "markdown"),
+        ("inkpdf-latex-symbolic", "LaTeX (Shift+Enter renders)", Tool::Latex, "latex"),
         ("inkpdf-pages-symbolic", "Pages", Tool::Pages, "pages"),
     ];
 
@@ -937,6 +938,7 @@ fn build_details_panel(canvas: &Canvas) -> (gtk::Stack, gtk::Button, gtk::Button
     stack.add_named(&page_lasso(canvas), Some("lasso"));
     stack.add_named(&page_eraser(canvas), Some("eraser"));
     stack.add_named(&page_markdown(canvas), Some("markdown"));
+    stack.add_named(&page_latex(canvas), Some("latex"));
     stack.set_visible_child_name("pen");
     (stack, add_page_button, remove_page_button)
 }
@@ -1362,6 +1364,19 @@ fn page_eraser(canvas: &Canvas) -> gtk::Box {
 /// covered (headings, bold/italic, lists, code, rules, frac/sqrt/sup/sub and
 /// common Greek letters/operators - not a full CommonMark or TeX engine).
 fn page_markdown(canvas: &Canvas) -> gtk::Box {
+    let page = detail_column();
+    {
+        let canvas = canvas.clone();
+        page.append(&size_stepper(16.0, 8.0, 72.0, 1.0, 0, move |v| canvas.set_text_size(v)));
+    }
+    page
+}
+
+/// A box dedicated purely to LaTeX math (no `$...$` wrapper needed - see
+/// `layout_and_draw_latex`/`parse_math` in canvas.rs). The size stepper also
+/// doubles as the "resize if a nested formula got too small" control, since
+/// every nested sup/sub/frac size is a fraction of this base size.
+fn page_latex(canvas: &Canvas) -> gtk::Box {
     let page = detail_column();
     {
         let canvas = canvas.clone();

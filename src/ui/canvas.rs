@@ -14,9 +14,9 @@ use uuid::Uuid;
 
 use crate::engine::OpenDocument;
 use crate::engine::document::{
-    A4, Annotation, AnnotationKind, Color, DEFAULT_PATTERN_SPACING, Document, MarkdownAnnotation,
-    Page, PageKind, PagePattern, ShapeAnnotation, ShapeKind, StrokeAnnotation, TextAnnotation,
-    TextRun, TextStyle,
+    A4, Annotation, AnnotationKind, Color, DEFAULT_PATTERN_SPACING, Document, LatexAnnotation,
+    MarkdownAnnotation, Page, PageKind, PagePattern, ShapeAnnotation, ShapeKind, StrokeAnnotation,
+    TextAnnotation, TextRun, TextStyle,
 };
 use crate::engine::pdf::PdfDocument;
 
@@ -49,6 +49,7 @@ struct Glyph {
 enum TextEditKind {
     Text,
     Markdown,
+    Latex,
 }
 
 /// A text or Markdown box currently being typed (the raw source, in both
@@ -473,6 +474,8 @@ pub enum Tool {
     /// then move or bulk-restyle the group, or delete it.
     Lasso,
     Markdown,
+    /// A box dedicated to a single LaTeX expression - no `$...$` needed.
+    Latex,
     Pages,
 }
 
@@ -729,10 +732,11 @@ impl Canvas {
 
     /// Selects the active tool.
     pub fn set_tool(&self, tool: Tool) {
-        // Leaving Text/Markdown editing commits it; other tools have no pending state here.
+        // Leaving Text/Markdown/Latex editing commits it; other tools have no pending state here.
         let kind = match tool {
             Tool::Text => Some(TextEditKind::Text),
             Tool::Markdown => Some(TextEditKind::Markdown),
+            Tool::Latex => Some(TextEditKind::Latex),
             _ => None,
         };
         self.set_place_kind(kind);
@@ -1320,6 +1324,7 @@ impl Canvas {
                 match kind {
                     TextEditKind::Text => self.start_new_text(page, lx, ly),
                     TextEditKind::Markdown => self.start_new_markdown(page, lx, ly),
+                    TextEditKind::Latex => self.start_new_latex(page, lx, ly),
                 }
             }
         } else if n_press == 2 {
@@ -1383,6 +1388,10 @@ impl Canvas {
         self.start_new_edit(page, lx, ly, TextEditKind::Markdown);
     }
 
+    fn start_new_latex(&self, page: usize, lx: f64, ly: f64) {
+        self.start_new_edit(page, lx, ly, TextEditKind::Latex);
+    }
+
     fn start_new_edit(&self, page: usize, lx: f64, ly: f64, kind: TextEditKind) {
         self.begin_edit_session();
         {
@@ -1429,7 +1438,10 @@ impl Canvas {
             AnnotationKind::Markdown(m) => {
                 (m.x, m.y, m.size, glyphs_from_plain(&m.source), annotation.id, TextEditKind::Markdown)
             }
-            // Only text/Markdown boxes are editable; restore anything else and bail.
+            AnnotationKind::Latex(l) => {
+                (l.x, l.y, l.size, glyphs_from_plain(&l.source), annotation.id, TextEditKind::Latex)
+            }
+            // Only text/Markdown/Latex boxes are editable; restore anything else and bail.
             _ => {
                 let mut st = self.state.borrow_mut();
                 if let Some(p) = st.doc.as_mut().and_then(|d| d.pages.get_mut(page)) {
@@ -1559,10 +1571,16 @@ impl Canvas {
         match keyval {
             gdk::Key::Escape => self.cancel_editing(),
             gdk::Key::Return | gdk::Key::KP_Enter => {
-                // Text commits on Ctrl+Enter; Markdown commits (and renders) on
-                // Shift+Enter, since Shift'd text is otherwise meaningless here.
-                let is_markdown = self.state.borrow().editing.as_ref().is_some_and(|ed| ed.kind == TextEditKind::Markdown);
-                let commits = if is_markdown { extend } else { ctrl };
+                // Text commits on Ctrl+Enter; Markdown/Latex commit (and
+                // render) on Shift+Enter, since Shift'd text is otherwise
+                // meaningless here.
+                let renders_on_commit = self
+                    .state
+                    .borrow()
+                    .editing
+                    .as_ref()
+                    .is_some_and(|ed| matches!(ed.kind, TextEditKind::Markdown | TextEditKind::Latex));
+                let commits = if renders_on_commit { extend } else { ctrl };
                 if commits {
                     self.commit_editing();
                 } else {
@@ -1616,6 +1634,12 @@ impl Canvas {
                         runs: ed.to_runs(),
                     }),
                     TextEditKind::Markdown => AnnotationKind::Markdown(MarkdownAnnotation {
+                        x: ed.x,
+                        y: ed.y,
+                        size: ed.size,
+                        source: ed.plain_text(),
+                    }),
+                    TextEditKind::Latex => AnnotationKind::Latex(LatexAnnotation {
                         x: ed.x,
                         y: ed.y,
                         size: ed.size,
@@ -2295,7 +2319,7 @@ impl Canvas {
             Tool::Text => text_cursor((text_line_height(text_size) * z).round() as i32),
             Tool::Eraser => circle_cursor((eraser_width * z).round() as i32),
             Tool::Pen | Tool::Shape => plus_cursor(),
-            Tool::Select | Tool::Lasso | Tool::Markdown | Tool::Pages => None,
+            Tool::Select | Tool::Lasso | Tool::Markdown | Tool::Latex | Tool::Pages => None,
         };
         self.area.set_cursor(cursor.as_ref());
     }
@@ -3349,6 +3373,30 @@ fn measure_markdown(size: f64, source: &str) -> (f64, f64) {
 
 // --- end Markdown rendering ---------------------------------------------
 
+/// Lays out (and, if `draw`, paints) a dedicated LaTeX box: each
+/// newline-separated line of `source` is a full math expression (no `$...$`
+/// wrapper needed - the whole box is math mode), stacked vertically. Shares
+/// `parse_math`/`render_math_tokens` with Markdown's inline math.
+fn layout_and_draw_latex(c: &cairo::Context, x: f64, y: f64, size: f64, source: &str, draw: bool) -> (f64, f64) {
+    if draw {
+        c.set_source_rgba(0.0, 0.0, 0.0, 1.0);
+    }
+    let (ascent, line_height) = line_metrics(c, size);
+    let mut cursor_y = y;
+    let mut max_width = 0.0_f64;
+    for line in source.split('\n') {
+        let tokens = parse_math(line);
+        let (w, ea, ed) = render_math_tokens(c, &tokens, x, cursor_y + ascent, size, draw);
+        max_width = max_width.max(w);
+        cursor_y += line_height + ea + ed;
+    }
+    (max_width.max(MIN_BOX_WIDTH), (cursor_y - y).max(line_height))
+}
+
+fn measure_latex(size: f64, source: &str) -> (f64, f64) {
+    with_scratch(|c| layout_and_draw_latex(c, 0.0, 0.0, size, source, false), (MIN_BOX_WIDTH, size))
+}
+
 /// Dispatches an annotation to its renderer. Context in page-point space.
 fn draw_annotation(c: &cairo::Context, kind: &AnnotationKind) {
     match kind {
@@ -3357,6 +3405,9 @@ fn draw_annotation(c: &cairo::Context, kind: &AnnotationKind) {
         AnnotationKind::Shape(s) => draw_shape(c, s),
         AnnotationKind::Markdown(m) => {
             let _ = layout_and_draw_markdown(c, m.x, m.y, m.size, &m.source, true);
+        }
+        AnnotationKind::Latex(l) => {
+            let _ = layout_and_draw_latex(c, l.x, l.y, l.size, &l.source, true);
         }
     }
 }
@@ -3376,6 +3427,10 @@ fn annotation_bounds(kind: &AnnotationKind) -> (f64, f64, f64, f64) {
         AnnotationKind::Markdown(m) => {
             let (w, h) = measure_markdown(m.size, &m.source);
             (m.x, m.y, w, h)
+        }
+        AnnotationKind::Latex(l) => {
+            let (w, h) = measure_latex(l.size, &l.source);
+            (l.x, l.y, w, h)
         }
     }
 }
@@ -3424,6 +3479,12 @@ fn translate_annotation(kind: &AnnotationKind, dx: f64, dy: f64) -> AnnotationKi
             m.x += dx;
             m.y += dy;
             AnnotationKind::Markdown(m)
+        }
+        AnnotationKind::Latex(l) => {
+            let mut l = l.clone();
+            l.x += dx;
+            l.y += dy;
+            AnnotationKind::Latex(l)
         }
     }
 }
@@ -3549,7 +3610,7 @@ fn draw_shape(c: &cairo::Context, s: &ShapeAnnotation) {
 /// geometry. Text is ignored - it has its own selection/delete.
 fn eraser_hits(kind: &AnnotationKind, px: f64, py: f64, radius: f64) -> bool {
     match kind {
-        AnnotationKind::Text(_) | AnnotationKind::Markdown(_) => false,
+        AnnotationKind::Text(_) | AnnotationKind::Markdown(_) | AnnotationKind::Latex(_) => false,
         AnnotationKind::Stroke(s) => {
             point_near_polyline(&s.points, false, px, py, radius + s.width / 2.0)
         }
@@ -3682,13 +3743,15 @@ fn plus_cursor() -> Option<gdk::Cursor> {
 }
 
 fn draw_overlay(c: &cairo::Context, page: &Page, index: usize, zoom: f64, overlay: &Overlay) {
-    // Outline every box the active Text/Markdown tool could edit, so the user
-    // can see where a click will land.
+    // Outline every box the active Text/Markdown/Latex tool could edit, so
+    // the user can see where a click will land.
     if let Some(kind) = overlay.place_kind {
         for annotation in &page.annotations {
             let matches = matches!(
                 (&annotation.kind, kind),
-                (AnnotationKind::Text(_), TextEditKind::Text) | (AnnotationKind::Markdown(_), TextEditKind::Markdown)
+                (AnnotationKind::Text(_), TextEditKind::Text)
+                    | (AnnotationKind::Markdown(_), TextEditKind::Markdown)
+                    | (AnnotationKind::Latex(_), TextEditKind::Latex)
             );
             if matches {
                 let (x, y, w, h) = annotation_bounds(&annotation.kind);
@@ -4158,6 +4221,46 @@ mod tests {
         let data = surface.data().unwrap();
         let non_white = data.iter().filter(|&&b| b != 0xFF).count();
         assert!(non_white > 0, "markdown (incl. a fraction) should render as dark pixels");
+    }
+
+    #[test]
+    fn latex_annotation_renders_pixels() {
+        let mut page = a4_page();
+        page.annotations.push(Annotation {
+            id: Uuid::new_v4(),
+            kind: AnnotationKind::Latex(LatexAnnotation {
+                x: 50.0,
+                y: 50.0,
+                size: 16.0,
+                source: "\\frac{\\frac{a}{b}}{c}".to_string(),
+            }),
+        });
+        let mut cache = HashMap::new();
+        let (pw, ph) = (A4.0.ceil() as i32, A4.1.ceil() as i32);
+        let mut surface = page_surface(None, &mut cache, 0, &page, 1.0, pw, ph).unwrap();
+        drop(cache);
+        surface.flush();
+
+        let data = surface.data().unwrap();
+        let non_white = data.iter().filter(|&&b| b != 0xFF).count();
+        assert!(non_white > 0, "a dedicated latex box (incl. a nested fraction) should render as dark pixels");
+    }
+
+    #[test]
+    fn latex_resize_scales_bounds() {
+        let small = annotation_bounds(&AnnotationKind::Latex(LatexAnnotation {
+            x: 0.0,
+            y: 0.0,
+            size: 16.0,
+            source: "\\frac{a}{b}".to_string(),
+        }));
+        let big = annotation_bounds(&AnnotationKind::Latex(LatexAnnotation {
+            x: 0.0,
+            y: 0.0,
+            size: 32.0,
+            source: "\\frac{a}{b}".to_string(),
+        }));
+        assert!(big.2 > small.2 && big.3 > small.3, "bumping the base size should scale the whole formula up");
     }
 
     #[test]

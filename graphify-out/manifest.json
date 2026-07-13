@@ -1,7 +1,7 @@
 {
   "src/engine/document.rs": {
-    "mtime": 1783954101.3592055,
-    "ast_hash": "f803fa8cd0f28d8ad1126fbcc26a7dd5",
+    "mtime": 1783969821.1311812,
+    "ast_hash": "c01a7ebe842b2aff31d57c4d4070e1d6",
     "semantic_hash": ""
   },
   "src/engine/mod.rs": {
@@ -25,8 +25,8 @@
     "semantic_hash": "7d9a75c9d4e38d2cfd996650e4027c11"
   },
   "src/ui/canvas.rs": {
-    "mtime": 1783968864.5551667,
-    "ast_hash": "722c52f45f4a1730a2d69b58e2326ffb",
+    "mtime": 1783970325.896507,
+    "ast_hash": "8f51ae02ad3b54a728f1c3b6bb2b634c",
     "semantic_hash": ""
   },
   "src/ui/mod.rs": {
@@ -35,8 +35,8 @@
     "semantic_hash": ""
   },
   "src/ui/window.rs": {
-    "mtime": 1783966878.7124414,
-    "ast_hash": "bb52b876bd2d8cbd9d337e117a011182",
+    "mtime": 1783970304.225617,
+    "ast_hash": "4328e6b308ce61315f85835d22471d3c",
     "semantic_hash": ""
   },
   "data/icons/hicolor/scalable/actions/inkpdf-ellipse-symbolic.svg": {
@@ -127,6 +127,11 @@
   "data/icons/hicolor/scalable/actions/inkpdf-lasso-symbolic.svg": {
     "mtime": 1783966681.3817925,
     "ast_hash": "5818b288f7cb9f4d8e6b4dbcd3b0774f",
+    "semantic_hash": ""
+  },
+  "data/icons/hicolor/scalable/actions/inkpdf-latex-symbolic.svg": {
+    "mtime": 1783969800.5182977,
+    "ast_hash": "74c7f23db2d9e356e0cbfcb4ed985b7d",
     "semantic_hash": ""
   }
 }
