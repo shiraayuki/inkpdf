@@ -1743,8 +1743,8 @@ impl Canvas {
             return;
         }
 
-        // A drag starting on the selected Latex box's bottom-right handle
-        // rescales it instead of moving it.
+        // A drag starting on a Latex box's bottom-right handle rescales it
+        // instead of moving it.
         if let Some((page, index, orig_dist, orig_size)) = self.latex_resize_hit(x, y) {
             self.begin_resize(page, index, orig_dist, orig_size);
             return;
@@ -1854,28 +1854,29 @@ impl Canvas {
 
     /// Whether widget-space point `(x, y)` lands on the resize handle of the
     /// currently-selected Latex box (only Latex boxes are resizable this way,
-    /// since their bounds are entirely derived from the font size). Returns
-    /// `(page, annotation index, distance from anchor to handle, current size)`.
+    /// since their bounds are entirely derived from the font size). Doesn't
+    /// require the box to already be selected - a fresh press lands here
+    /// before `on_click` gets a chance to update `selected` (same as the
+    /// plain-move hit test below), so gating this on prior selection would
+    /// make it depend on click/drag firing order instead of just geometry.
+    /// Returns `(page, annotation index, distance from anchor to handle, current size)`.
     fn latex_resize_hit(&self, x: f64, y: f64) -> Option<(usize, usize, f64, f64)> {
         let (page, lx, ly) = self.page_hit(x, y)?;
         let st = self.state.borrow();
-        let (sel_page, id) = st.selected?;
-        if sel_page != page {
-            return None;
-        }
         let doc = st.doc.as_ref()?;
-        let (index, annotation) = doc.pages.get(page)?.annotations.iter().enumerate().find(|(_, a)| a.id == id)?;
-        let AnnotationKind::Latex(l) = &annotation.kind else {
-            return None;
-        };
-        let (bx, by, bw, bh) = annotation_bounds(&annotation.kind);
-        let (cx, cy) = (bx + bw, by + bh);
         let radius = RESIZE_HANDLE_HIT_PX / st.zoom;
-        if (lx - cx).powi(2) + (ly - cy).powi(2) > radius * radius {
-            return None;
-        }
-        let orig_dist = ((cx - bx).powi(2) + (cy - by).powi(2)).sqrt().max(1.0);
-        Some((page, index, orig_dist, l.size))
+        doc.pages.get(page)?.annotations.iter().enumerate().rev().find_map(|(index, annotation)| {
+            let AnnotationKind::Latex(l) = &annotation.kind else {
+                return None;
+            };
+            let (bx, by, bw, bh) = annotation_bounds(&annotation.kind);
+            let (cx, cy) = (bx + bw, by + bh);
+            if (lx - cx).powi(2) + (ly - cy).powi(2) > radius * radius {
+                return None;
+            }
+            let orig_dist = ((cx - bx).powi(2) + (cy - by).powi(2)).sqrt().max(1.0);
+            Some((page, index, orig_dist, l.size))
+        })
     }
 
     fn begin_resize(&self, page: usize, index: usize, orig_dist: f64, orig_size: f64) {
@@ -1901,6 +1902,7 @@ impl Canvas {
                 st.history.record(snapshot);
             }
             st.cache.remove(&page);
+            st.selected = Some((page, annotation.id));
             let orig = annotation.kind.clone();
             st.dragging = Some(DragState { page, annotation, orig, kind });
         }
