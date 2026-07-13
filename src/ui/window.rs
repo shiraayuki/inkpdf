@@ -258,9 +258,11 @@ impl WindowUi {
         for (i, tab) in tabs.iter().enumerate() {
             let chip = gtk::Box::new(gtk::Orientation::Horizontal, 0);
             chip.add_css_class("inkpdf-tab");
+            chip.set_hexpand(true);
 
             let label = gtk::Button::builder().label(tab.label.as_str()).css_classes(["flat"]).build();
             label.add_css_class("inkpdf-tab-label");
+            label.set_hexpand(true);
             if i == active {
                 label.add_css_class("active");
             }
@@ -450,6 +452,9 @@ pub fn build(app: &adw::Application) -> WindowUi {
 
     let tab_bar = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     tab_bar.add_css_class("inkpdf-tab-bar");
+    // Tabs share the full width equally (1 tab = 100%, 2 = 50/50, ...).
+    tab_bar.set_homogeneous(true);
+    tab_bar.set_hexpand(true);
 
     let content = adw::ToolbarView::new();
     content.add_top_bar(&header);
