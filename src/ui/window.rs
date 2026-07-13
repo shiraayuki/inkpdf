@@ -20,6 +20,8 @@ const DEFAULT_HEIGHT: i32 = 700;
 const SWATCH: i32 = 30;
 /// Points added/removed per click on the page width/height steppers.
 const PAGE_SIZE_STEP: f64 = 10.0;
+/// Fixed width of the embedded file browser sidebar.
+const FILE_BROWSER_WIDTH: f64 = 260.0;
 
 /// One open document. Only the active tab's document/pdf actually live in the
 /// `Canvas` at any time; `switch_to_tab` moves them in and out of here.
@@ -493,15 +495,22 @@ pub fn build(app: &adw::Application) -> WindowUi {
     tab_bar.set_homogeneous(true);
     tab_bar.set_hexpand(true);
 
-    // The file browser's revealer is prepended here once `ui` exists below (it
-    // needs `ui` to open files); this box is its permanent parent.
-    let main_hbox = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    main_hbox.append(&overlay);
+    // The file browser sidebar is attached here once `ui` exists below (it
+    // needs `ui` to open files); split_view is its permanent parent. Using
+    // AdwOverlaySplitView (not a manual Box+Revealer) lets libadwaita own the
+    // sidebar's width/animation/collapsing instead of hand-rolled layout math.
+    let split_view = adw::OverlaySplitView::builder()
+        .content(&overlay)
+        .sidebar_position(gtk::PackType::Start)
+        .show_sidebar(false)
+        .min_sidebar_width(FILE_BROWSER_WIDTH)
+        .max_sidebar_width(FILE_BROWSER_WIDTH)
+        .build();
 
     let content = adw::ToolbarView::new();
     content.add_top_bar(&header);
     content.add_top_bar(&tab_bar);
-    content.set_content(Some(&main_hbox));
+    content.set_content(Some(&split_view));
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -560,15 +569,15 @@ pub fn build(app: &adw::Application) -> WindowUi {
     // Embedded file browser: slides in from the left; picking a file there
     // opens it straight into a new tab (see FileBrowser::new / open_path_in_new_tab).
     let file_browser = crate::ui::file_browser::FileBrowser::new(&ui);
-    main_hbox.prepend(&file_browser.revealer);
+    split_view.set_sidebar(Some(&file_browser.widget));
     let browser_toggle = gtk::ToggleButton::builder()
         .icon_name("sidebar-show-symbolic")
         .tooltip_text("Dateien")
         .css_classes(["flat"])
         .build();
     {
-        let revealer = file_browser.revealer.clone();
-        browser_toggle.connect_toggled(move |btn| revealer.set_reveal_child(btn.is_active()));
+        let split_view = split_view.clone();
+        browser_toggle.connect_toggled(move |btn| split_view.set_show_sidebar(btn.is_active()));
     }
     header.pack_start(&browser_toggle);
 

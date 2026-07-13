@@ -1741,17 +1741,29 @@ impl Canvas {
         let Some((page, lx, ly)) = self.state.borrow().lasso_start else {
             return;
         };
-        let hit_id = {
+        // A press anywhere inside the current selection's combined bounding box
+        // starts a group move - not just a press on one specific item's own
+        // (possibly thin/small) bounds, which made moving a multi-selection
+        // together nearly impossible in practice.
+        let starts_in_selection = {
             let st = self.state.borrow();
-            st.doc
-                .as_ref()
-                .and_then(|d| d.pages.get(page))
-                .and_then(|p| annotation_at(p, lx, ly).map(|idx| p.annotations[idx].id))
+            st.lasso_selected.as_ref().is_some_and(|(sel_page, ids)| {
+                if *sel_page != page {
+                    return false;
+                }
+                let Some(kinds) = st.doc.as_ref().and_then(|d| d.pages.get(page)).map(|p| {
+                    p.annotations.iter().filter(|a| ids.contains(&a.id)).map(|a| a.kind.clone()).collect::<Vec<_>>()
+                }) else {
+                    return false;
+                };
+                if kinds.is_empty() {
+                    return false;
+                }
+                let (bx, by, bw, bh) = union_bounds(&kinds);
+                lx >= bx && lx <= bx + bw && ly >= by && ly <= by + bh
+            })
         };
-        let in_selection = hit_id.is_some_and(|id| {
-            self.state.borrow().lasso_selected.as_ref().is_some_and(|(p, ids)| *p == page && ids.contains(&id))
-        });
-        if in_selection {
+        if starts_in_selection {
             self.lift_lasso_group(page);
         } else {
             let mut st = self.state.borrow_mut();
@@ -1899,10 +1911,22 @@ impl Canvas {
         self.area.queue_draw();
     }
 
+    /// The current selection for bulk operations: the Lasso multi-selection if
+    /// there is one, else the plain single-select fallback - so switching to
+    /// the Lasso tool's bulk-edit panel after a single click made elsewhere
+    /// (e.g. with the default Select tool) still has something to act on.
+    fn effective_lasso_selection(&self) -> Option<(usize, Vec<Uuid>)> {
+        let st = self.state.borrow();
+        if let Some(sel) = &st.lasso_selected {
+            return Some(sel.clone());
+        }
+        st.selected.map(|(page, id)| (page, vec![id]))
+    }
+
     /// Applies `f` to every lasso-selected annotation whose kind matches
     /// `applies_to` (one undo entry if anything actually applies).
     fn apply_to_lasso_if(&self, applies_to: fn(&AnnotationKind) -> bool, f: impl Fn(&mut AnnotationKind)) {
-        let Some((page, ids)) = self.state.borrow().lasso_selected.clone() else {
+        let Some((page, ids)) = self.effective_lasso_selection() else {
             return;
         };
         let any_applies = self
@@ -4189,5 +4213,41 @@ mod tests {
         let data = surface.data().unwrap();
         let dark = data.iter().filter(|&&b| b < 0x40).count();
         assert!(dark > 0, "the stroke should paint dark pixels");
+    }
+
+    #[test]
+    fn ellipse_shape_does_not_touch_its_bounding_box_corner() {
+        // A rectangle's outline passes through every corner of its own bounding
+        // box; an ellipse's outline never does. If both render identically
+        // (the "everything looks like a rectangle" bug report), this would fail.
+        let rect = ShapeAnnotation {
+            shape: ShapeKind::Rectangle,
+            x0: 10.0,
+            y0: 10.0,
+            x1: 110.0,
+            y1: 110.0,
+            color: Color::BLACK,
+            width: 2.0,
+        };
+        let ellipse = ShapeAnnotation { shape: ShapeKind::Ellipse, ..rect };
+
+        let corner_is_dark = |s: &ShapeAnnotation| {
+            let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, 120, 120).unwrap();
+            let stride = surface.stride() as usize;
+            {
+                let c = cairo::Context::new(&surface).unwrap();
+                c.set_source_rgb(1.0, 1.0, 1.0);
+                let _ = c.paint();
+                draw_shape(&c, s);
+            }
+            surface.flush();
+            let data = surface.data().unwrap();
+            // BGRA-ish premultiplied data; sample right at the top-left corner (10,10).
+            let idx = (10 * stride) + 10 * 4;
+            data[idx] < 0x80
+        };
+
+        assert!(corner_is_dark(&rect), "a rectangle's outline reaches its own corner");
+        assert!(!corner_is_dark(&ellipse), "an ellipse's outline must NOT reach its bounding box corner");
     }
 }

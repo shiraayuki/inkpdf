@@ -11,10 +11,10 @@ use gtk::prelude::*;
 use crate::engine::document::FILE_EXTENSION;
 use crate::ui::window::WindowUi;
 
-const PANEL_WIDTH: i32 = 240;
-
 pub struct FileBrowser {
-    pub revealer: gtk::Revealer,
+    /// The sidebar's content; hand this to `AdwOverlaySplitView::set_sidebar`,
+    /// which owns showing/hiding/animating it (no manual Revealer needed).
+    pub widget: gtk::Box,
 }
 
 impl FileBrowser {
@@ -41,7 +41,6 @@ impl FileBrowser {
         header_row.append(&path_label);
 
         let column = gtk::Box::new(gtk::Orientation::Vertical, 6);
-        column.set_width_request(PANEL_WIDTH);
         column.set_margin_top(8);
         column.set_margin_bottom(8);
         column.set_margin_start(8);
@@ -49,12 +48,6 @@ impl FileBrowser {
         column.append(&header_row);
         column.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         column.append(&scroller);
-
-        let revealer = gtk::Revealer::builder()
-            .transition_type(gtk::RevealerTransitionType::SlideRight)
-            .reveal_child(false)
-            .child(&column)
-            .build();
 
         refresh(&list, &path_label, &entries, &dir);
 
@@ -100,7 +93,7 @@ impl FileBrowser {
             });
         }
 
-        Self { revealer }
+        Self { widget: column }
     }
 }
 
