@@ -182,11 +182,43 @@ impl WindowUi {
         self.switch_to_tab(idx);
     }
 
-    /// Opens `path` straight into a fresh tab, no replace/new-tab prompt - used
-    /// by the embedded file browser, where "pick a file" already implies "new tab".
-    pub(crate) fn open_path_in_new_tab(&self, path: &Path) {
-        self.new_tab();
-        self.load_path(path);
+    /// Opens `path` as chosen from the embedded file browser - no replace/new-tab
+    /// prompt, unlike the header Open button. Unless `force_new_tab` (the
+    /// browser's right-click "open in new tab"): if `path` is an `.inkpdf`
+    /// already open in another tab, switches to it instead of duplicating it;
+    /// else if the active tab is still the untouched initial blank page, that
+    /// tab is replaced rather than leaving it around unused; else opens a
+    /// fresh tab.
+    pub(crate) fn open_from_browser(&self, path: &Path, force_new_tab: bool) {
+        let is_inkpdf = path.extension().is_some_and(|e| e.eq_ignore_ascii_case(FILE_EXTENSION));
+        if !force_new_tab && is_inkpdf && let Some(idx) = self.tab_index_for_path(path) {
+            self.switch_to_tab(idx);
+            return;
+        }
+        if !force_new_tab && self.active_tab_is_untouched() {
+            self.load_path(path);
+        } else {
+            self.new_tab();
+            self.load_path(path);
+        }
+    }
+
+    /// Index of the tab whose save path resolves to the same file as `path`
+    /// (symlink/relative-path safe via canonicalization), if any.
+    fn tab_index_for_path(&self, path: &Path) -> Option<usize> {
+        let target = std::fs::canonicalize(path).ok()?;
+        self.tabs
+            .borrow()
+            .iter()
+            .position(|t| t.save_path.as_deref().and_then(|p| std::fs::canonicalize(p).ok()).as_ref() == Some(&target))
+    }
+
+    /// Whether the active tab is still exactly the pristine blank page it
+    /// started as: never saved/loaded from a file, and unedited.
+    fn active_tab_is_untouched(&self) -> bool {
+        self.save_path().is_none()
+            && self.canvas.document().is_some_and(|d| d.source.is_none())
+            && !self.is_dirty()
     }
 
     /// Switches the canvas to a different tab, stashing the current tab's live
@@ -1393,16 +1425,16 @@ fn load_css() {
 }
 
 /// Runs `on_press` when the widget receives a right-click.
-fn add_secondary_click(widget: &impl IsA<gtk::Widget>, on_press: impl Fn() + 'static) {
+pub(crate) fn add_secondary_click(widget: &impl IsA<gtk::Widget>, on_press: impl Fn() + 'static) {
     let gesture = gtk::GestureClick::builder().button(gdk::BUTTON_SECONDARY).build();
     gesture.connect_pressed(move |_, _, _, _| on_press());
     widget.add_controller(gesture);
 }
 
-type MenuItem = (&'static str, bool, Box<dyn Fn()>);
+pub(crate) type MenuItem = (&'static str, bool, Box<dyn Fn()>);
 
 /// Pops up a small menu of labelled actions anchored to `anchor`.
-fn show_menu(anchor: &impl IsA<gtk::Widget>, items: Vec<MenuItem>) {
+pub(crate) fn show_menu(anchor: &impl IsA<gtk::Widget>, items: Vec<MenuItem>) {
     let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let popover = gtk::Popover::builder().autohide(true).build();
 

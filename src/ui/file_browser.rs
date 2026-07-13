@@ -9,7 +9,7 @@ use gtk::glib;
 use gtk::prelude::*;
 
 use crate::engine::document::FILE_EXTENSION;
-use crate::ui::window::WindowUi;
+use crate::ui::window::{WindowUi, add_secondary_click, show_menu};
 
 pub struct FileBrowser {
     /// The sidebar's content; hand this to `AdwOverlaySplitView::set_sidebar`,
@@ -49,18 +49,19 @@ impl FileBrowser {
         column.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         column.append(&scroller);
 
-        refresh(&list, &path_label, &entries, &dir);
+        refresh(&list, &path_label, &entries, &dir, ui);
 
         {
             let dir = dir.clone();
             let entries = entries.clone();
             let list = list.clone();
             let path_label = path_label.clone();
+            let ui = ui.clone();
             up_button.connect_clicked(move |_| {
                 let parent = dir.borrow().parent().map(|p| p.to_path_buf());
                 if let Some(parent) = parent {
                     *dir.borrow_mut() = parent;
-                    refresh(&list, &path_label, &entries, &dir);
+                    refresh(&list, &path_label, &entries, &dir, &ui);
                 }
             });
         }
@@ -69,9 +70,10 @@ impl FileBrowser {
             let entries = entries.clone();
             let list = list.clone();
             let path_label = path_label.clone();
+            let ui = ui.clone();
             home_button.connect_clicked(move |_| {
                 *dir.borrow_mut() = initial_dir();
-                refresh(&list, &path_label, &entries, &dir);
+                refresh(&list, &path_label, &entries, &dir, &ui);
             });
         }
         {
@@ -86,9 +88,9 @@ impl FileBrowser {
                 };
                 if is_dir {
                     *dir.borrow_mut() = path;
-                    refresh(list, &path_label, &entries, &dir);
+                    refresh(list, &path_label, &entries, &dir, &ui);
                 } else {
-                    ui.open_path_in_new_tab(&path);
+                    ui.open_from_browser(&path, false);
                 }
             });
         }
@@ -108,12 +110,15 @@ fn icon_button(icon: &str, tip: &str) -> gtk::Button {
 /// Rebuilds the row list for the current directory, filtering files down to
 /// `.pdf`/`.inkpdf` (folders are always shown, for navigation). Keeps
 /// `entries` in sync (same order as the rows) so `row-activated` can look up
-/// what was clicked by index.
+/// what was clicked by index. Files (not folders) get a right-click menu to
+/// force-open in a new tab, bypassing the switch-to-existing-tab/replace-
+/// pristine-blank-tab behavior of a plain click.
 fn refresh(
     list: &gtk::ListBox,
     path_label: &gtk::Label,
     entries: &Rc<RefCell<Vec<(PathBuf, bool)>>>,
     dir: &Rc<RefCell<PathBuf>>,
+    ui: &WindowUi,
 ) {
     while let Some(child) = list.first_child() {
         list.remove(&child);
@@ -137,6 +142,18 @@ fn refresh(
         label.set_hexpand(true);
         label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
         row.append(&label);
+
+        if !is_dir {
+            let ui = ui.clone();
+            let path = path.clone();
+            let anchor = row.clone();
+            add_secondary_click(&row, move || {
+                let ui = ui.clone();
+                let path = path.clone();
+                show_menu(&anchor, vec![("In neuem Tab öffnen", true, Box::new(move || ui.open_from_browser(&path, true)))]);
+            });
+        }
+
         list.append(&row);
     }
 
