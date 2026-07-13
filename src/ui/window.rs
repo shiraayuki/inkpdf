@@ -11,7 +11,7 @@ use crate::engine::document::{
 };
 use crate::engine::pdf::PdfDocument;
 use crate::engine::storage;
-use crate::ui::canvas::{Canvas, Relative, Tool, draw_page_pattern};
+use crate::ui::canvas::{Canvas, LassoShape, Relative, Tool, draw_page_pattern};
 use crate::ui::settings::{self, AppSettings};
 
 const DEFAULT_WIDTH: i32 = 900;
@@ -1243,18 +1243,35 @@ fn page_shapes(canvas: &Canvas) -> gtk::Box {
 /// Lasso ("Select") tool page: bulk-edits the current multi-selection. The
 /// shape-kind buttons are plain (momentary), not toggles - like the text
 /// style buttons, they act on the selection and must not stick in :checked.
+/// Lasso ("Select") tool page: pick how a new drag builds a selection -
+/// rectangle marquee (intersects annotation bounds) or freeform lasso (traces
+/// an arbitrary path; anything whose center falls inside gets selected).
+/// Mutually exclusive, like the shape-kind picker on the Shapes tool page.
 fn page_lasso(canvas: &Canvas) -> gtk::Box {
     let page = detail_column();
 
-    let shapes: [(&str, &str, ShapeKind); 2] = [
-        ("inkpdf-rect-symbolic", "Als Rechteck", ShapeKind::Rectangle),
-        ("inkpdf-line-symbolic", "Als Linie", ShapeKind::Line),
+    let modes: [(&str, &str, LassoShape); 2] = [
+        ("inkpdf-rect-symbolic", "Rechteck-Auswahl", LassoShape::Rect),
+        ("inkpdf-lasso-symbolic", "Freihand-Lasso", LassoShape::Freeform),
     ];
-    for (icon, tip, kind) in shapes {
-        let button = flat_icon_button(icon, tip);
+    let mut group: Option<gtk::ToggleButton> = None;
+    for (icon, tip, shape) in modes {
+        let toggle = flat_toggle(icon, tip);
+        if let Some(first) = &group {
+            toggle.set_group(Some(first));
+        } else {
+            group = Some(toggle.clone());
+        }
+        if shape == canvas.lasso_shape() {
+            toggle.set_active(true);
+        }
         let canvas = canvas.clone();
-        button.connect_clicked(move |_| canvas.set_lasso_shape_kind(kind));
-        page.append(&button);
+        toggle.connect_toggled(move |btn| {
+            if btn.is_active() {
+                canvas.set_lasso_shape(shape);
+            }
+        });
+        page.append(&toggle);
     }
     page
 }

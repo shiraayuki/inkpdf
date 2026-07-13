@@ -449,6 +449,8 @@ struct State {
     lasso_start: Option<(usize, f64, f64)>,
     /// The in-progress Lasso gesture, once the drag has exceeded the threshold.
     lasso_op: Option<LassoOp>,
+    /// Which shape a new Lasso-tool drag builds: rectangle marquee or freeform.
+    lasso_shape: LassoShape,
 }
 
 /// Where an insert/delete acts relative to the current page.
@@ -475,11 +477,22 @@ pub enum Tool {
 
 /// An in-progress Lasso-tool gesture.
 enum LassoOp {
-    /// Marquee rectangle from `start` to `current` (page-local points).
-    Marquee { page: usize, start: (f64, f64), current: (f64, f64) },
+    /// Rectangle marquee from `start` to `current` (page-local points).
+    Rect { page: usize, start: (f64, f64), current: (f64, f64) },
+    /// Freeform lasso: the traced path so far (page-local points). Selection
+    /// is decided on release by testing each annotation's bounds-center
+    /// against this path (`point_in_polygon`), not by intersection like Rect.
+    Freeform { page: usize, points: Vec<(f64, f64)> },
     /// Group-dragging the lifted annotations; `orig` is the pre-drag snapshot,
     /// parallel to `lifted` by index, and translated fresh from it each frame.
     Move { page: usize, orig: Vec<AnnotationKind>, lifted: Vec<Annotation> },
+}
+
+/// Which shape a Lasso-tool drag draws to build a new selection.
+#[derive(Clone, Copy, PartialEq)]
+pub enum LassoShape {
+    Rect,
+    Freeform,
 }
 
 #[derive(Clone)]
@@ -535,6 +548,7 @@ impl Canvas {
             lasso_press: None,
             lasso_start: None,
             lasso_op: None,
+            lasso_shape: LassoShape::Rect,
         }));
 
         {
@@ -1761,7 +1775,10 @@ impl Canvas {
         } else {
             let mut st = self.state.borrow_mut();
             st.lasso_selected = None;
-            st.lasso_op = Some(LassoOp::Marquee { page, start: (lx, ly), current: (lx, ly) });
+            st.lasso_op = Some(match st.lasso_shape {
+                LassoShape::Rect => LassoOp::Rect { page, start: (lx, ly), current: (lx, ly) },
+                LassoShape::Freeform => LassoOp::Freeform { page, points: vec![(lx, ly)] },
+            });
         }
     }
 
@@ -1846,11 +1863,18 @@ impl Canvas {
         let mut st = self.state.borrow_mut();
         let State { doc, lasso_op, .. } = &mut *st;
         match lasso_op {
-            Some(LassoOp::Marquee { page, current, .. }) => {
+            Some(LassoOp::Rect { page, current, .. }) => {
                 if let Some((hit_page, lx, ly)) = current_hit
                     && hit_page == *page
                 {
                     *current = (lx, ly);
+                }
+            }
+            Some(LassoOp::Freeform { page, points }) => {
+                if let Some((hit_page, lx, ly)) = current_hit
+                    && hit_page == *page
+                {
+                    points.push((lx, ly));
                 }
             }
             Some(LassoOp::Move { page, orig, lifted }) => {
@@ -1887,7 +1911,7 @@ impl Canvas {
                 drop(st);
                 self.area.queue_draw();
             }
-            Some(LassoOp::Marquee { page, start, current }) => {
+            Some(LassoOp::Rect { page, start, current }) => {
                 let (x0, y0) = start;
                 let (x1, y1) = current;
                 let rect = (x0.min(x1), y0.min(y1), (x1 - x0).abs(), (y1 - y0).abs());
@@ -1900,6 +1924,27 @@ impl Canvas {
                         p.annotations
                             .iter()
                             .filter(|a| rects_intersect(annotation_bounds(&a.kind), rect))
+                            .map(|a| a.id)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                st.lasso_selected = if ids.is_empty() { None } else { Some((page, ids)) };
+                drop(st);
+                self.area.queue_draw();
+            }
+            Some(LassoOp::Freeform { page, points }) => {
+                let mut st = self.state.borrow_mut();
+                let ids: Vec<Uuid> = st
+                    .doc
+                    .as_ref()
+                    .and_then(|d| d.pages.get(page))
+                    .map(|p| {
+                        p.annotations
+                            .iter()
+                            .filter(|a| {
+                                let (x, y, w, h) = annotation_bounds(&a.kind);
+                                point_in_polygon((x + w / 2.0, y + h / 2.0), &points)
+                            })
                             .map(|a| a.id)
                             .collect()
                     })
@@ -1929,60 +1974,15 @@ impl Canvas {
         self.area.queue_draw();
     }
 
-    /// The current selection for bulk operations: the Lasso multi-selection if
-    /// there is one, else the plain single-select fallback - so switching to
-    /// the Lasso tool's bulk-edit panel after a single click made elsewhere
-    /// (e.g. with the default Select tool) still has something to act on.
-    fn effective_lasso_selection(&self) -> Option<(usize, Vec<Uuid>)> {
-        let st = self.state.borrow();
-        if let Some(sel) = &st.lasso_selected {
-            return Some(sel.clone());
-        }
-        st.selected.map(|(page, id)| (page, vec![id]))
+    /// Which shape a new Lasso-tool drag builds (rectangle marquee or freeform).
+    pub fn lasso_shape(&self) -> LassoShape {
+        self.state.borrow().lasso_shape
     }
 
-    /// Applies `f` to every lasso-selected annotation whose kind matches
-    /// `applies_to` (one undo entry if anything actually applies).
-    fn apply_to_lasso_if(&self, applies_to: fn(&AnnotationKind) -> bool, f: impl Fn(&mut AnnotationKind)) {
-        let Some((page, ids)) = self.effective_lasso_selection() else {
-            return;
-        };
-        let any_applies = self
-            .state
-            .borrow()
-            .doc
-            .as_ref()
-            .and_then(|d| d.pages.get(page))
-            .map(|p| p.annotations.iter().any(|a| ids.contains(&a.id) && applies_to(&a.kind)))
-            .unwrap_or(false);
-        if !any_applies {
-            return;
-        }
-        self.record_change();
-        let mut st = self.state.borrow_mut();
-        if let Some(p) = st.doc.as_mut().and_then(|d| d.pages.get_mut(page)) {
-            for annotation in p.annotations.iter_mut().filter(|a| ids.contains(&a.id)) {
-                if applies_to(&annotation.kind) {
-                    f(&mut annotation.kind);
-                }
-            }
-        }
-        st.cache.remove(&page);
-        drop(st);
-        self.area.queue_draw();
+    pub fn set_lasso_shape(&self, shape: LassoShape) {
+        self.state.borrow_mut().lasso_shape = shape;
     }
 
-    /// Bulk-changes the shape kind of the Shape members of the current Lasso selection.
-    pub fn set_lasso_shape_kind(&self, kind: ShapeKind) {
-        self.apply_to_lasso_if(
-            |k| matches!(k, AnnotationKind::Shape(_)),
-            move |k| {
-                if let AnnotationKind::Shape(s) = k {
-                    s.shape = kind;
-                }
-            },
-        );
-    }
 
     fn on_drag_end(&self) {
         if self.state.borrow().draw_op.is_some() {
@@ -3252,6 +3252,27 @@ fn rects_intersect(a: (f64, f64, f64, f64), b: (f64, f64, f64, f64)) -> bool {
     ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by
 }
 
+/// Even-odd (ray-casting) point-in-polygon test; `poly` need not be closed
+/// (the last-to-first edge is implied). Used by the freeform Lasso to decide
+/// which annotations (by their bounds center) fall inside the traced path.
+fn point_in_polygon(p: (f64, f64), poly: &[(f64, f64)]) -> bool {
+    if poly.len() < 3 {
+        return false;
+    }
+    let (px, py) = p;
+    let mut inside = false;
+    let mut j = poly.len() - 1;
+    for i in 0..poly.len() {
+        let (xi, yi) = poly[i];
+        let (xj, yj) = poly[j];
+        if (yi > py) != (yj > py) && px < (xj - xi) * (py - yi) / (yj - yi) + xi {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
 /// Draws a freehand stroke as a Catmull-Rom spline through the sampled points
 /// (rendered as cubic Béziers), so it looks smooth instead of polygonal.
 /// A single point renders as a dot.
@@ -3522,13 +3543,24 @@ fn draw_overlay(c: &cairo::Context, page: &Page, index: usize, zoom: f64, overla
         }
     }
 
-    // The in-progress Lasso gesture: a marquee rectangle, or the group being dragged.
+    // The in-progress Lasso gesture: a rect/freeform marquee, or the group being dragged.
     if let Some(op) = overlay.lasso_op {
         match op {
-            LassoOp::Marquee { page: op_page, start, current } if *op_page == index => {
+            LassoOp::Rect { page: op_page, start, current } if *op_page == index => {
                 let (x0, y0) = *start;
                 let (x1, y1) = *current;
                 stroke_box(c, x0.min(x1), y0.min(y1), (x1 - x0).abs(), (y1 - y0).abs(), zoom, BOX_ACTIVE);
+            }
+            LassoOp::Freeform { page: op_page, points } if *op_page == index && points.len() >= 2 => {
+                let (r, g, b, _) = BOX_ACTIVE;
+                c.set_source_rgba(r, g, b, 1.0);
+                c.set_line_width(1.5 / zoom);
+                c.move_to(points[0].0, points[0].1);
+                for &(x, y) in &points[1..] {
+                    c.line_to(x, y);
+                }
+                c.close_path();
+                let _ = c.stroke();
             }
             LassoOp::Move { page: op_page, lifted, .. } if *op_page == index => {
                 for annotation in lifted {
@@ -4154,6 +4186,17 @@ mod tests {
         assert!(rects_intersect((0.0, 0.0, 10.0, 10.0), (5.0, 5.0, 10.0, 10.0)), "overlapping");
         assert!(!rects_intersect((0.0, 0.0, 10.0, 10.0), (10.0, 10.0, 5.0, 5.0)), "touching edges only");
         assert!(!rects_intersect((0.0, 0.0, 10.0, 10.0), (20.0, 20.0, 5.0, 5.0)), "far apart");
+    }
+
+    #[test]
+    fn point_in_polygon_cases() {
+        // A concave "C"-ish shape, so an interior test actually exercises the
+        // ray-casting logic rather than a trivial convex bounding box.
+        let star = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (5.0, 3.0), (0.0, 10.0)];
+        assert!(point_in_polygon((5.0, 1.0), &star), "inside the wide top part");
+        assert!(!point_in_polygon((5.0, 8.0), &star), "inside the concave notch, not the shape");
+        assert!(!point_in_polygon((20.0, 20.0), &star), "well outside");
+        assert!(!point_in_polygon((5.0, 5.0), &[(0.0, 0.0), (1.0, 1.0)]), "degenerate (<3 points) polygon");
     }
 
     #[test]
