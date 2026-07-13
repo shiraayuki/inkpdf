@@ -1382,6 +1382,9 @@ fn page_latex(canvas: &Canvas) -> gtk::Box {
         let canvas = canvas.clone();
         page.append(&size_stepper(16.0, 8.0, 72.0, 1.0, 0, move |v| canvas.set_text_size(v)));
     }
+    let hint = caption("Rechtsklick + ziehen in der Box: Größe ändern");
+    hint.set_wrap(true);
+    page.append(&hint);
     page
 }
 

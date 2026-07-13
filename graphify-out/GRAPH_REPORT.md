@@ -1,16 +1,16 @@
 # Graph Report - inkpdf  (2026-07-13)
 
 ## Corpus Check
-- 10 files · ~28,475 words
+- 10 files · ~28,529 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 476 nodes · 1395 edges · 16 communities (13 shown, 3 thin omitted)
+- 476 nodes · 1395 edges · 22 communities (17 shown, 5 thin omitted)
 - Extraction: 100% EXTRACTED · 0% INFERRED · 0% AMBIGUOUS · INFERRED: 4 edges (avg confidence: 0.8)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `cfb84acb`
+- Built from commit: `fae9dcb5`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -28,7 +28,13 @@
 - Option
 - Option
 - .on_click
+- .is_empty
 - .style_selection
+- annotation_bounds
+- canvas.rs
+- .update_layout
+- .style_selection
+- .lift_annotation
 
 ## God Nodes (most connected - your core abstractions)
 1. `Canvas` - 127 edges
@@ -57,15 +63,15 @@
 ## Import Cycles
 - None detected.
 
-## Communities (16 total, 3 thin omitted)
+## Communities (22 total, 5 thin omitted)
 
 ### Community 0 - "Canvas Rendering & Hit-Testing"
-Cohesion: 0.05
-Nodes (89): HashMap, HeadingLevel, Instant, a4_page(), ann_glyphs(), annotation_at(), annotation_at_also_hits_strokes_and_shapes(), annotation_at_hits_inside_and_misses_outside() (+81 more)
+Cohesion: 0.24
+Nodes (23): apply_glyph_font(), draw_annotation(), draw_caret(), draw_glyphs(), draw_glyphs_with_math(), draw_one_glyph(), draw_overlay(), draw_shape() (+15 more)
 
 ### Community 1 - ".record_change"
-Cohesion: 0.12
-Nodes (4): ScrolledWindow, Canvas, LassoShape, DrawingArea
+Cohesion: 0.11
+Nodes (5): ScrolledWindow, Canvas, LassoShape, DrawingArea, FnOnce
 
 ### Community 2 - "Window & Tool UI"
 Cohesion: 0.07
@@ -73,7 +79,7 @@ Nodes (62): Application, ApplicationWindow, Cell, ColorDialogButton, IsA, MenuIt
 
 ### Community 3 - "Document Model"
 Cohesion: 0.06
-Nodes (52): ImageSurface, Annotation, AnnotationKind, Color, default_font(), Document, insert_blank_page_adds_page_at_index(), LatexAnnotation (+44 more)
+Nodes (53): ImageSurface, Annotation, AnnotationKind, Color, default_font(), Document, insert_blank_page_adds_page_at_index(), LatexAnnotation (+45 more)
 
 ### Community 4 - "Text Editing & Styling"
 Cohesion: 0.11
@@ -91,35 +97,51 @@ Nodes (12): AppSettings, load(), load_from(), path(), roundtrip_preserves_settin
 Cohesion: 0.18
 Nodes (16): ListBox, FileBrowser, icon_button(), initial_dir(), list_dir_entries(), list_dir_entries_shows_dirs_and_pdf_inkpdf_only(), refresh(), Box (+8 more)
 
-### Community 9 - ".update_layout"
-Cohesion: 0.15
-Nodes (3): content_size(), Relative, FnOnce
-
 ### Community 11 - "Option"
-Cohesion: 0.17
-Nodes (10): Cursor, circle_cursor(), cursor_from_draw(), plus_cursor(), Option, stroke_halo(), text_cursor(), text_line_height() (+2 more)
+Cohesion: 0.16
+Nodes (12): Cursor, Instant, ModelerInputEventType, circle_cursor(), cursor_from_draw(), PenModel, plus_cursor(), Option (+4 more)
 
 ### Community 12 - "Option"
+Cohesion: 0.32
+Nodes (6): clamp_translate(), clamp_translate_keeps_box_on_page(), cursor_at(), translate_annotation(), translate_annotation_shifts_every_kind(), union_bounds()
+
+### Community 13 - ".on_click"
+Cohesion: 0.22
+Nodes (3): ann_glyphs(), glyphs_from_plain(), Uuid
+
+### Community 15 - ".is_empty"
+Cohesion: 0.13
+Nodes (16): HeadingLevel, heading_scale(), MathSplit, MdLine, MdPiece, MdRun, parse_markdown_lines(), parse_markdown_lines_list_items_get_prefixes() (+8 more)
+
+### Community 16 - ".style_selection"
 Cohesion: 0.18
-Nodes (6): clamp_translate(), clamp_translate_keeps_box_on_page(), DragKind, translate_annotation(), translate_annotation_shifts_every_kind(), union_bounds()
+Nodes (16): HashMap, a4_page(), annotation_at_also_hits_strokes_and_shapes(), annotation_at_hits_inside_and_misses_outside(), ellipse_shape_does_not_touch_its_bounding_box_corner(), fraction_needs_more_height_than_plain_text(), highlighted_text_renders_marker_pixels(), latex_annotation_renders_pixels() (+8 more)
+
+### Community 17 - "annotation_bounds"
+Cohesion: 0.12
+Nodes (16): annotation_at(), annotation_bounds(), annotation_bounds_covers_all_kinds(), bounds_of_points(), latex_resize_scales_bounds(), markdown_bounds_grow_with_more_lines(), measure_glyphs(), measure_glyphs_with_math() (+8 more)
+
+### Community 18 - "canvas.rs"
+Cohesion: 0.16
+Nodes (12): dist_point_segment(), hit_test(), hit_test_maps_click_to_page_local_point(), math_symbol(), MathToken, parse_math(), parse_math_falls_back_to_literal_for_unknown_commands(), parse_math_handles_frac_sup_sub_and_symbols() (+4 more)
 
 ## Knowledge Gaps
-- **3 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **5 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `Canvas` connect `.record_change` to `Canvas Rendering & Hit-Testing`, `Window & Tool UI`, `Document Model`, `Text Editing & Styling`, `Engine / PDF Loading`, `.update_layout`, `Option`, `Option`, `.on_click`, `.attach_input`, `.style_selection`?**
-  _High betweenness centrality (0.462) - this node is a cross-community bridge._
+- **Why does `Canvas` connect `.record_change` to `Window & Tool UI`, `Document Model`, `Text Editing & Styling`, `Engine / PDF Loading`, `.update_layout`, `Option`, `Option`, `.on_click`, `.attach_input`, `.is_empty`, `.style_selection`, `annotation_bounds`, `canvas.rs`, `.update_layout`, `.style_selection`, `.lift_annotation`?**
+  _High betweenness centrality (0.463) - this node is a cross-community bridge._
 - **Why does `WindowUi` connect `Window & Tool UI` to `.record_change`, `.record_change`?**
   _High betweenness centrality (0.119) - this node is a cross-community bridge._
-- **Why does `Document` connect `Document Model` to `Canvas Rendering & Hit-Testing`, `Window & Tool UI`, `Text Editing & Styling`, `Engine / PDF Loading`?**
+- **Why does `Document` connect `Document Model` to `canvas.rs`, `Window & Tool UI`, `Text Editing & Styling`, `Engine / PDF Loading`?**
   _High betweenness centrality (0.096) - this node is a cross-community bridge._
-- **Should `Canvas Rendering & Hit-Testing` be split into smaller, more focused modules?**
-  _Cohesion score 0.0510989010989011 - nodes in this community are weakly interconnected._
 - **Should `.record_change` be split into smaller, more focused modules?**
-  _Cohesion score 0.11666666666666667 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.11333333333333333 - nodes in this community are weakly interconnected._
 - **Should `Window & Tool UI` be split into smaller, more focused modules?**
-  _Cohesion score 0.07469135802469136 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.075 - nodes in this community are weakly interconnected._
 - **Should `Document Model` be split into smaller, more focused modules?**
-  _Cohesion score 0.05765765765765766 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.0593607305936073 - nodes in this community are weakly interconnected._
+- **Should `Text Editing & Styling` be split into smaller, more focused modules?**
+  _Cohesion score 0.10631229235880399 - nodes in this community are weakly interconnected._

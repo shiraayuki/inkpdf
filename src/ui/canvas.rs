@@ -28,9 +28,6 @@ const TEXT_SIZE: f64 = 16.0;
 const MIN_BOX_WIDTH: f64 = 4.0;
 /// Squared pixel distance a press must move before it counts as a drag (not a click).
 const DRAG_THRESHOLD_SQ: f64 = 9.0;
-/// Pixel radius (independent of zoom) around a selected Latex box's
-/// bottom-right corner that starts a resize instead of a move.
-const RESIZE_HANDLE_HIT_PX: f64 = 10.0;
 const LATEX_MIN_SIZE: f64 = 4.0;
 const LATEX_MAX_SIZE: f64 = 300.0;
 // Canvas backdrop behind the pages, per theme (r, g, b).
@@ -288,13 +285,16 @@ struct DragState {
     kind: DragKind,
 }
 
-/// Whether an in-progress `dragging` lift is a move, or - for a Latex box's
-/// bottom-right handle - a resize that rescales `size`, anchored at the
-/// box's own top-left corner (its `x, y` fields never change).
+/// Whether an in-progress `dragging` lift is a move (plain left-click drag),
+/// or - a right-click drag started inside a Latex box - a resize that
+/// rescales `size`, anchored at the box's own top-left corner (its `x, y`
+/// fields never change). `start` is the page-point where the resize drag
+/// began, so distance-from-anchor growth/shrink works no matter where inside
+/// the box the drag started.
 #[derive(Clone, Copy)]
 enum DragKind {
     Move,
-    Resize { orig_dist: f64, orig_size: f64 },
+    Resize { start: (f64, f64), orig_dist: f64, orig_size: f64 },
 }
 
 const PEN_WIDTH: f64 = 3.0;
@@ -614,6 +614,25 @@ impl Canvas {
             drag.connect_drag_end(move |_, _, _| this.on_drag_end());
         }
         self.area.add_controller(drag);
+
+        // Right-click drag: resizes a Latex box instead of moving it. A
+        // separate gesture bound to the secondary button, so it never
+        // competes with the plain (left-click) move drag above; update/end
+        // are shared with it since both just react to `state.dragging`.
+        let resize_drag = gtk::GestureDrag::builder().button(gdk::BUTTON_SECONDARY).build();
+        {
+            let this = self.clone();
+            resize_drag.connect_drag_begin(move |_, x, y| this.on_resize_drag_begin(x, y));
+        }
+        {
+            let this = self.clone();
+            resize_drag.connect_drag_update(move |_, ox, oy| this.on_drag_update(ox, oy));
+        }
+        {
+            let this = self.clone();
+            resize_drag.connect_drag_end(move |_, _, _| this.on_drag_end());
+        }
+        self.area.add_controller(resize_drag);
 
         // Track which page is in view so the current-page frame follows scrolling.
         let this = self.clone();
@@ -1743,13 +1762,6 @@ impl Canvas {
             return;
         }
 
-        // A drag starting on a Latex box's bottom-right handle rescales it
-        // instead of moving it.
-        if let Some((page, index, orig_dist, orig_size)) = self.latex_resize_hit(x, y) {
-            self.begin_resize(page, index, orig_dist, orig_size);
-            return;
-        }
-
         // Otherwise a drag on any annotation (text, stroke, or shape) grabs it for moving.
         if let Some((page, index)) = self.annotation_hit(x, y) {
             let id = {
@@ -1828,11 +1840,11 @@ impl Canvas {
                     let (dx, dy) = clamp_translate(bx, by, bw, bh, offset_x / zoom, offset_y / zoom, pw, ph);
                     ds.annotation.kind = translate_annotation(&ds.orig, dx, dy);
                 }
-                DragKind::Resize { orig_dist, orig_size } => {
+                DragKind::Resize { start, orig_dist, orig_size } => {
                     if let AnnotationKind::Latex(l) = &ds.orig {
-                        let (bx, by, bw, bh) = annotation_bounds(&ds.orig);
-                        let (cx, cy) = (bx + bw, by + bh);
-                        let (nx, ny) = (cx + offset_x / zoom, cy + offset_y / zoom);
+                        let (bx, by, _, _) = annotation_bounds(&ds.orig);
+                        let (sx, sy) = start;
+                        let (nx, ny) = (sx + offset_x / zoom, sy + offset_y / zoom);
                         let new_dist = ((nx - bx).powi(2) + (ny - by).powi(2)).sqrt().max(1.0);
                         let mut l = l.clone();
                         l.size = (orig_size * (new_dist / orig_dist)).clamp(LATEX_MIN_SIZE, LATEX_MAX_SIZE);
@@ -1852,35 +1864,42 @@ impl Canvas {
         self.lift_annotation(page, index, DragKind::Move);
     }
 
-    /// Whether widget-space point `(x, y)` lands on the resize handle of the
-    /// currently-selected Latex box (only Latex boxes are resizable this way,
-    /// since their bounds are entirely derived from the font size). Doesn't
-    /// require the box to already be selected - a fresh press lands here
-    /// before `on_click` gets a chance to update `selected` (same as the
-    /// plain-move hit test below), so gating this on prior selection would
-    /// make it depend on click/drag firing order instead of just geometry.
-    /// Returns `(page, annotation index, distance from anchor to handle, current size)`.
-    fn latex_resize_hit(&self, x: f64, y: f64) -> Option<(usize, usize, f64, f64)> {
-        let (page, lx, ly) = self.page_hit(x, y)?;
-        let st = self.state.borrow();
-        let doc = st.doc.as_ref()?;
-        let radius = RESIZE_HANDLE_HIT_PX / st.zoom;
-        doc.pages.get(page)?.annotations.iter().enumerate().rev().find_map(|(index, annotation)| {
-            let AnnotationKind::Latex(l) = &annotation.kind else {
-                return None;
-            };
-            let (bx, by, bw, bh) = annotation_bounds(&annotation.kind);
-            let (cx, cy) = (bx + bw, by + bh);
-            if (lx - cx).powi(2) + (ly - cy).powi(2) > radius * radius {
-                return None;
-            }
-            let orig_dist = ((cx - bx).powi(2) + (cy - by).powi(2)).sqrt().max(1.0);
-            Some((page, index, orig_dist, l.size))
-        })
+    /// Entry point for the dedicated right-click drag gesture: starting
+    /// inside a Latex box and dragging away from its top-left corner grows
+    /// it, dragging back toward that corner shrinks it - from any starting
+    /// point inside the box, not just a corner handle. A separate button
+    /// from the plain move-drag means the two gestures never compete for the
+    /// same press.
+    fn on_resize_drag_begin(&self, x: f64, y: f64) {
+        if self.state.borrow().editing.is_some() || self.state.borrow().place_kind.is_some() {
+            return;
+        }
+        let Some((page, lx, ly)) = self.page_hit(x, y) else {
+            return;
+        };
+        let hit = {
+            let st = self.state.borrow();
+            st.doc.as_ref().and_then(|doc| doc.pages.get(page)).and_then(|p| {
+                p.annotations.iter().enumerate().rev().find_map(|(index, a)| {
+                    let AnnotationKind::Latex(l) = &a.kind else {
+                        return None;
+                    };
+                    let (bx, by, bw, bh) = annotation_bounds(&a.kind);
+                    if lx < bx || lx > bx + bw || ly < by || ly > by + bh {
+                        return None;
+                    }
+                    let orig_dist = ((lx - bx).powi(2) + (ly - by).powi(2)).sqrt().max(1.0);
+                    Some((index, orig_dist, l.size))
+                })
+            })
+        };
+        if let Some((index, orig_dist, orig_size)) = hit {
+            self.begin_resize(page, index, (lx, ly), orig_dist, orig_size);
+        }
     }
 
-    fn begin_resize(&self, page: usize, index: usize, orig_dist: f64, orig_size: f64) {
-        self.lift_annotation(page, index, DragKind::Resize { orig_dist, orig_size });
+    fn begin_resize(&self, page: usize, index: usize, start: (f64, f64), orig_dist: f64, orig_size: f64) {
+        self.lift_annotation(page, index, DragKind::Resize { start, orig_dist, orig_size });
     }
 
     /// Removes annotation `index` on `page` from the model into `dragging`

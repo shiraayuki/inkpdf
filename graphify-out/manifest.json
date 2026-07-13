@@ -25,8 +25,8 @@
     "semantic_hash": "7d9a75c9d4e38d2cfd996650e4027c11"
   },
   "src/ui/canvas.rs": {
-    "mtime": 1783971194.8818896,
-    "ast_hash": "aad762bca4e49e5bc712615fa5d93ca2",
+    "mtime": 1783971573.8620455,
+    "ast_hash": "bf6cb27f9fb87c6889c025cdea3b606e",
     "semantic_hash": ""
   },
   "src/ui/mod.rs": {
@@ -35,8 +35,8 @@
     "semantic_hash": ""
   },
   "src/ui/window.rs": {
-    "mtime": 1783970304.225617,
-    "ast_hash": "4328e6b308ce61315f85835d22471d3c",
+    "mtime": 1783971603.0958474,
+    "ast_hash": "cf8f1a709951eef596094ca4ab734f34",
     "semantic_hash": ""
   },
   "data/icons/hicolor/scalable/actions/inkpdf-ellipse-symbolic.svg": {
