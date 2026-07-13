@@ -1466,12 +1466,7 @@ impl Canvas {
         self.begin_edit_session();
         let removed = {
             let mut st = self.state.borrow_mut();
-            match st.doc.as_mut() {
-                Some(doc) if page < doc.pages.len() && index < doc.pages[page].annotations.len() => {
-                    Some(doc.pages[page].annotations.remove(index))
-                }
-                _ => None,
-            }
+            remove_annotation_at(&mut st.doc, page, index)
         };
         let Some(annotation) = removed else {
             return;
@@ -1880,6 +1875,13 @@ impl Canvas {
     /// from the plain move-drag means the two gestures never compete for the
     /// same press.
     fn on_resize_drag_begin(&self, x: f64, y: f64) {
+        // Same reachable states as the plain move-drag fallback below: not
+        // while a drawing/erasing/lasso tool owns the gesture, and not while
+        // editing or about to place a new box.
+        let tool = self.state.borrow().tool;
+        if matches!(tool, Tool::Pen | Tool::Shape | Tool::Eraser | Tool::Lasso) {
+            return;
+        }
         if self.state.borrow().editing.is_some() || self.state.borrow().place_kind.is_some() {
             return;
         }
@@ -1919,12 +1921,7 @@ impl Canvas {
         let mut st = self.state.borrow_mut();
         // Snapshot before lifting so the whole gesture is one undo entry.
         let snapshot = st.doc.as_ref().map(|d| d.pages.clone());
-        let removed = match st.doc.as_mut() {
-            Some(doc) if page < doc.pages.len() && index < doc.pages[page].annotations.len() => {
-                Some(doc.pages[page].annotations.remove(index))
-            }
-            _ => None,
-        };
+        let removed = remove_annotation_at(&mut st.doc, page, index);
         if let Some(annotation) = removed {
             if let Some(snapshot) = snapshot {
                 st.history.record(snapshot);
@@ -3180,6 +3177,15 @@ enum MathToken {
     Sqrt(Vec<MathToken>),
 }
 
+/// Hard cap on math nesting depth (fractions/sup/sub/sqrt each recurse back
+/// into the parser for their argument). Without this, a pathological input
+/// like `\frac{\frac{\frac{...}}}` - typed live, pasted, or loaded from a
+/// `.inkpdf` - would recurse arbitrarily deep and can blow the stack, which
+/// hard-aborts the process (unlike a normal error, there's no dialog that
+/// can catch it). Past this depth we just stop parsing structure and show
+/// the rest as literal text, same fallback already used for unknown commands.
+const MAX_MATH_NESTING: usize = 32;
+
 /// Best-effort LaTeX math subset: recognizes `\frac{a}{b}`, `\sqrt{x}`,
 /// `^sup`/`^{sup}`, `_sub`/`_{sub}` (all of which may themselves nest -
 /// `{...}` groups are brace-balanced and recursively parsed), and a small
@@ -3187,6 +3193,13 @@ enum MathToken {
 /// NOT a full TeX engine, and anything unrecognized falls back to being
 /// shown as plain (italic) text rather than failing.
 fn parse_math(expr: &str) -> Vec<MathToken> {
+    parse_math_depth(expr, 0)
+}
+
+fn parse_math_depth(expr: &str, depth: usize) -> Vec<MathToken> {
+    if depth >= MAX_MATH_NESTING {
+        return vec![MathToken::Text(expr.to_string())];
+    }
     let chars: Vec<char> = expr.chars().collect();
     let mut i = 0usize;
     let mut plain = String::new();
@@ -3241,12 +3254,12 @@ fn parse_math(expr: &str) -> Vec<MathToken> {
                 let cmd: String = chars[start..i].iter().collect();
                 if cmd == "frac" {
                     flush(&mut plain, &mut tokens);
-                    let a = parse_math(&read_group(&chars, &mut i));
-                    let b = parse_math(&read_group(&chars, &mut i));
+                    let a = parse_math_depth(&read_group(&chars, &mut i), depth + 1);
+                    let b = parse_math_depth(&read_group(&chars, &mut i), depth + 1);
                     tokens.push(MathToken::Frac(a, b));
                 } else if cmd == "sqrt" {
                     flush(&mut plain, &mut tokens);
-                    tokens.push(MathToken::Sqrt(parse_math(&read_group(&chars, &mut i))));
+                    tokens.push(MathToken::Sqrt(parse_math_depth(&read_group(&chars, &mut i), depth + 1)));
                 } else if let Some(sym) = math_symbol(&cmd) {
                     plain.push_str(sym);
                 } else if !cmd.is_empty() {
@@ -3261,12 +3274,12 @@ fn parse_math(expr: &str) -> Vec<MathToken> {
             '^' => {
                 i += 1;
                 flush(&mut plain, &mut tokens);
-                tokens.push(MathToken::Sup(parse_math(&read_group(&chars, &mut i))));
+                tokens.push(MathToken::Sup(parse_math_depth(&read_group(&chars, &mut i), depth + 1)));
             }
             '_' => {
                 i += 1;
                 flush(&mut plain, &mut tokens);
-                tokens.push(MathToken::Sub(parse_math(&read_group(&chars, &mut i))));
+                tokens.push(MathToken::Sub(parse_math_depth(&read_group(&chars, &mut i), depth + 1)));
             }
             c => {
                 plain.push(c);
@@ -3553,6 +3566,17 @@ fn draw_annotation(c: &cairo::Context, kind: &AnnotationKind) {
         AnnotationKind::Latex(l) => {
             let _ = layout_and_draw_latex(c, l.x, l.y, l.size, &l.source, true);
         }
+    }
+}
+
+/// Removes and returns the annotation at `(page, index)`, or `None` if either
+/// index is out of range (or there's no open document).
+fn remove_annotation_at(doc: &mut Option<Document>, page: usize, index: usize) -> Option<Annotation> {
+    match doc.as_mut() {
+        Some(doc) if page < doc.pages.len() && index < doc.pages[page].annotations.len() => {
+            Some(doc.pages[page].annotations.remove(index))
+        }
+        _ => None,
     }
 }
 
@@ -4420,7 +4444,7 @@ mod tests {
         std::fs::remove_file(&path).ok();
         assert!(!bytes.is_empty(), "exported PDF should not be empty");
 
-        let pdf = PdfDocument::from_bytes(bytes).expect("exported bytes should be a valid PDF");
+        let pdf = PdfDocument::from_bytes(bytes.into()).expect("exported bytes should be a valid PDF");
         assert_eq!(pdf.n_pages(), 2, "one PDF page per document page");
         let (w, h) = pdf.page_size(0);
         assert!((w - A4.0).abs() < 0.5 && (h - A4.1).abs() < 0.5, "page size should match the document page");
@@ -4533,6 +4557,21 @@ mod tests {
         // tokens[0] is the plain "x" before the "^"; tokens[1] is the superscript.
         let MathToken::Sup(inner) = &tokens[1] else { unreachable!() };
         assert!(matches!(inner[1], MathToken::Sup(_)), "nested superscript should parse as Sup, got {inner:?}");
+    }
+
+    #[test]
+    fn parse_math_caps_pathological_nesting_instead_of_recursing_forever() {
+        // 500 nested \frac{...} would blow the stack without a depth cap.
+        let mut expr = "x".to_string();
+        for _ in 0..500 {
+            expr = format!("\\frac{{{expr}}}{{y}}");
+        }
+        // Must return without crashing; the exact fallback shape isn't the point.
+        let tokens = parse_math(&expr);
+        assert!(!tokens.is_empty());
+
+        // Rendering (which recurses over the parsed tree) must also survive.
+        with_scratch(|c| render_math_tokens(c, &tokens, 0.0, 0.0, 16.0, false), (0.0, 0.0, 0.0));
     }
 
     #[test]

@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 use gtk::cairo;
 use gtk::glib;
@@ -10,7 +12,10 @@ pub struct PdfDocument {
 }
 
 impl PdfDocument {
-    pub fn from_bytes(data: Vec<u8>) -> Result<Self> {
+    /// Takes `Arc<[u8]>` (not `Vec<u8>`) so the caller can share the same
+    /// buffer with `PdfSource.bytes` instead of duplicating it - this is the
+    /// only copy of the PDF bytes that poppler holds onto.
+    pub fn from_bytes(data: Arc<[u8]>) -> Result<Self> {
         let bytes = glib::Bytes::from_owned(data);
         let doc = Document::from_bytes(&bytes, None)
             .map_err(|e| anyhow::anyhow!("could not open PDF: {e}"))?;
@@ -32,8 +37,9 @@ impl PdfDocument {
         self.page_sizes.len()
     }
 
+    /// Falls back to A4 for an out-of-range index rather than panicking.
     pub fn page_size(&self, index: usize) -> (f64, f64) {
-        self.page_sizes[index]
+        page_size_or_a4(&self.page_sizes, index)
     }
 
     /// Renders a page onto `ctx`; the caller sets the zoom via the context's transform.
@@ -42,6 +48,10 @@ impl PdfDocument {
             page.render(ctx);
         }
     }
+}
+
+fn page_size_or_a4(sizes: &[(f64, f64)], index: usize) -> (f64, f64) {
+    sizes.get(index).copied().unwrap_or((595.0, 842.0))
 }
 
 #[cfg(test)]
@@ -56,7 +66,7 @@ mod tests {
         };
 
         let data = std::fs::read(&path).expect("read pdf");
-        let pdf = PdfDocument::from_bytes(data).expect("PDF should load");
+        let pdf = PdfDocument::from_bytes(data.into()).expect("PDF should load");
         assert!(pdf.n_pages() > 0);
 
         let (w, h) = pdf.page_size(0);
@@ -73,5 +83,11 @@ mod tests {
         let data = surface.data().expect("surface data readable");
         let non_white = data.iter().filter(|&&b| b != 0xFF).count();
         assert!(non_white > 0, "rendered page is blank");
+    }
+
+    #[test]
+    fn page_size_falls_back_instead_of_panicking_on_out_of_range_index() {
+        assert_eq!(page_size_or_a4(&[(100.0, 200.0)], 5), (595.0, 842.0));
+        assert_eq!(page_size_or_a4(&[(100.0, 200.0)], 0), (100.0, 200.0));
     }
 }

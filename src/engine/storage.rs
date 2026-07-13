@@ -19,11 +19,23 @@ pub fn save(doc: &Document, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Refuses to decompress more than this many bytes, so a small malicious
+/// `.inkpdf` (a "gzip bomb") can't exhaust memory before we even get to
+/// parsing it.
+const MAX_DECOMPRESSED_BYTES: u64 = 1024 * 1024 * 1024;
+
 pub fn load(path: &Path) -> Result<Document> {
+    load_capped(path, MAX_DECOMPRESSED_BYTES)
+}
+
+fn load_capped(path: &Path, max_bytes: u64) -> Result<Document> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let mut decoder = GzDecoder::new(BufReader::new(file));
+    let decoder = GzDecoder::new(BufReader::new(file));
     let mut json = Vec::new();
-    decoder.read_to_end(&mut json).context("decompressing document")?;
+    decoder.take(max_bytes + 1).read_to_end(&mut json).context("decompressing document")?;
+    if json.len() as u64 > max_bytes {
+        anyhow::bail!("document exceeds the maximum decompressed size ({max_bytes} bytes)");
+    }
     serde_json::from_slice(&json).context("parsing document")
 }
 
@@ -37,7 +49,7 @@ mod tests {
         Document {
             source: Some(PdfSource {
                 name: "sample.pdf".into(),
-                bytes: vec![0x25, 0x50, 0x44, 0x46, 0x2d, 1, 2, 3, 4, 5],
+                bytes: vec![0x25, 0x50, 0x44, 0x46, 0x2d, 1, 2, 3, 4, 5].into(),
             }),
             pages: vec![
                 Page {
@@ -94,5 +106,29 @@ mod tests {
         let result = load(&path);
         std::fs::remove_file(&path).ok();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_capped_rejects_a_gzip_bomb() {
+        // Small on disk, but decompresses to far more than a tiny cap allows.
+        let path = temp_path();
+        let file = File::create(&path).unwrap();
+        let mut encoder = GzEncoder::new(BufWriter::new(file), Compression::default());
+        encoder.write_all(&vec![0u8; 10_000]).unwrap();
+        encoder.finish().unwrap();
+
+        let result = load_capped(&path, 100);
+        std::fs::remove_file(&path).ok();
+        assert!(result.is_err(), "decompressing past the cap should error out, not allocate unbounded memory");
+    }
+
+    #[test]
+    fn load_capped_accepts_documents_within_the_cap() {
+        let doc = sample();
+        let path = temp_path();
+        save(&doc, &path).unwrap();
+        let loaded = load_capped(&path, MAX_DECOMPRESSED_BYTES);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(doc, loaded.unwrap());
     }
 }

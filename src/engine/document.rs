@@ -196,10 +196,12 @@ pub struct Page {
 }
 
 /// The imported PDF, embedded so a saved document stays self-contained.
+/// `bytes` is `Arc`-shared with the runtime poppler handle (`PdfDocument`)
+/// rather than duplicated, since both need their own owner of the same data.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct PdfSource {
     pub name: String,
-    pub bytes: Vec<u8>,
+    pub bytes: std::sync::Arc<[u8]>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

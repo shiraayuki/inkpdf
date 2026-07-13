@@ -5,6 +5,7 @@ pub mod pdf;
 pub mod storage;
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Result;
 
@@ -27,6 +28,7 @@ impl OpenDocument {
     }
 
     pub fn from_pdf_bytes(name: String, data: Vec<u8>) -> Result<Self> {
+        let data: Arc<[u8]> = Arc::from(data);
         let pdf = PdfDocument::from_bytes(data.clone())?;
         let pages = (0..pdf.n_pages())
             .map(|i| {
@@ -47,6 +49,7 @@ impl OpenDocument {
     pub fn from_inkpdf_path(path: &Path) -> Result<Self> {
         let model = storage::load(path)?;
         let pdf = match &model.source {
+            // Cheap Arc clone (refcount bump), not a duplicate of the bytes.
             Some(src) => Some(PdfDocument::from_bytes(src.bytes.clone())?),
             None => None,
         };
