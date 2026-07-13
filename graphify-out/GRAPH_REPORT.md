@@ -1,16 +1,16 @@
 # Graph Report - inkpdf  (2026-07-13)
 
 ## Corpus Check
-- 10 files · ~29,160 words
+- 10 files · ~29,147 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 482 nodes · 1420 edges · 19 communities (12 shown, 7 thin omitted)
+- 482 nodes · 1419 edges · 19 communities (12 shown, 7 thin omitted)
 - Extraction: 100% EXTRACTED · 0% INFERRED · 0% AMBIGUOUS · INFERRED: 4 edges (avg confidence: 0.8)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `ac8ec8b5`
+- Built from commit: `f39a5d16`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -119,6 +119,6 @@ _Questions this graph is uniquely positioned to answer:_
 - **Should `.record_change` be split into smaller, more focused modules?**
   _Cohesion score 0.0989247311827957 - nodes in this community are weakly interconnected._
 - **Should `Window & Tool UI` be split into smaller, more focused modules?**
-  _Cohesion score 0.07721518987341772 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.07689873417721518 - nodes in this community are weakly interconnected._
 - **Should `Document Model` be split into smaller, more focused modules?**
   _Cohesion score 0.06252587991718427 - nodes in this community are weakly interconnected._
