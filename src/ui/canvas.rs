@@ -449,12 +449,6 @@ struct State {
     lasso_start: Option<(usize, f64, f64)>,
     /// The in-progress Lasso gesture, once the drag has exceeded the threshold.
     lasso_op: Option<LassoOp>,
-    /// Set once a Lasso press is promoted into a real marquee/group-move (see
-    /// `start_lasso_op`). The click gesture fires for the same press/release
-    /// regardless of whether a drag happened; `on_click`'s Lasso branch checks
-    /// this so it doesn't clobber what the drag already did (e.g. collapsing a
-    /// just-moved multi-selection back down to whatever's under the cursor).
-    lasso_was_drag: bool,
 }
 
 /// Where an insert/delete acts relative to the current page.
@@ -541,7 +535,6 @@ impl Canvas {
             lasso_press: None,
             lasso_start: None,
             lasso_op: None,
-            lasso_was_drag: false,
         }));
 
         {
@@ -1256,13 +1249,18 @@ impl Canvas {
         }
 
         // Lasso: a plain click (no real drag) either selects just the one
-        // annotation under it, or deselects. The click gesture fires for the
-        // same press/release a drag does, so if the drag already turned into
-        // a real marquee/group-move (lasso_was_drag), leave what it did alone.
+        // annotation under it, or deselects.
         if self.state.borrow().tool == Tool::Lasso {
             self.commit_editing();
-            let was_drag = std::mem::take(&mut self.state.borrow_mut().lasso_was_drag);
-            if was_drag {
+            // The click gesture fires on *press*, before a drag gets any
+            // chance to move (and so before it's known whether this press
+            // will become a group move) - so if it landed inside the current
+            // multi-selection, leave that selection alone here and let the
+            // drag handlers (which see the same press) decide: either they
+            // turn it into a group move, or nothing moves and the selection
+            // stays as it was.
+            let in_selection = self.page_hit(x, y).is_some_and(|(page, lx, ly)| self.point_in_lasso_selection(page, lx, ly));
+            if in_selection {
                 return;
             }
             let hit = self.annotation_hit(x, y);
@@ -1744,7 +1742,6 @@ impl Canvas {
         let hit = self.page_hit(x, y);
         let mut st = self.state.borrow_mut();
         st.lasso_op = None;
-        st.lasso_was_drag = false;
         st.lasso_press = Some((x, y));
         st.lasso_start = hit;
     }
@@ -1755,36 +1752,42 @@ impl Canvas {
         let Some((page, lx, ly)) = self.state.borrow().lasso_start else {
             return;
         };
-        self.state.borrow_mut().lasso_was_drag = true;
         // A press anywhere inside the current selection's combined bounding box
         // starts a group move - not just a press on one specific item's own
         // (possibly thin/small) bounds, which made moving a multi-selection
         // together nearly impossible in practice.
-        let starts_in_selection = {
-            let st = self.state.borrow();
-            st.lasso_selected.as_ref().is_some_and(|(sel_page, ids)| {
-                if *sel_page != page {
-                    return false;
-                }
-                let Some(kinds) = st.doc.as_ref().and_then(|d| d.pages.get(page)).map(|p| {
-                    p.annotations.iter().filter(|a| ids.contains(&a.id)).map(|a| a.kind.clone()).collect::<Vec<_>>()
-                }) else {
-                    return false;
-                };
-                if kinds.is_empty() {
-                    return false;
-                }
-                let (bx, by, bw, bh) = union_bounds(&kinds);
-                lx >= bx && lx <= bx + bw && ly >= by && ly <= by + bh
-            })
-        };
-        if starts_in_selection {
+        if self.point_in_lasso_selection(page, lx, ly) {
             self.lift_lasso_group(page);
         } else {
             let mut st = self.state.borrow_mut();
             st.lasso_selected = None;
             st.lasso_op = Some(LassoOp::Marquee { page, start: (lx, ly), current: (lx, ly) });
         }
+    }
+
+    /// Whether a page-local point falls within the union bounding box of the
+    /// current Lasso multi-selection. Shared by `start_lasso_op` (does a press
+    /// start a group move?) and `on_click` (a plain click landing here must
+    /// not collapse the selection - the click gesture fires on *press*,
+    /// before a drag can distinguish itself from a click, so this is the only
+    /// way to tell "might become a group drag" from "picked something else").
+    fn point_in_lasso_selection(&self, page: usize, lx: f64, ly: f64) -> bool {
+        let st = self.state.borrow();
+        st.lasso_selected.as_ref().is_some_and(|(sel_page, ids)| {
+            if *sel_page != page {
+                return false;
+            }
+            let Some(kinds) = st.doc.as_ref().and_then(|d| d.pages.get(page)).map(|p| {
+                p.annotations.iter().filter(|a| ids.contains(&a.id)).map(|a| a.kind.clone()).collect::<Vec<_>>()
+            }) else {
+                return false;
+            };
+            if kinds.is_empty() {
+                return false;
+            }
+            let (bx, by, bw, bh) = union_bounds(&kinds);
+            lx >= bx && lx <= bx + bw && ly >= by && ly <= by + bh
+        })
     }
 
     /// Lifts every currently lasso-selected annotation on `page` out of the
@@ -1967,30 +1970,6 @@ impl Canvas {
         st.cache.remove(&page);
         drop(st);
         self.area.queue_draw();
-    }
-
-    /// Bulk-recolors the Stroke/Shape members of the current Lasso selection.
-    pub fn set_lasso_color(&self, color: Color) {
-        self.apply_to_lasso_if(
-            |k| matches!(k, AnnotationKind::Stroke(_) | AnnotationKind::Shape(_)),
-            move |k| match k {
-                AnnotationKind::Stroke(s) => s.color = color,
-                AnnotationKind::Shape(s) => s.color = color,
-                AnnotationKind::Text(_) | AnnotationKind::Markdown(_) => {}
-            },
-        );
-    }
-
-    /// Bulk-resizes the Stroke/Shape members of the current Lasso selection.
-    pub fn set_lasso_width(&self, width: f64) {
-        self.apply_to_lasso_if(
-            |k| matches!(k, AnnotationKind::Stroke(_) | AnnotationKind::Shape(_)),
-            move |k| match k {
-                AnnotationKind::Stroke(s) => s.width = width,
-                AnnotationKind::Shape(s) => s.width = width,
-                AnnotationKind::Text(_) | AnnotationKind::Markdown(_) => {}
-            },
-        );
     }
 
     /// Bulk-changes the shape kind of the Shape members of the current Lasso selection.

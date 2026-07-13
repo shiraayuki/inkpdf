@@ -1256,19 +1256,6 @@ fn page_lasso(canvas: &Canvas) -> gtk::Box {
         button.connect_clicked(move |_| canvas.set_lasso_shape_kind(kind));
         page.append(&button);
     }
-
-    page.append(&hsep());
-    let color = color_button();
-    {
-        let canvas = canvas.clone();
-        color.connect_rgba_notify(move |btn| canvas.set_lasso_color(color_from_rgba(&btn.rgba())));
-    }
-    page.append(&color);
-
-    {
-        let canvas = canvas.clone();
-        page.append(&size_stepper(3.0, 0.5, 20.0, 0.5, 1, move |v| canvas.set_lasso_width(v)));
-    }
     page
 }
 
