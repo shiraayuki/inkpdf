@@ -246,12 +246,13 @@ impl TextEdit {
     }
 }
 
-/// A text annotation lifted out of the model while being dragged.
+/// An annotation lifted out of the model while being dragged (any kind).
+/// `orig` is the untranslated snapshot taken at drag start, so each frame's
+/// position is `translate(orig, clamped total offset)` - never accumulated.
 struct DragState {
     page: usize,
     annotation: Annotation,
-    orig_x: f64,
-    orig_y: f64,
+    orig: AnnotationKind,
 }
 
 const PEN_WIDTH: f64 = 3.0;
@@ -375,12 +376,12 @@ struct State {
     editing: Option<TextEdit>,
     /// Page nearest the viewport center; gets the accent frame and anchors insert/delete.
     current: usize,
-    /// Candidate for a box drag: (page, annotation index, orig x, orig y).
-    drag_start: Option<(usize, usize, f64, f64)>,
+    /// Candidate for a box drag: (page, annotation index).
+    drag_start: Option<(usize, usize)>,
     dragging: Option<DragState>,
     /// Widget-space start point while drag-selecting text inside the edited box.
     text_drag: Option<(f64, f64)>,
-    /// Currently selected text box (page, annotation id) in move/select mode.
+    /// Currently selected annotation (page, id) in move/select mode.
     selected: Option<(usize, Uuid)>,
     /// Font size for new text boxes (and the one being edited).
     text_size: f64,
@@ -678,8 +679,46 @@ impl Canvas {
         self.state.borrow().text_size
     }
 
+    /// If the current selection's kind matches `applies_to`, applies `f` to it
+    /// (one undo entry). No-op otherwise - used so a color/width/kind control
+    /// also restyles the current stroke/shape selection, not just future ones.
+    fn apply_to_selected_if(&self, applies_to: fn(&AnnotationKind) -> bool, f: impl FnOnce(&mut AnnotationKind)) {
+        let Some((page, id)) = self.state.borrow().selected else {
+            return;
+        };
+        let applies = self
+            .state
+            .borrow()
+            .doc
+            .as_ref()
+            .and_then(|d| d.pages.get(page))
+            .and_then(|p| p.annotations.iter().find(|a| a.id == id))
+            .is_some_and(|a| applies_to(&a.kind));
+        if !applies {
+            return;
+        }
+        self.record_change();
+        let mut st = self.state.borrow_mut();
+        if let Some(annotation) =
+            st.doc.as_mut().and_then(|d| d.pages.get_mut(page)).and_then(|p| p.annotations.iter_mut().find(|a| a.id == id))
+        {
+            f(&mut annotation.kind);
+        }
+        st.cache.remove(&page);
+        drop(st);
+        self.area.queue_draw();
+    }
+
     pub fn set_pen_color(&self, color: Color) {
         self.state.borrow_mut().pen_color = color;
+        self.apply_to_selected_if(
+            |k| matches!(k, AnnotationKind::Stroke(_)),
+            move |k| {
+                if let AnnotationKind::Stroke(s) = k {
+                    s.color = color;
+                }
+            },
+        );
     }
 
     pub fn pen_color(&self) -> Color {
@@ -688,6 +727,14 @@ impl Canvas {
 
     pub fn set_pen_width(&self, width: f64) {
         self.state.borrow_mut().pen_width = width;
+        self.apply_to_selected_if(
+            |k| matches!(k, AnnotationKind::Stroke(_)),
+            move |k| {
+                if let AnnotationKind::Stroke(s) = k {
+                    s.width = width;
+                }
+            },
+        );
     }
 
     pub fn pen_width(&self) -> f64 {
@@ -696,6 +743,14 @@ impl Canvas {
 
     pub fn set_shape_kind(&self, kind: ShapeKind) {
         self.state.borrow_mut().shape_kind = kind;
+        self.apply_to_selected_if(
+            |k| matches!(k, AnnotationKind::Shape(_)),
+            move |k| {
+                if let AnnotationKind::Shape(s) = k {
+                    s.shape = kind;
+                }
+            },
+        );
     }
 
     pub fn shape_kind(&self) -> ShapeKind {
@@ -704,6 +759,14 @@ impl Canvas {
 
     pub fn set_shape_color(&self, color: Color) {
         self.state.borrow_mut().shape_color = color;
+        self.apply_to_selected_if(
+            |k| matches!(k, AnnotationKind::Shape(_)),
+            move |k| {
+                if let AnnotationKind::Shape(s) = k {
+                    s.color = color;
+                }
+            },
+        );
     }
 
     pub fn shape_color(&self) -> Color {
@@ -712,6 +775,14 @@ impl Canvas {
 
     pub fn set_shape_width(&self, width: f64) {
         self.state.borrow_mut().shape_width = width;
+        self.apply_to_selected_if(
+            |k| matches!(k, AnnotationKind::Shape(_)),
+            move |k| {
+                if let AnnotationKind::Shape(s) = k {
+                    s.width = width;
+                }
+            },
+        );
     }
 
     pub fn shape_width(&self) -> f64 {
@@ -1442,22 +1513,19 @@ impl Canvas {
             return;
         }
 
-        // Otherwise a drag on a box grabs it for moving.
+        // Otherwise a drag on any annotation (text, stroke, or shape) grabs it for moving.
         if let Some((page, index)) = self.annotation_hit(x, y) {
-            let info = {
+            let id = {
                 let st = self.state.borrow();
                 st.doc
                     .as_ref()
                     .and_then(|d| d.pages.get(page))
                     .and_then(|p| p.annotations.get(index))
-                    .and_then(|a| match &a.kind {
-                        AnnotationKind::Text(t) => Some((t.x, t.y, a.id)),
-                        _ => None,
-                    })
+                    .map(|a| a.id)
             };
-            if let Some((ox, oy, id)) = info {
+            if let Some(id) = id {
                 let mut st = self.state.borrow_mut();
-                st.drag_start = Some((page, index, ox, oy));
+                st.drag_start = Some((page, index));
                 st.selected = Some((page, id));
                 drop(st);
                 self.area.queue_draw();
@@ -1508,12 +1576,12 @@ impl Canvas {
                 .and_then(|d| d.pages.get(ds.page))
                 .map(|p| (p.width, p.height))
                 .unwrap_or(A4);
-            if let AnnotationKind::Text(t) = &mut ds.annotation.kind {
-                // Keep the whole box on the page so it can't slip behind it.
-                let (bw, bh) = measure_glyphs(t.size, &ann_glyphs(t));
-                t.x = (ds.orig_x + offset_x / zoom).clamp(0.0, (pw - bw).max(0.0));
-                t.y = (ds.orig_y + offset_y / zoom).clamp(0.0, (ph - bh).max(0.0));
-            }
+            // Keep the whole box on the page so it can't slip behind it. Always
+            // translates from `orig` (the pre-drag snapshot) so repeated clamping
+            // never accumulates drift.
+            let (bx, by, bw, bh) = annotation_bounds(&ds.orig);
+            let (dx, dy) = clamp_translate(bx, by, bw, bh, offset_x / zoom, offset_y / zoom, pw, ph);
+            ds.annotation.kind = translate_annotation(&ds.orig, dx, dy);
             drop(st);
             self.area.queue_draw();
         }
@@ -1521,7 +1589,7 @@ impl Canvas {
 
     fn lift_for_drag(&self) {
         let mut st = self.state.borrow_mut();
-        let Some((page, index, ox, oy)) = st.drag_start else {
+        let Some((page, index)) = st.drag_start else {
             return;
         };
         // Snapshot before lifting so the whole move is one undo entry.
@@ -1537,7 +1605,8 @@ impl Canvas {
                 st.history.record(snapshot);
             }
             st.cache.remove(&page);
-            st.dragging = Some(DragState { page, annotation, orig_x: ox, orig_y: oy });
+            let orig = annotation.kind.clone();
+            st.dragging = Some(DragState { page, annotation, orig });
         }
         st.drag_start = None;
     }
@@ -2152,6 +2221,73 @@ fn draw_annotation(c: &cairo::Context, kind: &AnnotationKind) {
     }
 }
 
+/// Bounding box (x, y, w, h) of an annotation in page-point space, regardless
+/// of kind - used for selection frames and to clamp/anchor moves.
+fn annotation_bounds(kind: &AnnotationKind) -> (f64, f64, f64, f64) {
+    match kind {
+        AnnotationKind::Text(t) => {
+            let (w, h) = measure_glyphs(t.size, &ann_glyphs(t));
+            (t.x, t.y, w, h)
+        }
+        AnnotationKind::Stroke(s) => bounds_of_points(&s.points),
+        AnnotationKind::Shape(s) => {
+            (s.x0.min(s.x1), s.y0.min(s.y1), (s.x1 - s.x0).abs(), (s.y1 - s.y0).abs())
+        }
+    }
+}
+
+fn bounds_of_points(points: &[(f64, f64)]) -> (f64, f64, f64, f64) {
+    let Some(&(fx, fy)) = points.first() else {
+        return (0.0, 0.0, 0.0, 0.0);
+    };
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (fx, fy, fx, fy);
+    for &(x, y) in &points[1..] {
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+    }
+    (min_x, min_y, max_x - min_x, max_y - min_y)
+}
+
+/// Returns a copy of `kind` translated by `(dx, dy)` in page points.
+fn translate_annotation(kind: &AnnotationKind, dx: f64, dy: f64) -> AnnotationKind {
+    match kind {
+        AnnotationKind::Text(t) => {
+            let mut t = t.clone();
+            t.x += dx;
+            t.y += dy;
+            AnnotationKind::Text(t)
+        }
+        AnnotationKind::Stroke(s) => {
+            let mut s = s.clone();
+            for p in &mut s.points {
+                p.0 += dx;
+                p.1 += dy;
+            }
+            AnnotationKind::Stroke(s)
+        }
+        AnnotationKind::Shape(s) => {
+            let mut s = s.clone();
+            s.x0 += dx;
+            s.x1 += dx;
+            s.y0 += dy;
+            s.y1 += dy;
+            AnnotationKind::Shape(s)
+        }
+    }
+}
+
+/// Clamps a proposed translation `(dx, dy)` so a box `(bx, by, bw, bh)` stays
+/// within `[0, pw] x [0, ph]`.
+fn clamp_translate(bx: f64, by: f64, bw: f64, bh: f64, dx: f64, dy: f64, pw: f64, ph: f64) -> (f64, f64) {
+    let min_dx = -bx;
+    let max_dx = (pw - bw - bx).max(min_dx);
+    let min_dy = -by;
+    let max_dy = (ph - bh - by).max(min_dy);
+    (dx.clamp(min_dx, max_dx), dy.clamp(min_dy, max_dy))
+}
+
 /// Draws a freehand stroke as a Catmull-Rom spline through the sampled points
 /// (rendered as cubic Béziers), so it looks smooth instead of polygonal.
 /// A single point renders as a dot.
@@ -2363,10 +2499,9 @@ fn draw_overlay(c: &cairo::Context, page: &Page, index: usize, zoom: f64, overla
     if let Some((sel_page, id)) = overlay.selected
         && sel_page == index
         && let Some(annotation) = page.annotations.iter().find(|a| a.id == id)
-        && let AnnotationKind::Text(t) = &annotation.kind
     {
-        let (w, h) = measure_glyphs(t.size, &ann_glyphs(t));
-        stroke_selection_handles(c, t.x, t.y, w, h, zoom);
+        let (x, y, w, h) = annotation_bounds(&annotation.kind);
+        stroke_selection_handles(c, x, y, w, h, zoom);
     }
 
     if let Some(ed) = overlay.editing
@@ -2399,11 +2534,10 @@ fn draw_overlay(c: &cairo::Context, page: &Page, index: usize, zoom: f64, overla
 
     if let Some(ds) = overlay.dragging
         && ds.page == index
-        && let AnnotationKind::Text(t) = &ds.annotation.kind
     {
-        draw_glyphs(c, t.x, t.y, t.size, &ann_glyphs(t));
-        let (w, h) = measure_glyphs(t.size, &ann_glyphs(t));
-        stroke_box(c, t.x, t.y, w, h, zoom, BOX_ACTIVE);
+        draw_annotation(c, &ds.annotation.kind);
+        let (x, y, w, h) = annotation_bounds(&ds.annotation.kind);
+        stroke_box(c, x, y, w, h, zoom, BOX_ACTIVE);
     }
 
     // Live preview of the in-progress pen stroke or shape.
@@ -2768,6 +2902,69 @@ mod tests {
         assert!(dist_point_segment(1.0, 0.0, a, b) < 1e-9); // on segment
         assert!((dist_point_segment(1.0, 3.0, a, b) - 3.0).abs() < 1e-9); // perpendicular
         assert!((dist_point_segment(5.0, 0.0, a, b) - 3.0).abs() < 1e-9); // past end -> endpoint
+    }
+
+    #[test]
+    fn annotation_bounds_covers_all_kinds() {
+        let stroke = AnnotationKind::Stroke(StrokeAnnotation {
+            points: vec![(2.0, 5.0), (8.0, 1.0), (4.0, 9.0)],
+            color: Color::BLACK,
+            width: 2.0,
+        });
+        assert_eq!(annotation_bounds(&stroke), (2.0, 1.0, 6.0, 8.0));
+
+        // Reversed corners (x1 < x0, y1 < y0) still normalize to a positive box.
+        let shape = AnnotationKind::Shape(ShapeAnnotation {
+            shape: ShapeKind::Rectangle,
+            x0: 10.0,
+            y0: 10.0,
+            x1: 3.0,
+            y1: 4.0,
+            color: Color::BLACK,
+            width: 1.0,
+        });
+        assert_eq!(annotation_bounds(&shape), (3.0, 4.0, 7.0, 6.0));
+
+        let text = AnnotationKind::Text(TextAnnotation { x: 5.0, y: 7.0, size: 16.0, runs: vec![] });
+        let (x, y, _, _) = annotation_bounds(&text);
+        assert_eq!((x, y), (5.0, 7.0));
+    }
+
+    #[test]
+    fn translate_annotation_shifts_every_kind() {
+        let stroke = AnnotationKind::Stroke(StrokeAnnotation {
+            points: vec![(1.0, 1.0), (2.0, 2.0)],
+            color: Color::BLACK,
+            width: 2.0,
+        });
+        let AnnotationKind::Stroke(s) = translate_annotation(&stroke, 10.0, -1.0) else {
+            unreachable!()
+        };
+        assert_eq!(s.points, vec![(11.0, 0.0), (12.0, 1.0)]);
+
+        let shape = AnnotationKind::Shape(ShapeAnnotation {
+            shape: ShapeKind::Line,
+            x0: 0.0,
+            y0: 0.0,
+            x1: 5.0,
+            y1: 5.0,
+            color: Color::BLACK,
+            width: 1.0,
+        });
+        let AnnotationKind::Shape(s) = translate_annotation(&shape, 2.0, 3.0) else {
+            unreachable!()
+        };
+        assert_eq!((s.x0, s.y0, s.x1, s.y1), (2.0, 3.0, 7.0, 8.0));
+    }
+
+    #[test]
+    fn clamp_translate_keeps_box_on_page() {
+        // Box at (70, 70) sized 20x20 on a 100x100 page: 10pt of headroom right/down.
+        let (dx, dy) = clamp_translate(70.0, 70.0, 20.0, 20.0, 50.0, 50.0, 100.0, 100.0);
+        assert_eq!((dx, dy), (10.0, 10.0));
+        // Moving far left/up clamps to exactly reach the page's left/top edge.
+        let (dx, dy) = clamp_translate(70.0, 70.0, 20.0, 20.0, -200.0, -200.0, 100.0, 100.0);
+        assert_eq!((dx, dy), (-70.0, -70.0));
     }
 
     #[test]
