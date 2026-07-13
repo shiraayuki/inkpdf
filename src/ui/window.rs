@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -6,7 +6,7 @@ use adw::prelude::*;
 use gtk::{gdk, gio};
 
 use crate::engine::OpenDocument;
-use crate::engine::document::{Color, FILE_EXTENSION, ShapeKind};
+use crate::engine::document::{A4, Color, Document, FILE_EXTENSION, ShapeKind};
 use crate::engine::storage;
 use crate::ui::canvas::{Canvas, Relative, Tool};
 
@@ -21,8 +21,10 @@ const PAGE_SIZE_STEP: f64 = 10.0;
 pub struct WindowUi {
     window: adw::ApplicationWindow,
     canvas: Canvas,
-    stack: gtk::Stack,
     title: adw::WindowTitle,
+    /// The `.inkpdf` file the document saves to on plain "Save" (None until it has
+    /// one: a fresh doc, or a PDF that has not yet been saved as `.inkpdf`).
+    save_path: Rc<RefCell<Option<PathBuf>>>,
 }
 
 impl WindowUi {
@@ -41,19 +43,48 @@ impl WindowUi {
         match opened {
             Ok(open) => {
                 self.canvas.set_open_document(open);
-                self.stack.set_visible_child_name("canvas");
-                self.title.set_subtitle(&file_label(path));
+                // Only an .inkpdf becomes the plain-save target; a PDF must be
+                // "saved as" a new .inkpdf first.
+                *self.save_path.borrow_mut() = is_inkpdf.then(|| path.to_path_buf());
+                self.show_title(Some(path));
             }
             Err(err) => show_error(&self.window, &format!("{err:#}")),
         }
     }
 
+    /// Sets the header title to the file name and the subtitle to its full path
+    /// (or "Unbenannt" for a document with no file yet).
+    fn show_title(&self, path: Option<&Path>) {
+        match path {
+            Some(p) => {
+                self.title.set_title(&file_label(p));
+                self.title.set_subtitle(&p.display().to_string());
+            }
+            None => {
+                self.title.set_title("Unbenannt");
+                self.title.set_subtitle("");
+            }
+        }
+    }
+
+    /// Plain save: write to the known file if there is one, else fall back to "save as".
+    fn save(&self) {
+        let path = self.save_path.borrow().clone();
+        match path {
+            Some(path) => {
+                let Some(model) = self.canvas.document() else {
+                    return;
+                };
+                if let Err(err) = storage::save(&model, &path) {
+                    show_error(&self.window, &format!("{err:#}"));
+                }
+            }
+            None => save_dialog(self),
+        }
+    }
+
     fn insert_page(&self, rel: Relative) {
         self.canvas.insert_blank_page(rel);
-        self.stack.set_visible_child_name("canvas");
-        if self.title.subtitle().is_empty() {
-            self.title.set_subtitle("untitled");
-        }
     }
 }
 
@@ -221,20 +252,9 @@ pub fn build(app: &adw::Application) -> WindowUi {
     // Keep the group alive for the app's lifetime (widgets don't own it).
     std::mem::forget(panel_group);
 
-    let placeholder = adw::StatusPage::builder()
-        .icon_name("document-open-symbolic")
-        .title("No PDF open")
-        .description("Click Open to load a PDF or inkpdf file.")
-        .build();
-
-    let stack = gtk::Stack::new();
-    stack.add_named(&placeholder, Some("placeholder"));
-    stack.add_named(&overlay, Some("canvas"));
-    stack.set_visible_child_name("placeholder");
-
     let content = adw::ToolbarView::new();
     content.add_top_bar(&header);
-    content.set_content(Some(&stack));
+    content.set_content(Some(&overlay));
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -246,9 +266,17 @@ pub fn build(app: &adw::Application) -> WindowUi {
     let ui = WindowUi {
         window: window.clone(),
         canvas: canvas.clone(),
-        stack,
         title,
+        save_path: Rc::new(RefCell::new(None)),
     };
+
+    // Start on a fresh blank A4 page.
+    let mut blank = Document::new();
+    blank.insert_blank_page(0, A4.0, A4.1, Color::WHITE);
+    canvas.set_open_document(OpenDocument { model: blank, pdf: None });
+    ui.show_title(None);
+
+    register_shortcuts(app, &window, &ui);
 
     {
         let ui = ui.clone();
@@ -256,7 +284,7 @@ pub fn build(app: &adw::Application) -> WindowUi {
     }
     {
         let ui = ui.clone();
-        save_button.connect_clicked(move |_| save_dialog(&ui));
+        save_button.connect_clicked(move |_| ui.save());
     }
     {
         let ui = ui.clone();
@@ -307,6 +335,22 @@ pub fn build(app: &adw::Application) -> WindowUi {
     ui
 }
 
+/// Wires Ctrl+O / Ctrl+S / Ctrl+Shift+S to open, save, and save-as.
+fn register_shortcuts(app: &adw::Application, window: &adw::ApplicationWindow, ui: &WindowUi) {
+    let actions: [(&str, &str, Box<dyn Fn(&WindowUi)>); 3] = [
+        ("open", "<Control>o", Box::new(open_dialog)),
+        ("save", "<Control>s", Box::new(|ui: &WindowUi| ui.save())),
+        ("save-as", "<Control><Shift>s", Box::new(save_dialog)),
+    ];
+    for (name, accel, handler) in actions {
+        let action = gio::SimpleAction::new(name, None);
+        let ui = ui.clone();
+        action.connect_activate(move |_, _| handler(&ui));
+        window.add_action(&action);
+        app.set_accels_for_action(&format!("win.{name}"), &[accel]);
+    }
+}
+
 fn open_dialog(ui: &WindowUi) {
     let filter = gtk::FileFilter::new();
     filter.set_name(Some("PDF or inkpdf"));
@@ -342,9 +386,17 @@ fn save_dialog(ui: &WindowUi) {
         return;
     };
 
+    // Default the file name to the opened document's name (with the .inkpdf ext).
+    let title = ui.title.title();
+    let stem = Path::new(title.as_str()).file_stem().map(|s| s.to_string_lossy().into_owned());
+    let initial = match stem {
+        Some(s) if !s.is_empty() && title != "Unbenannt" => format!("{s}.{FILE_EXTENSION}"),
+        _ => format!("untitled.{FILE_EXTENSION}"),
+    };
+
     let dialog = gtk::FileDialog::builder()
         .title("Save as inkpdf")
-        .initial_name(format!("untitled.{FILE_EXTENSION}"))
+        .initial_name(initial)
         .modal(true)
         .build();
 
@@ -362,7 +414,10 @@ fn save_dialog(ui: &WindowUi) {
         let path = with_extension(path);
 
         match storage::save(&model, &path) {
-            Ok(()) => ui.title.set_subtitle(&file_label(&path)),
+            Ok(()) => {
+                *ui.save_path.borrow_mut() = Some(path.clone());
+                ui.show_title(Some(&path));
+            }
             Err(err) => show_error(&ui.window, &format!("{err:#}")),
         }
     });
