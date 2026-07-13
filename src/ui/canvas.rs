@@ -249,6 +249,43 @@ struct DragState {
     orig_y: f64,
 }
 
+/// Max snapshots kept per direction (older ones are dropped).
+const HISTORY_LIMIT: usize = 100;
+
+/// Undo/redo history. Each entry is a snapshot of the page list (annotations +
+/// page structure); the embedded PDF bytes are never copied, so history stays
+/// cheap even for large documents.
+#[derive(Default)]
+struct History {
+    undo: Vec<Vec<Page>>,
+    redo: Vec<Vec<Page>>,
+}
+
+impl History {
+    /// Records `snapshot` as a new undo point and invalidates the redo stack.
+    fn record(&mut self, snapshot: Vec<Page>) {
+        self.undo.push(snapshot);
+        if self.undo.len() > HISTORY_LIMIT {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+
+    /// Steps one entry: pops the target stack (redo if `forward`, else undo) and
+    /// pushes `current` onto the opposite one. Returns the snapshot to apply, or
+    /// `None` (leaving `current` untouched) when the target stack is empty.
+    fn step(&mut self, current: Vec<Page>, forward: bool) -> Option<Vec<Page>> {
+        let (from, to) = if forward {
+            (&mut self.redo, &mut self.undo)
+        } else {
+            (&mut self.undo, &mut self.redo)
+        };
+        let prev = from.pop()?;
+        to.push(current);
+        Some(prev)
+    }
+}
+
 /// The transient bits drawn on top of the cached page surfaces.
 struct Overlay<'a> {
     text_mode: bool,
@@ -279,6 +316,11 @@ struct State {
     /// Style for newly typed characters (color, font, weight). Also applied to the
     /// current selection when a style control changes.
     text_style: TextStyle,
+    /// Undo/redo snapshots.
+    history: History,
+    /// Page snapshot taken when the current edit session began, so the whole
+    /// session (typing + styling) collapses into one undo entry on commit.
+    edit_baseline: Option<Vec<Page>>,
 }
 
 /// Where an insert/delete acts relative to the current page.
@@ -336,6 +378,8 @@ impl Canvas {
             selected: None,
             text_size: TEXT_SIZE,
             text_style: TextStyle::default(),
+            history: History::default(),
+            edit_baseline: None,
         }));
 
         {
@@ -393,6 +437,8 @@ impl Canvas {
             st.dragging = None;
             st.text_drag = None;
             st.selected = None;
+            st.history = History::default();
+            st.edit_baseline = None;
             st.doc = Some(open.model);
             st.pdf = open.pdf;
             st.zoom = 1.0;
@@ -405,6 +451,57 @@ impl Canvas {
     pub fn document(&self) -> Option<Document> {
         self.commit_editing();
         self.state.borrow().doc.clone()
+    }
+
+    /// Pushes the current page state onto the undo stack before a mutation.
+    fn record_change(&self) {
+        let mut st = self.state.borrow_mut();
+        let snapshot = st.doc.as_ref().map(|d| d.pages.clone());
+        if let Some(snapshot) = snapshot {
+            st.history.record(snapshot);
+        }
+    }
+
+    /// Remembers the page state at the start of an edit session so the whole
+    /// session becomes a single undo entry (recorded on commit, if it changed).
+    fn begin_edit_session(&self) {
+        let mut st = self.state.borrow_mut();
+        st.edit_baseline = st.doc.as_ref().map(|d| d.pages.clone());
+    }
+
+    /// Reverts to the previous page snapshot.
+    pub fn undo(&self) {
+        self.commit_editing();
+        let changed = self.swap_history(false);
+        if changed {
+            self.update_layout();
+        }
+    }
+
+    /// Re-applies a snapshot undone by `undo`.
+    pub fn redo(&self) {
+        self.commit_editing();
+        let changed = self.swap_history(true);
+        if changed {
+            self.update_layout();
+        }
+    }
+
+    /// Moves one step through history (redo if `forward`, else undo), swapping the
+    /// stored snapshot in for the current pages. Returns whether anything changed.
+    fn swap_history(&self, forward: bool) -> bool {
+        let mut st = self.state.borrow_mut();
+        let State { doc, history, selected, cache, .. } = &mut *st;
+        let Some(doc) = doc.as_mut() else {
+            return false;
+        };
+        let Some(prev) = history.step(doc.pages.clone(), forward) else {
+            return false;
+        };
+        doc.pages = prev;
+        *selected = None;
+        cache.clear();
+        true
     }
 
     pub fn set_text_mode(&self, on: bool) {
@@ -533,6 +630,7 @@ impl Canvas {
     /// Inserts a blank page before or after the current page.
     pub fn insert_blank_page(&self, rel: Relative) {
         self.cancel_editing();
+        self.record_change();
         let current = self.current_index();
         {
             let mut st = self.state.borrow_mut();
@@ -573,13 +671,15 @@ impl Canvas {
 
     fn remove_page(&self, index: usize) {
         self.cancel_editing();
+        let valid = self.state.borrow().doc.as_ref().is_some_and(|d| index < d.pages.len());
+        if !valid {
+            return;
+        }
+        self.record_change();
         {
             let mut st = self.state.borrow_mut();
-            match st.doc.as_mut() {
-                Some(doc) if index < doc.pages.len() => {
-                    doc.pages.remove(index);
-                }
-                _ => return,
+            if let Some(doc) = st.doc.as_mut() {
+                doc.pages.remove(index);
             }
             st.selected = None;
             st.cache.clear();
@@ -713,6 +813,7 @@ impl Canvas {
         let Some((page, id)) = selected else {
             return;
         };
+        self.record_change();
         {
             let mut st = self.state.borrow_mut();
             if let Some(p) = st.doc.as_mut().and_then(|d| d.pages.get_mut(page)) {
@@ -741,6 +842,7 @@ impl Canvas {
     }
 
     fn start_new_text(&self, page: usize, lx: f64, ly: f64) {
+        self.begin_edit_session();
         {
             let mut st = self.state.borrow_mut();
             st.selected = None;
@@ -762,6 +864,7 @@ impl Canvas {
 
     /// Lifts an existing annotation into the editor (removing it from the model).
     fn start_edit_existing(&self, page: usize, index: usize) {
+        self.begin_edit_session();
         let removed = {
             let mut st = self.state.borrow_mut();
             match st.doc.as_mut() {
@@ -807,6 +910,26 @@ impl Canvas {
     }
 
     fn on_key(&self, keyval: gdk::Key, state: gdk::ModifierType) -> glib::Propagation {
+        // Undo/redo work in every mode (any active edit is committed first).
+        if state.contains(gdk::ModifierType::CONTROL_MASK) {
+            let shift = state.contains(gdk::ModifierType::SHIFT_MASK);
+            match keyval {
+                gdk::Key::z | gdk::Key::Z if shift => {
+                    self.redo();
+                    return glib::Propagation::Stop;
+                }
+                gdk::Key::z | gdk::Key::Z => {
+                    self.undo();
+                    return glib::Propagation::Stop;
+                }
+                gdk::Key::y | gdk::Key::Y => {
+                    self.redo();
+                    return glib::Propagation::Stop;
+                }
+                _ => {}
+            }
+        }
+
         if self.state.borrow().editing.is_none() {
             // Not editing: Delete/Backspace removes the selected box.
             if self.state.borrow().selected.is_some()
@@ -877,11 +1000,18 @@ impl Canvas {
                 });
             }
             st.cache.remove(&ed.page);
+            // Record the session as one undo entry, but only if it changed the pages.
+            if let Some(baseline) = st.edit_baseline.take()
+                && st.doc.as_ref().is_some_and(|d| d.pages != baseline)
+            {
+                st.history.record(baseline);
+            }
         }
         self.area.queue_draw();
     }
 
     fn cancel_editing(&self) {
+        self.state.borrow_mut().edit_baseline = None;
         let editing = self.state.borrow_mut().editing.take();
         if let Some(ed) = editing {
             if let Some(original) = ed.original {
@@ -1014,6 +1144,8 @@ impl Canvas {
         let Some((page, index, ox, oy)) = st.drag_start else {
             return;
         };
+        // Snapshot before lifting so the whole move is one undo entry.
+        let snapshot = st.doc.as_ref().map(|d| d.pages.clone());
         let removed = match st.doc.as_mut() {
             Some(doc) if page < doc.pages.len() && index < doc.pages[page].annotations.len() => {
                 Some(doc.pages[page].annotations.remove(index))
@@ -1021,6 +1153,9 @@ impl Canvas {
             _ => None,
         };
         if let Some(annotation) = removed {
+            if let Some(snapshot) = snapshot {
+                st.history.record(snapshot);
+            }
             st.cache.remove(&page);
             st.dragging = Some(DragState { page, annotation, orig_x: ox, orig_y: oy });
         }
@@ -1647,6 +1782,43 @@ mod tests {
         let (_, one) = measure_glyphs(TEXT_SIZE, &glyphs_of("single line"));
         let (_, three) = measure_glyphs(TEXT_SIZE, &glyphs_of("line\ntwo\nthree"));
         assert!(three > one);
+    }
+
+    #[test]
+    fn history_record_clears_redo_and_caps() {
+        let mut h = History::default();
+        h.redo.push(vec![a4_page()]); // stale redo
+        h.record(vec![a4_page()]);
+        assert_eq!(h.undo.len(), 1);
+        assert!(h.redo.is_empty(), "recording a new change must invalidate redo");
+
+        for _ in 0..(HISTORY_LIMIT + 10) {
+            h.record(vec![a4_page()]);
+        }
+        assert_eq!(h.undo.len(), HISTORY_LIMIT, "undo stack is capped");
+    }
+
+    #[test]
+    fn history_step_round_trips() {
+        let mut h = History::default();
+        // One recorded change: pages went from empty -> [page].
+        h.record(vec![]);
+        let current = vec![a4_page()];
+
+        // Undo: restore empty, current pushed to redo.
+        let undone = h.step(current.clone(), false).unwrap();
+        assert!(undone.is_empty());
+        assert!(h.undo.is_empty());
+        assert_eq!(h.redo.len(), 1);
+
+        // Redo: restore [page].
+        let redone = h.step(undone, true).unwrap();
+        assert_eq!(redone.len(), 1);
+        assert_eq!(h.undo.len(), 1);
+        assert!(h.redo.is_empty());
+
+        // Nothing left to redo.
+        assert!(h.step(redone, true).is_none());
     }
 
     #[test]

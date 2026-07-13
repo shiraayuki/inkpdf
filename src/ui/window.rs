@@ -389,13 +389,18 @@ fn build_tool_strip(canvas: &Canvas, details: &gtk::Stack) -> gtk::Box {
 
     strip.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
-    // Undo/redo are placeholders for now (no history yet).
-    for (icon, tip) in [("inkpdf-undo-symbolic", "Undo"), ("inkpdf-redo-symbolic", "Redo")] {
-        let button = gtk::Button::builder().icon_name(icon).tooltip_text(tip).build();
-        button.add_css_class("flat");
-        button.add_css_class("circular");
-        strip.append(&button);
+    let undo = flat_icon_button("inkpdf-undo-symbolic", "Rückgängig (Strg+Z)");
+    {
+        let canvas = canvas.clone();
+        undo.connect_clicked(move |_| canvas.undo());
     }
+    strip.append(&undo);
+    let redo = flat_icon_button("inkpdf-redo-symbolic", "Wiederholen (Strg+Y)");
+    {
+        let canvas = canvas.clone();
+        redo.connect_clicked(move |_| canvas.redo());
+    }
+    strip.append(&redo);
 
     strip
 }
