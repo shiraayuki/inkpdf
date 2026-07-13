@@ -23,6 +23,9 @@ const TEXT_SIZE: f64 = 16.0;
 const MIN_BOX_WIDTH: f64 = 4.0;
 /// Squared pixel distance a press must move before it counts as a drag (not a click).
 const DRAG_THRESHOLD_SQ: f64 = 9.0;
+// Canvas backdrop behind the pages, per theme (r, g, b).
+const CANVAS_BG_DARK: (f64, f64, f64) = (0.18, 0.18, 0.20);
+const CANVAS_BG_LIGHT: (f64, f64, f64) = (0.86, 0.86, 0.88);
 // Bounding-box colors (r, g, b, a).
 const BOX_ACTIVE: (f64, f64, f64, f64) = (0.20, 0.51, 0.92, 1.0);
 const BOX_ANNOTATION: (f64, f64, f64, f64) = (0.55, 0.55, 0.60, 0.9);
@@ -464,6 +467,28 @@ impl Canvas {
         // Track which page is in view so the current-page frame follows scrolling.
         let this = self.clone();
         self.root.vadjustment().connect_value_changed(move |_| this.recompute_current());
+
+        // Repaint the backdrop when the light/dark theme changes.
+        let area = self.area.clone();
+        adw::StyleManager::default().connect_dark_notify(move |_| area.queue_draw());
+
+        // Ctrl + mouse wheel zooms instead of scrolling. Capture phase so we claim
+        // the event before the ScrolledWindow scrolls it.
+        let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+        scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let this = self.clone();
+        scroll.connect_scroll(move |ctrl, _dx, dy| {
+            if ctrl.current_event_state().contains(gdk::ModifierType::CONTROL_MASK) {
+                if dy < 0.0 {
+                    this.zoom_in();
+                } else if dy > 0.0 {
+                    this.zoom_out();
+                }
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        self.root.add_controller(scroll);
     }
 
     pub fn set_open_document(&self, open: OpenDocument) {
@@ -1070,6 +1095,14 @@ impl Canvas {
                 }
                 gdk::Key::y | gdk::Key::Y => {
                     self.redo();
+                    return glib::Propagation::Stop;
+                }
+                gdk::Key::plus | gdk::Key::KP_Add | gdk::Key::equal => {
+                    self.zoom_in();
+                    return glib::Propagation::Stop;
+                }
+                gdk::Key::minus | gdk::Key::KP_Subtract => {
+                    self.zoom_out();
                     return glib::Propagation::Stop;
                 }
                 _ => {}
@@ -1702,7 +1735,14 @@ fn cursor_at(size: f64, glyphs: &[Glyph], dx: f64, dy: f64) -> usize {
 }
 
 fn draw(state: &Rc<RefCell<State>>, ctx: &cairo::Context, width: i32) {
-    ctx.set_source_rgb(0.18, 0.18, 0.20);
+    // Theme-aware canvas backdrop: dark grey in dark mode, a light grey in light
+    // mode that still reads as distinct from the white page.
+    let (r, g, b) = if adw::StyleManager::default().is_dark() {
+        CANVAS_BG_DARK
+    } else {
+        CANVAS_BG_LIGHT
+    };
+    ctx.set_source_rgb(r, g, b);
     let _ = ctx.paint();
 
     let mut st = state.borrow_mut();

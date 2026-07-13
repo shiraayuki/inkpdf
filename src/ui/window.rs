@@ -398,7 +398,6 @@ fn file_label(path: &Path) -> String {
 /// then undo/redo. Selecting a tool switches the details panel to its page.
 fn build_tool_strip(canvas: &Canvas, details: &gtk::Stack) -> gtk::Box {
     let strip = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    strip.add_css_class("osd");
     strip.add_css_class("inkpdf-panel");
 
     let tools: [(&str, &str, Tool, &str); 6] = [
@@ -470,7 +469,6 @@ fn build_tool_strip(canvas: &Canvas, details: &gtk::Stack) -> gtk::Box {
 /// be wired once `WindowUi` exists (see `build()`).
 fn build_details_panel(canvas: &Canvas) -> (gtk::Stack, gtk::Button, gtk::Button) {
     let stack = gtk::Stack::new();
-    stack.add_css_class("osd");
     stack.add_css_class("inkpdf-panel");
     // Same width for every page (consistent panel), but height follows each page's elements.
     stack.set_hhomogeneous(true);
@@ -791,10 +789,17 @@ fn page_markdown() -> gtk::Box {
     page
 }
 
+// Theme-aware floating panels: the background and text follow the light/dark
+// palette (via libadwaita named colors), so the symbolic icons — which paint in
+// the inherited foreground color — recolor automatically with the theme.
 const PANEL_CSS: &str = "\
 .inkpdf-panel { \
-  padding: 10px 6px; \
+  background-color: alpha(@window_bg_color, 0.92); \
+  color: @window_fg_color; \
+  border: 1px solid alpha(@window_fg_color, 0.12); \
   border-radius: 20px; \
+  padding: 10px 6px; \
+  box-shadow: 0 1px 5px rgba(0, 0, 0, 0.35); \
 }\
 .inkpdf-panel separator { \
   background-color: alpha(@window_fg_color, 0.15); \
