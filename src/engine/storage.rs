@@ -61,6 +61,7 @@ mod tests {
                     kind: PageKind::Blank {
                         color: Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
                         pattern: PagePattern::Plain,
+                        pattern_spacing: DEFAULT_PATTERN_SPACING,
                     },
                     width: 595.0,
                     height: 842.0,

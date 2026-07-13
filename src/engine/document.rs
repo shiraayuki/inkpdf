@@ -74,6 +74,13 @@ pub enum PagePattern {
     Lined,
 }
 
+/// Default spacing (in PDF points) between grid lines / dots / ruled lines.
+pub const DEFAULT_PATTERN_SPACING: f64 = 20.0;
+
+fn default_pattern_spacing() -> f64 {
+    DEFAULT_PATTERN_SPACING
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum PageKind {
     Pdf { page_index: usize },
@@ -81,6 +88,8 @@ pub enum PageKind {
         color: Color,
         #[serde(default)]
         pattern: PagePattern,
+        #[serde(default = "default_pattern_spacing")]
+        pattern_spacing: f64,
     },
 }
 
@@ -179,9 +188,17 @@ impl Document {
         Self { source: None, pages: Vec::new() }
     }
 
-    pub fn insert_blank_page(&mut self, at: usize, width: f64, height: f64, color: Color, pattern: PagePattern) {
+    pub fn insert_blank_page(
+        &mut self,
+        at: usize,
+        width: f64,
+        height: f64,
+        color: Color,
+        pattern: PagePattern,
+        pattern_spacing: f64,
+    ) {
         let page = Page {
-            kind: PageKind::Blank { color, pattern },
+            kind: PageKind::Blank { color, pattern, pattern_spacing },
             width,
             height,
             annotations: Vec::new(),
@@ -203,14 +220,14 @@ mod tests {
     #[test]
     fn insert_blank_page_adds_page_at_index() {
         let mut doc = Document::new();
-        doc.insert_blank_page(0, 595.0, 842.0, Color::WHITE, PagePattern::Plain);
-        doc.insert_blank_page(1, 200.0, 300.0, Color::WHITE, PagePattern::Plain);
+        doc.insert_blank_page(0, 595.0, 842.0, Color::WHITE, PagePattern::Plain, DEFAULT_PATTERN_SPACING);
+        doc.insert_blank_page(1, 200.0, 300.0, Color::WHITE, PagePattern::Plain, DEFAULT_PATTERN_SPACING);
 
         assert_eq!(doc.pages.len(), 2);
         assert_eq!(doc.pages[1].width, 200.0);
         assert!(matches!(doc.pages[1].kind, PageKind::Blank { .. }));
         // Out-of-range index is clamped to the end.
-        doc.insert_blank_page(999, 100.0, 100.0, Color::WHITE, PagePattern::Plain);
+        doc.insert_blank_page(999, 100.0, 100.0, Color::WHITE, PagePattern::Plain, DEFAULT_PATTERN_SPACING);
         assert_eq!(doc.pages.len(), 3);
         assert_eq!(doc.pages[2].width, 100.0);
     }

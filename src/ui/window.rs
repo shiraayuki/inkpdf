@@ -6,10 +6,12 @@ use adw::prelude::*;
 use gtk::{gdk, gio};
 
 use crate::engine::OpenDocument;
-use crate::engine::document::{A4, Color, Document, FILE_EXTENSION, PagePattern, ShapeKind};
+use crate::engine::document::{
+    A4, Color, DEFAULT_PATTERN_SPACING, Document, FILE_EXTENSION, PagePattern, ShapeKind,
+};
 use crate::engine::pdf::PdfDocument;
 use crate::engine::storage;
-use crate::ui::canvas::{Canvas, Relative, Tool};
+use crate::ui::canvas::{Canvas, Relative, Tool, draw_page_pattern};
 
 const DEFAULT_WIDTH: i32 = 900;
 const DEFAULT_HEIGHT: i32 = 700;
@@ -36,7 +38,7 @@ struct Tab {
 impl Tab {
     fn blank() -> Self {
         let mut model = Document::new();
-        model.insert_blank_page(0, A4.0, A4.1, Color::WHITE, PagePattern::Plain);
+        model.insert_blank_page(0, A4.0, A4.1, Color::WHITE, PagePattern::Plain, DEFAULT_PATTERN_SPACING);
         Tab {
             saved_snapshot: Some(model.clone()),
             model,
@@ -970,10 +972,7 @@ fn size_stepper(
     column
 }
 
-/// "Pages" tool page: insert/delete the current page. Left click acts on the
-/// current page directly; right click opens a before/after choice (wired in
-/// `build()`, once `WindowUi` exists).
-/// Page patterns offered by the dropdown, in display order.
+/// Page patterns offered for blank pages, in display order.
 const PAGE_PATTERNS: [(&str, PagePattern); 4] = [
     ("Leer", PagePattern::Plain),
     ("Kariert", PagePattern::Grid),
@@ -981,6 +980,32 @@ const PAGE_PATTERNS: [(&str, PagePattern); 4] = [
     ("Liniert", PagePattern::Lined),
 ];
 
+/// Size (in widget pixels) of a pattern preview thumbnail.
+const PATTERN_THUMB: (i32, i32) = (28, 36);
+
+/// A small live preview of a page pattern (drawn with the same code the canvas
+/// uses), so the picker needs no text label and stays a fixed, narrow width —
+/// unlike a dropdown, whose width would jump around with the selected label.
+fn pattern_thumbnail(pattern: PagePattern) -> gtk::DrawingArea {
+    let (w, h) = PATTERN_THUMB;
+    let area = gtk::DrawingArea::builder().content_width(w).content_height(h).build();
+    area.set_draw_func(move |_, c, w, h| {
+        c.set_source_rgb(1.0, 1.0, 1.0);
+        let _ = c.paint();
+        draw_page_pattern(c, pattern, 8.0, w as f64, h as f64);
+        c.set_source_rgba(0.0, 0.0, 0.0, 0.35);
+        c.set_line_width(1.0);
+        c.rectangle(0.5, 0.5, w as f64 - 1.0, h as f64 - 1.0);
+        let _ = c.stroke();
+    });
+    area
+}
+
+/// "Pages" tool page: insert/delete the current page. Left click acts on the
+/// current page directly; right click opens a before/after choice (wired in
+/// `build()`, once `WindowUi` exists). Also holds the blank-page ruling picker
+/// (pattern + spacing): picking a pattern sets the default for newly inserted
+/// blank pages and, if the current page is itself blank, restyles it too.
 fn page_pages(canvas: &Canvas) -> (gtk::Box, gtk::Button, gtk::Button) {
     let page = detail_column();
     let add = flat_icon_button("inkpdf-page-add", "Insert page after current");
@@ -989,19 +1014,34 @@ fn page_pages(canvas: &Canvas) -> (gtk::Box, gtk::Button, gtk::Button) {
     page.append(&remove);
 
     page.append(&hsep());
-    let labels: [&str; 4] = std::array::from_fn(|i| PAGE_PATTERNS[i].0);
-    let pattern_dropdown = gtk::DropDown::from_strings(&labels);
-    let current = PAGE_PATTERNS.iter().position(|(_, p)| *p == canvas.blank_pattern()).unwrap_or(0);
-    pattern_dropdown.set_selected(current as u32);
+    let mut group: Option<gtk::ToggleButton> = None;
+    for (label, pattern) in PAGE_PATTERNS {
+        let toggle = gtk::ToggleButton::builder().tooltip_text(label).css_classes(["flat"]).build();
+        toggle.set_child(Some(&pattern_thumbnail(pattern)));
+        if let Some(first) = &group {
+            toggle.set_group(Some(first));
+        } else {
+            group = Some(toggle.clone());
+        }
+        if pattern == canvas.blank_pattern() {
+            toggle.set_active(true);
+        }
+        {
+            let canvas = canvas.clone();
+            toggle.connect_toggled(move |btn| {
+                if btn.is_active() {
+                    canvas.set_blank_pattern(pattern);
+                }
+            });
+        }
+        page.append(&toggle);
+    }
+
     {
         let canvas = canvas.clone();
-        pattern_dropdown.connect_selected_notify(move |dd| {
-            if let Some((_, pattern)) = PAGE_PATTERNS.get(dd.selected() as usize) {
-                canvas.set_blank_pattern(*pattern);
-            }
-        });
+        let spacing = canvas.pattern_spacing();
+        page.append(&size_stepper(spacing, 4.0, 60.0, 1.0, 0, move |v| canvas.set_pattern_spacing(v)));
     }
-    page.append(&pattern_dropdown);
 
     (page, add, remove)
 }
