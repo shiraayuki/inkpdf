@@ -304,8 +304,14 @@ pub fn build(app: &adw::Application) -> WindowUi {
         .tooltip_text("Save as inkpdf")
         .css_classes(["flat"])
         .build();
+    let new_tab_button = gtk::Button::builder()
+        .icon_name("tab-new-symbolic")
+        .tooltip_text("Neuer Tab")
+        .css_classes(["flat"])
+        .build();
     header.pack_start(&open_button);
     header.pack_start(&save_button);
+    header.pack_start(&new_tab_button);
 
     // Dark/light toggle (default dark = not active).
     let theme_button = gtk::ToggleButton::builder()
@@ -497,6 +503,10 @@ pub fn build(app: &adw::Application) -> WindowUi {
     {
         let ui = ui.clone();
         save_button.connect_clicked(move |_| ui.save());
+    }
+    {
+        let ui = ui.clone();
+        new_tab_button.connect_clicked(move |_| ui.new_tab());
     }
     {
         let ui = ui.clone();

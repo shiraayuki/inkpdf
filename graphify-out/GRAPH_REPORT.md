@@ -1,16 +1,16 @@
 # Graph Report - inkpdf  (2026-07-13)
 
 ## Corpus Check
-- 8 files · ~16,835 words
+- 8 files · ~16,854 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 330 nodes · 944 edges · 9 communities (8 shown, 1 thin omitted)
+- 330 nodes · 945 edges · 9 communities (8 shown, 1 thin omitted)
 - Extraction: 100% EXTRACTED · 0% INFERRED · 0% AMBIGUOUS
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `938b7814`
+- Built from commit: `46c95348`
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
@@ -28,7 +28,7 @@
 1. `Canvas` - 88 edges
 2. `TextEdit` - 35 edges
 3. `WindowUi` - 30 edges
-4. `build()` - 24 edges
+4. `build()` - 25 edges
 5. `Document` - 22 edges
 6. `State` - 19 edges
 7. `Color` - 16 edges
@@ -66,12 +66,12 @@ Cohesion: 0.08
 Nodes (60): Application, ApplicationWindow, Button, Cell, ColorDialogButton, IsA, Label, MenuItem (+52 more)
 
 ### Community 3 - "Document Model"
-Cohesion: 0.08
-Nodes (32): Default, Annotation, AnnotationKind, Color, default_font(), Document, insert_blank_page_adds_page_at_index(), PageKind (+24 more)
+Cohesion: 0.09
+Nodes (30): Default, Annotation, AnnotationKind, Color, default_font(), Document, insert_blank_page_adds_page_at_index(), PageKind (+22 more)
 
 ### Community 4 - "Text Editing & Styling"
-Cohesion: 0.17
-Nodes (5): Key, ModifierType, Propagation, text_edit_insert_delete_and_navigate(), TextEdit
+Cohesion: 0.15
+Nodes (7): Key, ModifierType, Propagation, String, text_edit_insert_delete_and_navigate(), text_of(), TextEdit
 
 ### Community 5 - "Engine / PDF Loading"
 Cohesion: 0.16
@@ -92,12 +92,12 @@ _Questions this graph is uniquely positioned to answer:_
 - **Why does `Document` connect `Document Model` to `Canvas Rendering & Hit-Testing`, `Canvas Input & Edit Sessions`, `Window & Tool UI`, `Engine / PDF Loading`?**
   _High betweenness centrality (0.131) - this node is a cross-community bridge._
 - **Why does `WindowUi` connect `Window & Tool UI` to `Canvas Input & Edit Sessions`?**
-  _High betweenness centrality (0.107) - this node is a cross-community bridge._
+  _High betweenness centrality (0.106) - this node is a cross-community bridge._
 - **Should `Canvas Rendering & Hit-Testing` be split into smaller, more focused modules?**
   _Cohesion score 0.06772151898734177 - nodes in this community are weakly interconnected._
 - **Should `Canvas Input & Edit Sessions` be split into smaller, more focused modules?**
   _Cohesion score 0.07380520266182698 - nodes in this community are weakly interconnected._
 - **Should `Window & Tool UI` be split into smaller, more focused modules?**
-  _Cohesion score 0.07603603603603604 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.0763963963963964 - nodes in this community are weakly interconnected._
 - **Should `Document Model` be split into smaller, more focused modules?**
-  _Cohesion score 0.0824829931972789 - nodes in this community are weakly interconnected._
+  _Cohesion score 0.08788159111933395 - nodes in this community are weakly interconnected._
