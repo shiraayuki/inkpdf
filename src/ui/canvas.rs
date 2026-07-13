@@ -2639,6 +2639,42 @@ fn page_surface(
 
 /// Draws glyphs (each with its own style: color, font, highlight, weight, decoration),
 /// honoring newlines. Context in page-point space.
+/// Renders one glyph at `(gx, line_top)` (highlight, color, underline/
+/// strikethrough) and returns its advance width.
+fn draw_one_glyph(c: &cairo::Context, gx: f64, line_top: f64, ascent: f64, line_height: f64, size: f64, g: &Glyph) -> f64 {
+    apply_glyph_font(c, size, &g.style);
+    let adv = c.text_extents(&g.ch.to_string()).map(|e| e.x_advance()).unwrap_or(0.0);
+
+    if let Some(h) = g.style.highlight {
+        c.set_source_rgba(h.r, h.g, h.b, h.a);
+        c.rectangle(gx, line_top, adv, line_height);
+        let _ = c.fill();
+    }
+
+    let baseline = line_top + ascent;
+    let Color { r, g: gg, b, a } = g.style.color;
+    c.set_source_rgba(r, gg, b, a);
+    c.move_to(gx, baseline);
+    let _ = c.show_text(&g.ch.to_string());
+
+    if g.style.underline || g.style.strikethrough {
+        c.set_line_width((size * 0.06).max(0.5));
+        if g.style.underline {
+            let uy = baseline + size * 0.12;
+            c.move_to(gx, uy);
+            c.line_to(gx + adv, uy);
+            let _ = c.stroke();
+        }
+        if g.style.strikethrough {
+            let sy = baseline - ascent * 0.32;
+            c.move_to(gx, sy);
+            c.line_to(gx + adv, sy);
+            let _ = c.stroke();
+        }
+    }
+    adv
+}
+
 fn draw_glyphs(c: &cairo::Context, x: f64, y: f64, size: f64, glyphs: &[Glyph]) {
     let (ascent, line_height) = line_metrics(c, size);
     let mut gx = x;
@@ -2649,38 +2685,81 @@ fn draw_glyphs(c: &cairo::Context, x: f64, y: f64, size: f64, glyphs: &[Glyph]) 
             line_top += line_height;
             continue;
         }
-        apply_glyph_font(c, size, &g.style);
-        let adv = c.text_extents(&g.ch.to_string()).map(|e| e.x_advance()).unwrap_or(0.0);
-
-        if let Some(h) = g.style.highlight {
-            c.set_source_rgba(h.r, h.g, h.b, h.a);
-            c.rectangle(gx, line_top, adv, line_height);
-            let _ = c.fill();
-        }
-
-        let baseline = line_top + ascent;
-        let Color { r, g: gg, b, a } = g.style.color;
-        c.set_source_rgba(r, gg, b, a);
-        c.move_to(gx, baseline);
-        let _ = c.show_text(&g.ch.to_string());
-
-        if g.style.underline || g.style.strikethrough {
-            c.set_line_width((size * 0.06).max(0.5));
-            if g.style.underline {
-                let uy = baseline + size * 0.12;
-                c.move_to(gx, uy);
-                c.line_to(gx + adv, uy);
-                let _ = c.stroke();
-            }
-            if g.style.strikethrough {
-                let sy = baseline - ascent * 0.32;
-                c.move_to(gx, sy);
-                c.line_to(gx + adv, sy);
-                let _ = c.stroke();
-            }
-        }
-        gx += adv;
+        gx += draw_one_glyph(c, gx, line_top, ascent, line_height, size, g);
     }
+}
+
+/// If `glyphs[start]` is `$` and a matching `$`/`$$` closer exists later on
+/// the same line, returns (extracted plain math source, glyphs consumed
+/// including both delimiters). Returns `None` for an unterminated/unmatched
+/// `$` (or one whose match would cross a line break), which then just
+/// renders as a literal `$` character.
+fn read_math_span(glyphs: &[Glyph], start: usize) -> Option<(String, usize)> {
+    let is_block = glyphs.get(start + 1).is_some_and(|g| g.ch == '$');
+    let delim_len = if is_block { 2 } else { 1 };
+    let content_start = start + delim_len;
+    let mut i = content_start;
+    while i < glyphs.len() && glyphs[i].ch != '\n' {
+        let at_delim = glyphs[i].ch == '$' && (!is_block || glyphs.get(i + 1).is_some_and(|g| g.ch == '$'));
+        if at_delim {
+            let expr: String = glyphs[content_start..i].iter().map(|g| g.ch).collect();
+            return Some((expr, (i + delim_len) - start));
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Lays out (and, if `draw`, paints) glyphs with `$...$`/`$$...$$` spans
+/// rendered via the same math engine Markdown boxes use (uniformly italic,
+/// ignoring per-glyph style within the span) instead of as literal
+/// characters. Returns the box (width, height) - shared by measurement
+/// (`measure_glyphs_with_math`, feeding `annotation_bounds`) and the final,
+/// non-editing render (`draw_annotation`) via the `draw` flag, so the two can
+/// never disagree. While actively editing, `draw_glyphs`/`layout`/
+/// `measure_glyphs` are used instead, unchanged: the raw `$...$` source shows
+/// as plain text, so it stays directly editable (matching Markdown boxes).
+fn layout_and_draw_glyphs_with_math(c: &cairo::Context, x: f64, y: f64, size: f64, glyphs: &[Glyph], draw: bool) -> (f64, f64) {
+    let (ascent, line_height) = line_metrics(c, size);
+    let mut gx = x;
+    let mut line_top = y;
+    let mut max_width = 0.0_f64;
+    let mut i = 0;
+    while i < glyphs.len() {
+        if glyphs[i].ch == '\n' {
+            max_width = max_width.max(gx - x);
+            gx = x;
+            line_top += line_height;
+            i += 1;
+            continue;
+        }
+        if glyphs[i].ch == '$'
+            && let Some((expr, consumed)) = read_math_span(glyphs, i)
+        {
+            let tokens = parse_math(&expr);
+            let (w, ..) = render_math_tokens(c, &tokens, gx, line_top + ascent, size, draw);
+            gx += w;
+            i += consumed;
+            continue;
+        }
+        if draw {
+            gx += draw_one_glyph(c, gx, line_top, ascent, line_height, size, &glyphs[i]);
+        } else {
+            apply_glyph_font(c, size, &glyphs[i].style);
+            gx += c.text_extents(&glyphs[i].ch.to_string()).map(|e| e.x_advance()).unwrap_or(0.0);
+        }
+        i += 1;
+    }
+    max_width = max_width.max(gx - x);
+    (max_width.max(MIN_BOX_WIDTH), (line_top - y) + line_height)
+}
+
+fn draw_glyphs_with_math(c: &cairo::Context, x: f64, y: f64, size: f64, glyphs: &[Glyph]) {
+    let _ = layout_and_draw_glyphs_with_math(c, x, y, size, glyphs, true);
+}
+
+fn measure_glyphs_with_math(size: f64, glyphs: &[Glyph]) -> (f64, f64) {
+    with_scratch(|c| layout_and_draw_glyphs_with_math(c, 0.0, 0.0, size, glyphs, false), (MIN_BOX_WIDTH, size))
 }
 
 // --- Markdown rendering ------------------------------------------------
@@ -3223,7 +3302,7 @@ fn measure_markdown(size: f64, source: &str) -> (f64, f64) {
 /// Dispatches an annotation to its renderer. Context in page-point space.
 fn draw_annotation(c: &cairo::Context, kind: &AnnotationKind) {
     match kind {
-        AnnotationKind::Text(t) => draw_glyphs(c, t.x, t.y, t.size, &ann_glyphs(t)),
+        AnnotationKind::Text(t) => draw_glyphs_with_math(c, t.x, t.y, t.size, &ann_glyphs(t)),
         AnnotationKind::Stroke(s) => draw_stroke(c, &s.points, s.color, s.width),
         AnnotationKind::Shape(s) => draw_shape(c, s),
         AnnotationKind::Markdown(m) => {
@@ -3237,7 +3316,7 @@ fn draw_annotation(c: &cairo::Context, kind: &AnnotationKind) {
 fn annotation_bounds(kind: &AnnotationKind) -> (f64, f64, f64, f64) {
     match kind {
         AnnotationKind::Text(t) => {
-            let (w, h) = measure_glyphs(t.size, &ann_glyphs(t));
+            let (w, h) = measure_glyphs_with_math(t.size, &ann_glyphs(t));
             (t.x, t.y, w, h)
         }
         AnnotationKind::Stroke(s) => bounds_of_points(&s.points),
@@ -3955,6 +4034,39 @@ mod tests {
         let data = surface.data().unwrap();
         let non_white = data.iter().filter(|&&b| b != 0xFF).count();
         assert!(non_white > 0, "text should render as dark pixels on the white page");
+    }
+
+    #[test]
+    fn read_math_span_finds_inline_and_block_delimiters() {
+        let glyphs = glyphs_of("a $x^2$ b");
+        // "a " is 2 glyphs, then '$' at index 2.
+        let (expr, consumed) = read_math_span(&glyphs, 2).expect("should find the closing $");
+        assert_eq!(expr, "x^2");
+        assert_eq!(consumed, "$x^2$".chars().count());
+
+        let block = glyphs_of("$$E=mc^2$$");
+        let (expr, consumed) = read_math_span(&block, 0).expect("should find the closing $$");
+        assert_eq!(expr, "E=mc^2");
+        assert_eq!(consumed, block.len());
+    }
+
+    #[test]
+    fn read_math_span_rejects_unterminated_or_cross_line() {
+        let glyphs = glyphs_of("a $unterminated");
+        assert!(read_math_span(&glyphs, 2).is_none());
+
+        let glyphs = glyphs_of("a $across\nlines$ b");
+        assert!(read_math_span(&glyphs, 2).is_none(), "must not match across a newline");
+    }
+
+    #[test]
+    fn text_with_math_renders_narrower_than_its_raw_source() {
+        // "$\alpha$" (8 chars) renders as a single Greek letter - the
+        // math-aware box should measure narrower than the plain glyph box.
+        let glyphs = glyphs_of("$\\alpha$");
+        let (plain_w, _) = measure_glyphs(TEXT_SIZE, &glyphs);
+        let (math_w, _) = measure_glyphs_with_math(TEXT_SIZE, &glyphs);
+        assert!(math_w < plain_w, "math_w={math_w} should be narrower than plain_w={plain_w}");
     }
 
     #[test]

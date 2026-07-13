@@ -25,8 +25,8 @@
     "semantic_hash": "7d9a75c9d4e38d2cfd996650e4027c11"
   },
   "src/ui/canvas.rs": {
-    "mtime": 1783967641.8810675,
-    "ast_hash": "0596fc7769c5079d92de7a8896d66cbb",
+    "mtime": 1783968180.729409,
+    "ast_hash": "0a3c892036941b348ecb54989675aab7",
     "semantic_hash": ""
   },
   "src/ui/mod.rs": {
