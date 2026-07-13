@@ -2724,20 +2724,39 @@ fn layout_and_draw_glyphs_with_math(c: &cairo::Context, x: f64, y: f64, size: f6
     let mut gx = x;
     let mut line_top = y;
     let mut max_width = 0.0_f64;
+    // Tallest math span seen so far on the *current* line, so a fraction
+    // properly pushes the next line down instead of being overlapped by it
+    // (and grows the box's returned height if it's on the last line).
+    let mut line_extra_ascent = 0.0_f64;
+    let mut line_extra_descent = 0.0_f64;
     let mut i = 0;
     while i < glyphs.len() {
         if glyphs[i].ch == '\n' {
             max_width = max_width.max(gx - x);
+            line_top += line_height + line_extra_ascent + line_extra_descent;
+            line_extra_ascent = 0.0;
+            line_extra_descent = 0.0;
             gx = x;
-            line_top += line_height;
             i += 1;
             continue;
         }
         if glyphs[i].ch == '$'
             && let Some((expr, consumed)) = read_math_span(glyphs, i)
         {
+            if draw {
+                // render_math_tokens never sets a color itself (Markdown's
+                // caller sets black once for the whole box); a Text box can
+                // have per-character color, so use the "$"'s own style here -
+                // otherwise a box that's *only* math never sets a color at
+                // all and silently inherits whatever the page background was
+                // last painted with (i.e. renders white-on-white).
+                let Color { r, g: gg, b, a } = glyphs[i].style.color;
+                c.set_source_rgba(r, gg, b, a);
+            }
             let tokens = parse_math(&expr);
-            let (w, ..) = render_math_tokens(c, &tokens, gx, line_top + ascent, size, draw);
+            let (w, ea, ed) = render_math_tokens(c, &tokens, gx, line_top + ascent, size, draw);
+            line_extra_ascent = line_extra_ascent.max(ea);
+            line_extra_descent = line_extra_descent.max(ed);
             gx += w;
             i += consumed;
             continue;
@@ -2751,7 +2770,8 @@ fn layout_and_draw_glyphs_with_math(c: &cairo::Context, x: f64, y: f64, size: f6
         i += 1;
     }
     max_width = max_width.max(gx - x);
-    (max_width.max(MIN_BOX_WIDTH), (line_top - y) + line_height)
+    let total_height = (line_top - y) + line_height + line_extra_ascent + line_extra_descent;
+    (max_width.max(MIN_BOX_WIDTH), total_height)
 }
 
 fn draw_glyphs_with_math(c: &cairo::Context, x: f64, y: f64, size: f64, glyphs: &[Glyph]) {
@@ -2980,23 +3000,24 @@ fn parse_markdown_lines(source: &str) -> Vec<MdLine> {
 }
 
 /// A single token within a parsed (not yet laid out) math expression.
+#[derive(Debug)]
 enum MathToken {
     /// Plain math-mode text (rendered in italic, the usual math convention).
     Text(String),
-    Sup(String),
-    Sub(String),
-    /// Numerator, denominator - each is plain text, not recursively parsed.
-    Frac(String, String),
-    /// Argument - plain text, not recursively parsed.
-    Sqrt(String),
+    /// Superscript/subscript/fraction/sqrt arguments are themselves parsed
+    /// (not just plain text), so e.g. `\frac{\frac{a}{b}}{c}` nests properly.
+    Sup(Vec<MathToken>),
+    Sub(Vec<MathToken>),
+    Frac(Vec<MathToken>, Vec<MathToken>),
+    Sqrt(Vec<MathToken>),
 }
 
-/// Best-effort, non-nested LaTeX math subset: recognizes `\frac{a}{b}`,
-/// `\sqrt{x}`, `^sup`/`^{sup}`, `_sub`/`_{sub}`, and a small table of
-/// `\command` symbols (Greek letters, common operators). This is NOT a full
-/// TeX engine - arguments are not themselves parsed for nested math, and
-/// anything unrecognized falls back to being shown as plain (italic) text
-/// rather than failing.
+/// Best-effort LaTeX math subset: recognizes `\frac{a}{b}`, `\sqrt{x}`,
+/// `^sup`/`^{sup}`, `_sub`/`_{sub}` (all of which may themselves nest -
+/// `{...}` groups are brace-balanced and recursively parsed), and a small
+/// table of `\command` symbols (Greek letters, common operators). This is
+/// NOT a full TeX engine, and anything unrecognized falls back to being
+/// shown as plain (italic) text rather than failing.
 fn parse_math(expr: &str) -> Vec<MathToken> {
     let chars: Vec<char> = expr.chars().collect();
     let mut i = 0usize;
@@ -3009,17 +3030,27 @@ fn parse_math(expr: &str) -> Vec<MathToken> {
         }
     }
 
-    // A `{...}` group (single level, no nested braces) or else a single char.
+    // A brace-balanced `{...}` group (returned with the outer braces
+    // stripped, so it can be fed straight back into `parse_math`), or else a
+    // single character.
     fn read_group(chars: &[char], i: &mut usize) -> String {
         if chars.get(*i) == Some(&'{') {
             *i += 1;
             let start = *i;
-            while *i < chars.len() && chars[*i] != '}' {
-                *i += 1;
+            let mut depth = 1;
+            while *i < chars.len() && depth > 0 {
+                match chars[*i] {
+                    '{' => depth += 1,
+                    '}' => depth -= 1,
+                    _ => {}
+                }
+                if depth > 0 {
+                    *i += 1;
+                }
             }
             let s: String = chars[start..*i].iter().collect();
             if *i < chars.len() {
-                *i += 1;
+                *i += 1; // consume the matching '}'
             }
             s
         } else if *i < chars.len() {
@@ -3042,12 +3073,12 @@ fn parse_math(expr: &str) -> Vec<MathToken> {
                 let cmd: String = chars[start..i].iter().collect();
                 if cmd == "frac" {
                     flush(&mut plain, &mut tokens);
-                    let a = read_group(&chars, &mut i);
-                    let b = read_group(&chars, &mut i);
+                    let a = parse_math(&read_group(&chars, &mut i));
+                    let b = parse_math(&read_group(&chars, &mut i));
                     tokens.push(MathToken::Frac(a, b));
                 } else if cmd == "sqrt" {
                     flush(&mut plain, &mut tokens);
-                    tokens.push(MathToken::Sqrt(read_group(&chars, &mut i)));
+                    tokens.push(MathToken::Sqrt(parse_math(&read_group(&chars, &mut i))));
                 } else if let Some(sym) = math_symbol(&cmd) {
                     plain.push_str(sym);
                 } else if !cmd.is_empty() {
@@ -3062,12 +3093,12 @@ fn parse_math(expr: &str) -> Vec<MathToken> {
             '^' => {
                 i += 1;
                 flush(&mut plain, &mut tokens);
-                tokens.push(MathToken::Sup(read_group(&chars, &mut i)));
+                tokens.push(MathToken::Sup(parse_math(&read_group(&chars, &mut i))));
             }
             '_' => {
                 i += 1;
                 flush(&mut plain, &mut tokens);
-                tokens.push(MathToken::Sub(read_group(&chars, &mut i)));
+                tokens.push(MathToken::Sub(parse_math(&read_group(&chars, &mut i))));
             }
             c => {
                 plain.push(c);
@@ -3135,7 +3166,11 @@ fn math_symbol(cmd: &str) -> Option<&'static str> {
 /// Lays out (and, if `draw`, paints) a math token stream starting at `(x,
 /// baseline_y)` in page points. Returns (total width, extra ascent, extra
 /// descent) beyond the surrounding line's normal metrics, so tall content
-/// like fractions can grow the line's height.
+/// like fractions can grow the line's height. Sup/Sub/Frac/Sqrt recurse into
+/// this same function for their argument(s) - both to render them and (with
+/// `draw=false`, at `(0, 0)`) to measure them - so nesting them arbitrarily
+/// (`\frac{\frac{a}{b}}{c}`, `x^{n^2}`, ...) works, just shrinking further at
+/// each level via `size`.
 fn render_math_tokens(c: &cairo::Context, tokens: &[MathToken], start_x: f64, baseline_y: f64, size: f64, draw: bool) -> (f64, f64, f64) {
     let mut x = start_x;
     let mut extra_ascent = 0.0_f64;
@@ -3149,50 +3184,64 @@ fn render_math_tokens(c: &cairo::Context, tokens: &[MathToken], start_x: f64, ba
                 }
                 x += w;
             }
-            MathToken::Sup(t) => {
+            MathToken::Sup(inner) => {
                 let sup_size = size * 0.65;
                 let sup_baseline = baseline_y - size * 0.35;
-                let w = measure_text(c, t, sup_size, false, true, false);
-                if draw {
-                    draw_text_run(c, x, sup_baseline, t, sup_size, false, true, false);
-                }
-                extra_ascent = extra_ascent.max(size * 0.35);
+                let (w, ea, ed) = render_math_tokens(c, inner, x, sup_baseline, sup_size, draw);
+                extra_ascent = extra_ascent.max(size * 0.35 + ea);
+                extra_descent = extra_descent.max((ed - size * 0.35).max(0.0));
                 x += w;
             }
-            MathToken::Sub(t) => {
+            MathToken::Sub(inner) => {
                 let sub_size = size * 0.65;
                 let sub_baseline = baseline_y + size * 0.25;
-                let w = measure_text(c, t, sub_size, false, true, false);
-                if draw {
-                    draw_text_run(c, x, sub_baseline, t, sub_size, false, true, false);
-                }
-                extra_descent = extra_descent.max(size * 0.25);
+                let (w, ea, ed) = render_math_tokens(c, inner, x, sub_baseline, sub_size, draw);
+                extra_descent = extra_descent.max(size * 0.25 + ed);
+                extra_ascent = extra_ascent.max((ea - size * 0.25).max(0.0));
                 x += w;
             }
             MathToken::Frac(a, b) => {
-                let frac_size = size * 0.8;
-                let w_a = measure_text(c, a, frac_size, false, true, false);
-                let w_b = measure_text(c, b, frac_size, false, true, false);
-                let w = w_a.max(w_b) + size * 0.2;
-                let gap = size * 0.12;
+                // Bar sits at "axis height" (roughly where a minus sign
+                // would be); numerator's baseline is lifted clearly above it,
+                // denominator's clearly below - using each side's own font
+                // metrics rather than a fixed offset, so it stays balanced
+                // as frac_size changes with nesting depth.
+                let frac_size = size * 0.72;
+                let (frac_ascent, frac_line_height) = line_metrics(c, frac_size);
+                let frac_descent = frac_line_height - frac_ascent;
+                let (normal_ascent, normal_line_height) = line_metrics(c, size);
+                let normal_descent = normal_line_height - normal_ascent;
+
+                let (w_a, ea_a, _) = render_math_tokens(c, a, 0.0, 0.0, frac_size, false);
+                let (w_b, _, ed_b) = render_math_tokens(c, b, 0.0, 0.0, frac_size, false);
+                let w = w_a.max(w_b) + size * 0.16;
+
+                let bar_y = baseline_y - size * 0.28;
+                let pad = size * 0.05;
+                let num_baseline = bar_y - pad;
+                let den_baseline = bar_y + pad + frac_ascent;
+
                 if draw {
-                    draw_text_run(c, x + (w - w_a) / 2.0, baseline_y - gap, a, frac_size, false, true, false);
-                    draw_text_run(c, x + (w - w_b) / 2.0, baseline_y + gap + frac_size * 0.75, b, frac_size, false, true, false);
+                    render_math_tokens(c, a, x + (w - w_a) / 2.0, num_baseline, frac_size, true);
+                    render_math_tokens(c, b, x + (w - w_b) / 2.0, den_baseline, frac_size, true);
                     c.set_line_width((size * 0.04).max(0.5));
-                    c.move_to(x, baseline_y - gap * 0.3);
-                    c.line_to(x + w, baseline_y - gap * 0.3);
+                    c.move_to(x, bar_y);
+                    c.line_to(x + w, bar_y);
                     let _ = c.stroke();
                 }
-                extra_ascent = extra_ascent.max(frac_size + gap);
-                extra_descent = extra_descent.max(gap + frac_size * 0.75);
+
+                let top = num_baseline - frac_ascent - ea_a;
+                let bottom = den_baseline + frac_descent + ed_b;
+                extra_ascent = extra_ascent.max((baseline_y - top - normal_ascent).max(0.0));
+                extra_descent = extra_descent.max((bottom - baseline_y - normal_descent).max(0.0));
                 x += w;
             }
             MathToken::Sqrt(a) => {
-                let w_a = measure_text(c, a, size, false, true, false);
+                let (w_a, ea_a, ed_a) = render_math_tokens(c, a, 0.0, 0.0, size, false);
                 let pad = size * 0.15;
                 let radical_w = size * 0.5;
                 if draw {
-                    draw_text_run(c, x + radical_w, baseline_y, a, size, false, true, false);
+                    render_math_tokens(c, a, x + radical_w, baseline_y, size, true);
                     c.set_line_width((size * 0.04).max(0.5));
                     c.move_to(x, baseline_y - size * 0.1);
                     c.line_to(x + radical_w * 0.35, baseline_y + size * 0.15);
@@ -3200,7 +3249,8 @@ fn render_math_tokens(c: &cairo::Context, tokens: &[MathToken], start_x: f64, ba
                     c.line_to(x + radical_w + w_a + pad, baseline_y - size * 0.65);
                     let _ = c.stroke();
                 }
-                extra_ascent = extra_ascent.max(size * 0.65);
+                extra_ascent = extra_ascent.max((size * 0.65 + ea_a).max(0.0));
+                extra_descent = extra_descent.max(ed_a.max(0.0));
                 x += radical_w + w_a + pad;
             }
         }
@@ -4037,6 +4087,24 @@ mod tests {
     }
 
     #[test]
+    fn text_box_that_is_only_math_still_renders_visibly() {
+        // Regression: render_math_tokens never sets a color itself, so a box
+        // whose *entire* content is a math span (no plain glyph rendered
+        // first to set one) used to inherit whatever the page background was
+        // last painted with and render white-on-white.
+        let page = text_page(50.0, 50.0, "$\\alpha + \\beta$");
+        let mut cache = HashMap::new();
+        let (pw, ph) = (A4.0.ceil() as i32, A4.1.ceil() as i32);
+        let mut surface = page_surface(None, &mut cache, 0, &page, 1.0, pw, ph).unwrap();
+        drop(cache);
+        surface.flush();
+
+        let data = surface.data().unwrap();
+        let non_white = data.iter().filter(|&&b| b != 0xFF).count();
+        assert!(non_white > 0, "a text box that's only a math span must still render visibly");
+    }
+
+    #[test]
     fn read_math_span_finds_inline_and_block_delimiters() {
         let glyphs = glyphs_of("a $x^2$ b");
         // "a " is 2 glyphs, then '$' at index 2.
@@ -4110,6 +4178,17 @@ mod tests {
     }
 
     #[test]
+    fn fraction_needs_more_height_than_plain_text() {
+        // A fraction stacks numerator/bar/denominator, so it must claim extra
+        // ascent/descent beyond a plain single line of the same font size.
+        let plain = text_page(0.0, 0.0, "a/b");
+        let plain_h = annotation_bounds(&plain.annotations[0].kind).3;
+        let frac = text_page(0.0, 0.0, "$\\frac{a}{b}$");
+        let frac_h = annotation_bounds(&frac.annotations[0].kind).3;
+        assert!(frac_h > plain_h, "fraction height {frac_h} should exceed a plain line's {plain_h}");
+    }
+
+    #[test]
     fn split_math_finds_inline_and_block_delimiters() {
         let parts = split_math("area is $\\pi r^2$ or $$E=mc^2$$ done");
         let plain: Vec<&str> =
@@ -4151,9 +4230,31 @@ mod tests {
             .collect();
         assert_eq!(kinds, vec!["frac", "text", "sup", "sub", "text"]);
         let MathToken::Frac(a, b) = &tokens[0] else { unreachable!() };
+        let MathToken::Text(a) = &a[0] else { unreachable!() };
+        let MathToken::Text(b) = &b[0] else { unreachable!() };
         assert_eq!((a.as_str(), b.as_str()), ("a", "b"));
         let MathToken::Text(last) = &tokens[4] else { unreachable!() };
         assert!(last.contains('\u{03b1}'), "\\alpha should resolve to the Greek letter, got {last:?}");
+    }
+
+    #[test]
+    fn parse_math_nests_fractions_and_superscripts() {
+        let tokens = parse_math("\\frac{\\frac{a}{b}}{c}");
+        assert_eq!(tokens.len(), 1);
+        let MathToken::Frac(num, den) = &tokens[0] else { unreachable!() };
+        // The numerator is itself a fraction, not a mangled literal string.
+        assert!(matches!(num[0], MathToken::Frac(..)), "numerator should be a nested Frac, got {num:?}");
+        let MathToken::Frac(inner_num, inner_den) = &num[0] else { unreachable!() };
+        let MathToken::Text(inner_num) = &inner_num[0] else { unreachable!() };
+        let MathToken::Text(inner_den) = &inner_den[0] else { unreachable!() };
+        assert_eq!((inner_num.as_str(), inner_den.as_str()), ("a", "b"));
+        let MathToken::Text(den) = &den[0] else { unreachable!() };
+        assert_eq!(den.as_str(), "c");
+
+        let tokens = parse_math("x^{n^2}");
+        // tokens[0] is the plain "x" before the "^"; tokens[1] is the superscript.
+        let MathToken::Sup(inner) = &tokens[1] else { unreachable!() };
+        assert!(matches!(inner[1], MathToken::Sup(_)), "nested superscript should parse as Sup, got {inner:?}");
     }
 
     #[test]
