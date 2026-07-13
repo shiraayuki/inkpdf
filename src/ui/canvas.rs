@@ -1,11 +1,13 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::Instant;
 
 use gtk::cairo;
 use gtk::gdk;
 use gtk::glib;
 use gtk::prelude::*;
+use ink_stroke_modeler_rs::{ModelerInput, ModelerInputEventType, ModelerParams, StrokeModeler};
 use uuid::Uuid;
 
 use crate::engine::OpenDocument;
@@ -258,9 +260,59 @@ const ERASER_WIDTH: f64 = 10.0;
 /// Smallest allowed page dimension in points.
 const MIN_PAGE: f64 = 50.0;
 
+/// Live smoothing state for the pen: Google's ink-stroke-modeler (the same one
+/// Rnote uses) turns raw input events into a dejittered, upsampled point stream.
+struct PenModel {
+    modeler: StrokeModeler,
+    started: Instant,
+    last_time: f64,
+    last_pos: (f64, f64),
+    /// Predicted tail so the preview keeps up with the cursor despite the
+    /// spring-model lag; never committed to the document.
+    prediction: Vec<(f64, f64)>,
+}
+
+impl PenModel {
+    fn new(pos: (f64, f64)) -> Self {
+        // Upstream suggested params assume centimeters; speeds/distances are
+        // rescaled to PDF points (1 cm ≈ 28.35 pt).
+        let params = ModelerParams {
+            wobble_smoother_speed_floor: 37.0,
+            wobble_smoother_speed_ceiling: 41.0,
+            sampling_end_of_stroke_stopping_distance: 0.03,
+            ..ModelerParams::suggested()
+        };
+        Self {
+            modeler: StrokeModeler::new(params).expect("static modeler params are valid"),
+            started: Instant::now(),
+            last_time: 0.0,
+            last_pos: pos,
+            prediction: Vec::new(),
+        }
+    }
+
+    /// Feeds one input event and returns the newly modeled points.
+    fn feed(&mut self, event_type: ModelerInputEventType, pos: (f64, f64), time: f64) -> Vec<(f64, f64)> {
+        self.last_time = time;
+        self.last_pos = pos;
+        self.modeler
+            .update(ModelerInput { event_type, pos, time, pressure: 1.0 })
+            .map(|out| out.iter().map(|r| r.pos).collect())
+            .unwrap_or_default()
+    }
+
+    fn refresh_prediction(&mut self) {
+        self.prediction = self
+            .modeler
+            .predict()
+            .map(|out| out.iter().map(|r| r.pos).collect())
+            .unwrap_or_default();
+    }
+}
+
 /// An in-progress drawing/erasing gesture (page-local coordinates in points).
 enum Draw {
-    Stroke { page: usize, points: Vec<(f64, f64)>, color: Color, width: f64 },
+    Stroke { page: usize, points: Vec<(f64, f64)>, color: Color, width: f64, model: Box<PenModel> },
     Shape { page: usize, shape: ShapeKind, start: (f64, f64), end: (f64, f64), color: Color, width: f64 },
     /// Erasing: `baseline` is the page snapshot before this drag, recorded on commit
     /// if anything was actually removed.
@@ -1553,7 +1605,9 @@ impl Canvas {
             st.selected = None;
             let op = match tool {
                 Tool::Pen => {
-                    Draw::Stroke { page, points: vec![(lx, ly)], color: st.pen_color, width: st.pen_width }
+                    let mut model = Box::new(PenModel::new((lx, ly)));
+                    let points = model.feed(ModelerInputEventType::Down, (lx, ly), 0.0);
+                    Draw::Stroke { page, points, color: st.pen_color, width: st.pen_width, model }
                 }
                 Tool::Shape => Draw::Shape {
                     page,
@@ -1596,9 +1650,15 @@ impl Canvas {
         match act {
             Act::Stroke(page) => {
                 if let Some((lx, ly)) = self.clamped_local(page, wx, wy)
-                    && let Some(Draw::Stroke { points, .. }) = self.state.borrow_mut().draw_op.as_mut()
+                    && let Some(Draw::Stroke { points, model, .. }) =
+                        self.state.borrow_mut().draw_op.as_mut()
                 {
-                    points.push((lx, ly));
+                    let time = model.started.elapsed().as_secs_f64();
+                    // The modeler requires strictly increasing timestamps.
+                    if time > model.last_time {
+                        points.extend(model.feed(ModelerInputEventType::Move, (lx, ly), time));
+                        model.refresh_prediction();
+                    }
                 }
             }
             Act::Shape(page) => {
@@ -1650,7 +1710,10 @@ impl Canvas {
             return;
         };
         match op {
-            Draw::Stroke { page, points, color, width } => {
+            Draw::Stroke { page, mut points, color, width, mut model } => {
+                let time = model.started.elapsed().as_secs_f64().max(model.last_time + 1e-4);
+                let pos = model.last_pos;
+                points.extend(model.feed(ModelerInputEventType::Up, pos, time));
                 if points.is_empty() {
                     return;
                 }
@@ -2089,7 +2152,9 @@ fn draw_annotation(c: &cairo::Context, kind: &AnnotationKind) {
     }
 }
 
-/// Draws a freehand polyline with round caps/joins. A single point renders as a dot.
+/// Draws a freehand stroke as a Catmull-Rom spline through the sampled points
+/// (rendered as cubic Béziers), so it looks smooth instead of polygonal.
+/// A single point renders as a dot.
 fn draw_stroke(c: &cairo::Context, points: &[(f64, f64)], color: Color, width: f64) {
     if points.is_empty() {
         return;
@@ -2105,8 +2170,16 @@ fn draw_stroke(c: &cairo::Context, points: &[(f64, f64)], color: Color, width: f
         return;
     }
     c.move_to(points[0].0, points[0].1);
-    for &(x, y) in &points[1..] {
-        c.line_to(x, y);
+    // Catmull-Rom segment p1→p2 as a cubic Bézier; endpoints are duplicated so
+    // the curve passes through the first and last point.
+    for i in 0..points.len() - 1 {
+        let p0 = points[i.saturating_sub(1)];
+        let p1 = points[i];
+        let p2 = points[i + 1];
+        let p3 = points[(i + 2).min(points.len() - 1)];
+        let c1 = (p1.0 + (p2.0 - p0.0) / 6.0, p1.1 + (p2.1 - p0.1) / 6.0);
+        let c2 = (p2.0 - (p3.0 - p1.0) / 6.0, p2.1 - (p3.1 - p1.1) / 6.0);
+        c.curve_to(c1.0, c1.1, c2.0, c2.1, p2.0, p2.1);
     }
     let _ = c.stroke();
 }
@@ -2336,8 +2409,14 @@ fn draw_overlay(c: &cairo::Context, page: &Page, index: usize, zoom: f64, overla
     // Live preview of the in-progress pen stroke or shape.
     if let Some(draw) = overlay.drawing {
         match draw {
-            Draw::Stroke { page, points, color, width } if *page == index => {
-                draw_stroke(c, points, *color, *width);
+            Draw::Stroke { page, points, color, width, model } if *page == index => {
+                if model.prediction.is_empty() {
+                    draw_stroke(c, points, *color, *width);
+                } else {
+                    let mut with_tail = points.clone();
+                    with_tail.extend_from_slice(&model.prediction);
+                    draw_stroke(c, &with_tail, *color, *width);
+                }
             }
             Draw::Shape { page, shape, start, end, color, width } if *page == index => {
                 draw_shape(
@@ -2397,6 +2476,25 @@ fn draw_caret(c: &cairo::Context, ed: &TextEdit, l: &TextLayout, zoom: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Zig-zag input along a horizontal line must come out flatter than it went in.
+    #[test]
+    fn pen_model_smooths_jittery_input() {
+        let mut model = PenModel::new((0.0, 0.0));
+        let mut points = model.feed(ModelerInputEventType::Down, (0.0, 0.0), 0.0);
+        for i in 1..=20 {
+            let jitter = if i % 2 == 0 { 0.8 } else { -0.8 };
+            points.extend(model.feed(
+                ModelerInputEventType::Move,
+                (i as f64 * 2.0, jitter),
+                i as f64 * 0.01,
+            ));
+        }
+        points.extend(model.feed(ModelerInputEventType::Up, (42.0, 0.0), 0.21));
+        assert!(points.len() > 21, "modeler should upsample the input");
+        let max_dev = points.iter().map(|p| p.1.abs()).fold(0.0, f64::max);
+        assert!(max_dev < 0.5, "deviation {max_dev} should stay well below the 0.8 input jitter");
+    }
 
     fn a4_page() -> Page {
         Page {
