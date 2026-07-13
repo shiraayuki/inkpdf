@@ -252,8 +252,12 @@ impl WindowUi {
             self.tab_bar.remove(&child);
         }
         let tabs = self.tabs.borrow();
+        // A single tab needs no bar at all.
+        self.tab_bar.set_visible(tabs.len() > 1);
+        if tabs.len() <= 1 {
+            return;
+        }
         let active = self.active_tab.get();
-        let show_close = tabs.len() > 1;
 
         for (i, tab) in tabs.iter().enumerate() {
             let chip = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -272,14 +276,12 @@ impl WindowUi {
             }
             chip.append(&label);
 
-            if show_close {
-                let close = flat_icon_button("window-close-symbolic", "Tab schließen");
-                {
-                    let ui = self.clone();
-                    close.connect_clicked(move |_| ui.close_tab(i));
-                }
-                chip.append(&close);
+            let close = flat_icon_button("window-close-symbolic", "Tab schließen");
+            {
+                let ui = self.clone();
+                close.connect_clicked(move |_| ui.close_tab(i));
             }
+            chip.append(&close);
 
             self.tab_bar.append(&chip);
         }
@@ -1140,8 +1142,8 @@ const PANEL_CSS: &str = "\
   border-radius: 8px; \
 }\
 .inkpdf-tab-label.active { \
-  background-color: @accent_bg_color; \
-  color: @accent_fg_color; \
+  background-color: alpha(@accent_bg_color, 0.18); \
+  color: @window_fg_color; \
 }";
 
 /// Installs the panel styling and bundled tool icons once for the default display.
