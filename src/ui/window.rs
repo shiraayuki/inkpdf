@@ -14,8 +14,8 @@ use crate::engine::storage;
 use crate::ui::canvas::{Canvas, LassoShape, Relative, Tool, draw_page_pattern};
 use crate::ui::settings::{self, AppSettings};
 
-const DEFAULT_WIDTH: i32 = 900;
-const DEFAULT_HEIGHT: i32 = 700;
+const DEFAULT_WIDTH: i32 = 1200;
+const DEFAULT_HEIGHT: i32 = 800;
 /// Side of the square color swatch in the details panel.
 const SWATCH: i32 = 30;
 /// Points added/removed per click on the page width/height steppers.
@@ -570,26 +570,53 @@ pub fn build(app: &adw::Application) -> WindowUi {
 
     load_css();
 
-    // Floating bottom dock overlaid on the canvas: a horizontal pill of tools,
-    // with the active tool's options in a second pill right above it.
+    // Floating bottom dock overlaid on the canvas: one horizontal pill holding
+    // the tools and, while a tool is active, its options inline to the right —
+    // the pill grows sideways instead of stacking panels over the document.
     let overlay = gtk::Overlay::new();
     overlay.set_child(Some(&canvas.root));
     overlay.set_hexpand(true);
 
     let (details, add_page_button, remove_page_button) = build_details_panel(&canvas);
-    details.set_halign(gtk::Align::Center);
-    details.set_visible(false); // shown only while a tool is active
 
     let dock = build_tool_strip(&canvas, &details);
-    dock.set_halign(gtk::Align::Center);
 
-    let dock_area = gtk::Box::new(gtk::Orientation::Vertical, 10);
-    dock_area.set_halign(gtk::Align::Center);
-    dock_area.set_valign(gtk::Align::End);
-    dock_area.set_margin_bottom(18);
-    dock_area.append(&details);
-    dock_area.append(&dock);
-    overlay.add_overlay(&dock_area);
+    // The scroller caps the dock at the window width: on a narrow window the
+    // pill becomes horizontally scrollable (External = no visible bar) instead
+    // of being clipped at both ends.
+    let dock_scroller = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::External)
+        .vscrollbar_policy(gtk::PolicyType::Never)
+        .propagate_natural_width(true)
+        .propagate_natural_height(true)
+        .child(&dock)
+        .build();
+    dock_scroller.set_halign(gtk::Align::Center);
+    dock_scroller.set_valign(gtk::Align::End);
+    dock_scroller.set_margin_bottom(12);
+    dock_scroller.set_margin_start(12);
+    dock_scroller.set_margin_end(12);
+    overlay.add_overlay(&dock_scroller);
+
+    // While the pointer drags on the canvas (drawing, moving, lassoing), the
+    // dock fades to a ghost so it never sits in the way of the pen; it comes
+    // back the moment the drag ends. Observe-only (capture phase, state never
+    // claimed), so the canvas's own gestures are unaffected.
+    {
+        let observer = gtk::GestureDrag::new();
+        observer.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let dock_fade = dock.clone();
+        observer.connect_drag_update(move |_, dx, dy| {
+            if dx * dx + dy * dy > 25.0 {
+                dock_fade.add_css_class("inkpdf-dock-ghost");
+            }
+        });
+        let dock_fade = dock.clone();
+        observer.connect_drag_end(move |_, _, _| {
+            dock_fade.remove_css_class("inkpdf-dock-ghost");
+        });
+        canvas.root.add_controller(observer);
+    }
 
     let tab_bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     tab_bar.add_css_class("inkpdf-tab-bar");
@@ -1008,11 +1035,18 @@ fn file_label(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-/// Bottom dock: exclusive tool toggles (all off = move/select mode), then
-/// undo/redo. Selecting a tool switches the options pill above to its page.
+/// Bottom dock: exclusive tool toggles (all off = move/select mode), the
+/// active tool's options inline behind a separator (the pill grows sideways),
+/// then undo/redo. Selecting a tool switches the options stack to its page.
 fn build_tool_strip(canvas: &Canvas, details: &gtk::Stack) -> gtk::Box {
     let strip = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     strip.add_css_class("inkpdf-dock");
+
+    // Own leading separator so it appears/disappears together with the options.
+    let options = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    options.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+    options.append(details);
+    options.set_visible(false);
 
     let tools: [(&str, &str, Tool, &str); 8] = [
         ("inkpdf-pen-symbolic", "Pen", Tool::Pen, "pen"),
@@ -1060,6 +1094,7 @@ fn build_tool_strip(canvas: &Canvas, details: &gtk::Stack) -> gtk::Box {
         let canvas = canvas.clone();
         let all = buttons.clone();
         let details = details.clone();
+        let options = options.clone();
         let tool = tools[i].2;
         let page = tools[i].3.to_string();
         button.connect_toggled(move |btn| {
@@ -1071,14 +1106,15 @@ fn build_tool_strip(canvas: &Canvas, details: &gtk::Stack) -> gtk::Box {
                 }
                 canvas.set_tool(tool);
                 details.set_visible_child_name(&page);
-                details.set_visible(true);
+                options.set_visible(true);
             } else if all.iter().all(|b| !b.is_active()) {
                 canvas.set_tool(Tool::Select);
-                details.set_visible(false);
+                options.set_visible(false);
             }
         });
     }
 
+    strip.append(&options);
     strip.append(&gtk::Separator::new(gtk::Orientation::Vertical));
 
     let undo = flat_icon_button("inkpdf-undo-symbolic", "Rückgängig (Strg+Z)");
@@ -1097,8 +1133,7 @@ fn build_tool_strip(canvas: &Canvas, details: &gtk::Stack) -> gtk::Box {
     strip
 }
 
-/// Options pill above the dock: a compact horizontal row of options per tool.
-/// The stack itself is the styled pill; it is hidden when no tool is active.
+/// Per-tool options, shown inline inside the dock while a tool is active.
 /// Returns the add/remove-page buttons too, since their click handlers can only
 /// be wired once `WindowUi` exists (see `build()`).
 fn build_details_panel(canvas: &Canvas) -> (gtk::Stack, gtk::Button, gtk::Button) {
@@ -1632,18 +1667,19 @@ const PANEL_CSS: &str = "\
 @define-color accent_bg_color #6957e8; \
 @define-color accent_fg_color #ffffff; \
 @define-color accent_color #8a7bff; \
-.inkpdf-dock, .inkpdf-options { \
+.inkpdf-dock { \
   background-color: alpha(@window_bg_color, 0.88); \
   color: @window_fg_color; \
   border: 1px solid alpha(@window_fg_color, 0.08); \
   border-radius: 999px; \
   padding: 7px 14px; \
   box-shadow: 0 6px 24px rgba(0, 0, 0, 0.30); \
+  transition: opacity 200ms ease; \
 }\
-.inkpdf-options { \
-  padding: 5px 14px; \
+.inkpdf-dock-ghost { \
+  opacity: 0.15; \
 }\
-.inkpdf-dock separator, .inkpdf-options separator { \
+.inkpdf-dock separator { \
   background-color: alpha(@window_fg_color, 0.15); \
   margin: 6px 6px; \
 }\
