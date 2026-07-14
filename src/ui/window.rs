@@ -380,14 +380,12 @@ impl WindowUi {
         for (i, tab) in tabs.iter().enumerate() {
             let chip = gtk::Box::new(gtk::Orientation::Horizontal, 0);
             chip.add_css_class("inkpdf-tab");
-            chip.set_hexpand(true);
 
             let label = gtk::Button::builder()
                 .label(tab.label.as_str())
                 .css_classes(["flat"])
                 .build();
             label.add_css_class("inkpdf-tab-label");
-            label.set_hexpand(true);
             if i == active {
                 label.add_css_class("active");
             }
@@ -414,6 +412,8 @@ pub fn build(app: &adw::Application) -> WindowUi {
 
     let header = adw::HeaderBar::new();
     header.set_title_widget(Some(&title));
+    // Borderless header: no bottom shadow/divider, blends into the canvas area.
+    header.add_css_class("flat");
 
     // File-browser toggle: packed first so it sits at the very left of the
     // header, ahead of open/save/new-tab. It's only wired up further down
@@ -570,38 +570,31 @@ pub fn build(app: &adw::Application) -> WindowUi {
 
     load_css();
 
-    // Floating Rnote-style panels overlaid on the canvas: tools on the right,
-    // tool details on the left.
+    // Floating bottom dock overlaid on the canvas: a horizontal pill of tools,
+    // with the active tool's options in a second pill right above it.
     let overlay = gtk::Overlay::new();
     overlay.set_child(Some(&canvas.root));
     overlay.set_hexpand(true);
 
     let (details, add_page_button, remove_page_button) = build_details_panel(&canvas);
-    details.set_halign(gtk::Align::Start);
-    details.set_valign(gtk::Align::Center);
-    details.set_margin_start(16);
+    details.set_halign(gtk::Align::Center);
     details.set_visible(false); // shown only while a tool is active
-    overlay.add_overlay(&details);
 
-    let tool_strip = build_tool_strip(&canvas, &details);
-    tool_strip.set_halign(gtk::Align::End);
-    tool_strip.set_valign(gtk::Align::Center);
-    tool_strip.set_margin_end(16);
-    overlay.add_overlay(&tool_strip);
+    let dock = build_tool_strip(&canvas, &details);
+    dock.set_halign(gtk::Align::Center);
 
-    // Give both side panels the same width (the wider one, i.e. the details
-    // panel whose color swatch sets its minimum width).
-    let panel_group = gtk::SizeGroup::new(gtk::SizeGroupMode::Horizontal);
-    panel_group.add_widget(&details);
-    panel_group.add_widget(&tool_strip);
-    // Keep the group alive for the app's lifetime (widgets don't own it).
-    std::mem::forget(panel_group);
+    let dock_area = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    dock_area.set_halign(gtk::Align::Center);
+    dock_area.set_valign(gtk::Align::End);
+    dock_area.set_margin_bottom(18);
+    dock_area.append(&details);
+    dock_area.append(&dock);
+    overlay.add_overlay(&dock_area);
 
-    let tab_bar = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    let tab_bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     tab_bar.add_css_class("inkpdf-tab-bar");
-    // Tabs share the full width equally (1 tab = 100%, 2 = 50/50, ...).
-    tab_bar.set_homogeneous(true);
-    tab_bar.set_hexpand(true);
+    // Centered pill chips at their natural width, not a full-width bar.
+    tab_bar.set_halign(gtk::Align::Center);
 
     // The file browser sidebar is attached here once `ui` exists below (it
     // needs `ui` to open files); split_view is its permanent parent. Using
@@ -1015,11 +1008,11 @@ fn file_label(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-/// Right-hand tool strip: exclusive tool toggles (all off = move/select mode),
-/// then undo/redo. Selecting a tool switches the details panel to its page.
+/// Bottom dock: exclusive tool toggles (all off = move/select mode), then
+/// undo/redo. Selecting a tool switches the options pill above to its page.
 fn build_tool_strip(canvas: &Canvas, details: &gtk::Stack) -> gtk::Box {
-    let strip = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    strip.add_css_class("inkpdf-panel");
+    let strip = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    strip.add_css_class("inkpdf-dock");
 
     let tools: [(&str, &str, Tool, &str); 8] = [
         ("inkpdf-pen-symbolic", "Pen", Tool::Pen, "pen"),
@@ -1086,7 +1079,7 @@ fn build_tool_strip(canvas: &Canvas, details: &gtk::Stack) -> gtk::Box {
         });
     }
 
-    strip.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    strip.append(&gtk::Separator::new(gtk::Orientation::Vertical));
 
     let undo = flat_icon_button("inkpdf-undo-symbolic", "Rückgängig (Strg+Z)");
     {
@@ -1104,16 +1097,19 @@ fn build_tool_strip(canvas: &Canvas, details: &gtk::Stack) -> gtk::Box {
     strip
 }
 
-/// Left-hand details panel: a compact Rnote-style column of options per tool.
-/// The stack itself is the styled card; it is hidden when no tool is active.
+/// Options pill above the dock: a compact horizontal row of options per tool.
+/// The stack itself is the styled pill; it is hidden when no tool is active.
 /// Returns the add/remove-page buttons too, since their click handlers can only
 /// be wired once `WindowUi` exists (see `build()`).
 fn build_details_panel(canvas: &Canvas) -> (gtk::Stack, gtk::Button, gtk::Button) {
     let stack = gtk::Stack::new();
-    stack.add_css_class("inkpdf-panel");
-    // Same width for every page (consistent panel), but height follows each page's elements.
-    stack.set_hhomogeneous(true);
+    stack.add_css_class("inkpdf-options");
+    // The pill hugs the visible page's natural size instead of the widest page,
+    // animating between widths on tool switch.
+    stack.set_hhomogeneous(false);
     stack.set_vhomogeneous(false);
+    stack.set_interpolate_size(true);
+    stack.set_transition_type(gtk::StackTransitionType::Crossfade);
     let (pages_page, add_page_button, remove_page_button) = page_pages(canvas);
     stack.add_named(&pages_page, Some("pages"));
     stack.add_named(&page_pen(canvas), Some("pen"));
@@ -1127,8 +1123,11 @@ fn build_details_panel(canvas: &Canvas) -> (gtk::Stack, gtk::Button, gtk::Button
     (stack, add_page_button, remove_page_button)
 }
 
-fn detail_column() -> gtk::Box {
-    gtk::Box::new(gtk::Orientation::Vertical, 6)
+/// One tool's options row inside the pill; children center vertically.
+fn detail_row() -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    row.set_valign(gtk::Align::Center);
+    row
 }
 
 fn flat_icon_button(icon: &str, tip: &str) -> gtk::Button {
@@ -1198,8 +1197,8 @@ fn color_from_rgba(rgba: &gdk::RGBA) -> Color {
     }
 }
 
-fn hsep() -> gtk::Separator {
-    gtk::Separator::new(gtk::Orientation::Horizontal)
+fn vsep() -> gtk::Separator {
+    gtk::Separator::new(gtk::Orientation::Vertical)
 }
 
 fn fmt_size(value: f64, decimals: usize) -> String {
@@ -1210,7 +1209,7 @@ fn fmt_size(value: f64, decimals: usize) -> String {
     }
 }
 
-/// Uniform vertical size control: +, an editable field, − (all stacked).
+/// Uniform inline size control: −, an editable field, + (in a row).
 /// Supports manual entry (float when `decimals > 0`). `on_change` is called with
 /// every new value.
 fn size_stepper(
@@ -1221,7 +1220,8 @@ fn size_stepper(
     decimals: usize,
     on_change: impl Fn(f64) + 'static,
 ) -> gtk::Box {
-    let column = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    let column = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+    column.set_valign(gtk::Align::Center);
     let value = Rc::new(Cell::new(default));
     let on_change = Rc::new(on_change);
 
@@ -1282,9 +1282,9 @@ fn size_stepper(
         minus.connect_clicked(move |_| step_by(-step));
     }
 
-    column.append(&plus);
-    column.append(&entry);
     column.append(&minus);
+    column.append(&entry);
+    column.append(&plus);
     column
 }
 
@@ -1326,13 +1326,13 @@ fn pattern_thumbnail(pattern: PagePattern) -> gtk::DrawingArea {
 /// (pattern + spacing): picking a pattern sets the default for newly inserted
 /// blank pages and, if the current page is itself blank, restyles it too.
 fn page_pages(canvas: &Canvas) -> (gtk::Box, gtk::Button, gtk::Button) {
-    let page = detail_column();
+    let page = detail_row();
     let add = flat_icon_button("inkpdf-page-add", "Insert page after current");
     let remove = flat_icon_button("inkpdf-page-remove", "Delete current page");
     page.append(&add);
     page.append(&remove);
 
-    page.append(&hsep());
+    page.append(&vsep());
     let mut group: Option<gtk::ToggleButton> = None;
     for (label, pattern) in PAGE_PATTERNS {
         let toggle = gtk::ToggleButton::builder()
@@ -1390,7 +1390,7 @@ fn page_pages(canvas: &Canvas) -> (gtk::Box, gtk::Button, gtk::Button) {
 }
 
 fn page_pen(canvas: &Canvas) -> gtk::Box {
-    let page = detail_column();
+    let page = detail_row();
 
     let color = color_button();
     {
@@ -1409,7 +1409,7 @@ fn page_pen(canvas: &Canvas) -> gtk::Box {
 }
 
 fn page_shapes(canvas: &Canvas) -> gtk::Box {
-    let page = detail_column();
+    let page = detail_row();
 
     let shapes: [(&str, &str, ShapeKind); 3] = [
         ("inkpdf-rect-symbolic", "Rechteck", ShapeKind::Rectangle),
@@ -1434,7 +1434,7 @@ fn page_shapes(canvas: &Canvas) -> gtk::Box {
         page.append(&toggle);
     }
 
-    page.append(&hsep());
+    page.append(&vsep());
     let color = color_button();
     {
         let canvas = canvas.clone();
@@ -1459,7 +1459,7 @@ fn page_shapes(canvas: &Canvas) -> gtk::Box {
 /// an arbitrary path; anything whose center falls inside gets selected).
 /// Mutually exclusive, like the shape-kind picker on the Shapes tool page.
 fn page_lasso(canvas: &Canvas) -> gtk::Box {
-    let page = detail_column();
+    let page = detail_row();
 
     let modes: [(&str, &str, LassoShape); 2] = [
         ("inkpdf-rect-symbolic", "Rechteck-Auswahl", LassoShape::Rect),
@@ -1492,7 +1492,7 @@ fn page_lasso(canvas: &Canvas) -> gtk::Box {
 }
 
 fn page_text(canvas: &Canvas) -> gtk::Box {
-    let page = detail_column();
+    let page = detail_row();
 
     // Font family: a compact icon button opening the system family picker. Only the
     // family is applied (size/style come from our own controls). A FontDialogButton
@@ -1535,7 +1535,7 @@ fn page_text(canvas: &Canvas) -> gtk::Box {
 
     // Plain (momentary) buttons, not toggles: they act on the selection and must not
     // stick in a blue :checked state.
-    page.append(&hsep());
+    page.append(&vsep());
     let styles: [(&str, &str, fn(&Canvas)); 4] = [
         ("format-text-bold-symbolic", "Fett", Canvas::toggle_bold),
         (
@@ -1563,7 +1563,7 @@ fn page_text(canvas: &Canvas) -> gtk::Box {
 
     // Marker (highlighter): the swatch picks the color, the apply button paints it
     // onto the selection, the clear button removes it.
-    page.append(&hsep());
+    page.append(&vsep());
     let marker = swatch_button(gdk::RGBA::new(1.0, 0.9, 0.2, 0.4));
     page.append(&marker);
     let apply = flat_icon_button("object-select-symbolic", "Markieren");
@@ -1583,7 +1583,7 @@ fn page_text(canvas: &Canvas) -> gtk::Box {
 }
 
 fn page_eraser(canvas: &Canvas) -> gtk::Box {
-    let page = detail_column();
+    let page = detail_row();
     let canvas = canvas.clone();
     page.append(&size_stepper(10.0, 1.0, 40.0, 0.5, 1, move |v| {
         canvas.set_eraser_width(v)
@@ -1598,7 +1598,7 @@ fn page_eraser(canvas: &Canvas) -> gtk::Box {
 /// covered (headings, bold/italic, lists, code, rules, frac/sqrt/sup/sub and
 /// common Greek letters/operators - not a full CommonMark or TeX engine).
 fn page_markdown(canvas: &Canvas) -> gtk::Box {
-    let page = detail_column();
+    let page = detail_row();
     {
         let canvas = canvas.clone();
         page.append(&size_stepper(16.0, 8.0, 72.0, 1.0, 0, move |v| {
@@ -1613,7 +1613,7 @@ fn page_markdown(canvas: &Canvas) -> gtk::Box {
 /// doubles as the "resize if a nested formula got too small" control, since
 /// every nested sup/sub/frac size is a fraction of this base size.
 fn page_latex(canvas: &Canvas) -> gtk::Box {
-    let page = detail_column();
+    let page = detail_row();
     {
         let canvas = canvas.clone();
         page.append(&size_stepper(16.0, 8.0, 72.0, 1.0, 0, move |v| {
@@ -1623,35 +1623,56 @@ fn page_latex(canvas: &Canvas) -> gtk::Box {
     page
 }
 
-// Theme-aware floating panels: the background and text follow the light/dark
+// Theme-aware floating pills: the background and text follow the light/dark
 // palette (via libadwaita named colors), so the symbolic icons — which paint in
 // the inherited foreground color — recolor automatically with the theme.
+// The named accent colors are overridden app-wide: inkpdf's identity color is
+// its own ink indigo, not the stock GTK blue.
 const PANEL_CSS: &str = "\
-.inkpdf-panel { \
-  background-color: alpha(@window_bg_color, 0.92); \
+@define-color accent_bg_color #6957e8; \
+@define-color accent_fg_color #ffffff; \
+@define-color accent_color #8a7bff; \
+.inkpdf-dock, .inkpdf-options { \
+  background-color: alpha(@window_bg_color, 0.88); \
   color: @window_fg_color; \
-  border: 1px solid alpha(@window_fg_color, 0.12); \
-  border-radius: 20px; \
-  padding: 10px 6px; \
-  box-shadow: 0 1px 5px rgba(0, 0, 0, 0.35); \
+  border: 1px solid alpha(@window_fg_color, 0.08); \
+  border-radius: 999px; \
+  padding: 7px 14px; \
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.30); \
 }\
-.inkpdf-panel separator { \
+.inkpdf-options { \
+  padding: 5px 14px; \
+}\
+.inkpdf-dock separator, .inkpdf-options separator { \
   background-color: alpha(@window_fg_color, 0.15); \
-  margin: 4px 10px; \
+  margin: 6px 6px; \
 }\
-.inkpdf-panel button:checked { \
+.inkpdf-dock button:checked { \
   background-color: @accent_bg_color; \
   color: @accent_fg_color; \
+}\
+.inkpdf-options entry { \
+  border-radius: 999px; \
+  min-height: 26px; \
 }\
 .inkpdf-tab-bar { \
   padding: 0 8px 6px 8px; \
 }\
+.inkpdf-tab { \
+  background-color: alpha(@window_fg_color, 0.06); \
+  border-radius: 999px; \
+  padding: 0 2px; \
+}\
 .inkpdf-tab-label { \
-  border-radius: 8px; \
+  border-radius: 999px; \
+  padding: 1px 14px; \
 }\
 .inkpdf-tab-label.active { \
-  background-color: alpha(@accent_bg_color, 0.18); \
+  background-color: alpha(@accent_bg_color, 0.28); \
   color: @window_fg_color; \
+}\
+.inkpdf-tab button { \
+  border-radius: 999px; \
 }";
 
 /// Installs the panel styling and bundled tool icons once for the default display.

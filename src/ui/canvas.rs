@@ -31,12 +31,13 @@ const DRAG_THRESHOLD_SQ: f64 = 9.0;
 const LATEX_MIN_SIZE: f64 = 4.0;
 const LATEX_MAX_SIZE: f64 = 300.0;
 // Canvas backdrop behind the pages, per theme (r, g, b).
-const CANVAS_BG_DARK: (f64, f64, f64) = (0.18, 0.18, 0.20);
-const CANVAS_BG_LIGHT: (f64, f64, f64) = (0.86, 0.86, 0.88);
-// Bounding-box colors (r, g, b, a).
-const BOX_ACTIVE: (f64, f64, f64, f64) = (0.20, 0.51, 0.92, 1.0);
+const CANVAS_BG_DARK: (f64, f64, f64) = (0.11, 0.11, 0.13);
+const CANVAS_BG_LIGHT: (f64, f64, f64) = (0.89, 0.89, 0.92);
+// Bounding-box colors (r, g, b, a); the active/selection tones match the app's
+// ink-indigo accent defined in window.rs PANEL_CSS (#6957e8).
+const BOX_ACTIVE: (f64, f64, f64, f64) = (0.41, 0.34, 0.91, 1.0);
 const BOX_ANNOTATION: (f64, f64, f64, f64) = (0.55, 0.55, 0.60, 0.9);
-const SELECTION_FILL: (f64, f64, f64, f64) = (0.20, 0.51, 0.92, 0.30);
+const SELECTION_FILL: (f64, f64, f64, f64) = (0.41, 0.34, 0.91, 0.28);
 
 /// A single character with its own style (color, font, highlight, weight).
 #[derive(Clone)]
