@@ -1331,8 +1331,10 @@ const PAGE_PATTERNS: [(&str, PagePattern); 4] = [
     ("Liniert", PagePattern::Lined),
 ];
 
-/// Size (in widget pixels) of a pattern preview thumbnail.
-const PATTERN_THUMB: (i32, i32) = (28, 36);
+/// Size (in widget pixels) of a pattern preview thumbnail. Kept at the height
+/// of the other inline dock controls (entries, swatches), so activating the
+/// Pages tool doesn't make the whole dock pill jump in height.
+const PATTERN_THUMB: (i32, i32) = (17, 24);
 
 /// A small live preview of a page pattern (drawn with the same code the canvas
 /// uses), so the picker needs no text label and stays a fixed, narrow width —
@@ -1346,7 +1348,7 @@ fn pattern_thumbnail(pattern: PagePattern) -> gtk::DrawingArea {
     area.set_draw_func(move |_, c, w, h| {
         c.set_source_rgb(1.0, 1.0, 1.0);
         let _ = c.paint();
-        draw_page_pattern(c, pattern, 8.0, w as f64, h as f64);
+        draw_page_pattern(c, pattern, 6.0, w as f64, h as f64);
         c.set_source_rgba(0.0, 0.0, 0.0, 0.35);
         c.set_line_width(1.0);
         c.rectangle(0.5, 0.5, w as f64 - 1.0, h as f64 - 1.0);

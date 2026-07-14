@@ -304,6 +304,14 @@ const ERASER_WIDTH: f64 = 10.0;
 /// Smallest allowed page dimension in points.
 const MIN_PAGE: f64 = 50.0;
 
+/// Longest time gap (seconds) fed to the modeler per input event. Pausing
+/// mid-stroke with the button held produces a real gap of seconds; a fed gap
+/// above sampling_max_outputs_per_call / sampling_min_output_rate (~0.11 s)
+/// makes update() fail with TooFarApart *without* advancing the engine's time
+/// anchor, so every later event would fail too and freeze the stroke. Idle
+/// time is compressed away instead - it carries no geometry anyway.
+const MAX_INPUT_GAP: f64 = 0.05;
+
 /// Live smoothing state for the pen: Google's ink-stroke-modeler (the same one
 /// Rnote uses) turns raw input events into a dejittered, upsampled point stream.
 struct PenModel {
@@ -311,6 +319,8 @@ struct PenModel {
     started: Instant,
     last_time: f64,
     last_pos: (f64, f64),
+    /// Accumulated idle time compressed out by `cap_time`.
+    time_offset: f64,
     /// Predicted tail so the preview keeps up with the cursor despite the
     /// spring-model lag; never committed to the document.
     prediction: Vec<(f64, f64)>,
@@ -331,8 +341,18 @@ impl PenModel {
             started: Instant::now(),
             last_time: 0.0,
             last_pos: pos,
+            time_offset: 0.0,
             prediction: Vec::new(),
         }
+    }
+
+    /// Maps a raw elapsed time onto the compressed timeline the modeler sees:
+    /// at most `MAX_INPUT_GAP` after the previously fed event.
+    fn cap_time(&mut self, raw: f64) -> f64 {
+        let t = raw - self.time_offset;
+        let capped = t.min(self.last_time + MAX_INPUT_GAP);
+        self.time_offset += t - capped;
+        capped
     }
 
     /// Feeds one input event and returns the newly modeled points.
@@ -2310,7 +2330,8 @@ impl Canvas {
                     && let Some(Draw::Stroke { points, model, .. }) =
                         self.state.borrow_mut().draw_op.as_mut()
                 {
-                    let time = model.started.elapsed().as_secs_f64();
+                    let raw = model.started.elapsed().as_secs_f64();
+                    let time = model.cap_time(raw);
                     // The modeler requires strictly increasing timestamps.
                     if time > model.last_time {
                         points.extend(model.feed(ModelerInputEventType::Move, (lx, ly), time));
@@ -2368,7 +2389,8 @@ impl Canvas {
         };
         match op {
             Draw::Stroke { page, mut points, color, width, mut model } => {
-                let time = model.started.elapsed().as_secs_f64().max(model.last_time + 1e-4);
+                let raw = model.started.elapsed().as_secs_f64();
+                let time = model.cap_time(raw).max(model.last_time + 1e-4);
                 let pos = model.last_pos;
                 points.extend(model.feed(ModelerInputEventType::Up, pos, time));
                 if points.is_empty() {
@@ -4124,6 +4146,35 @@ mod tests {
         assert!(points.len() > 21, "modeler should upsample the input");
         let max_dev = points.iter().map(|p| p.1.abs()).fold(0.0, f64::max);
         assert!(max_dev < 0.5, "deviation {max_dev} should stay well below the 0.8 input jitter");
+    }
+
+    /// Holding the pen still for a while mid-stroke must not freeze it: raw
+    /// gaps above ~0.11 s would make the modeler reject every further event
+    /// (TooFarApart), so `cap_time` compresses the pause away.
+    #[test]
+    fn pen_model_survives_a_pause_while_drawing() {
+        let mut model = PenModel::new((0.0, 0.0));
+        model.feed(ModelerInputEventType::Down, (0.0, 0.0), 0.0);
+        for i in 1..=5 {
+            let raw = i as f64 * 0.01;
+            let time = model.cap_time(raw);
+            model.feed(ModelerInputEventType::Move, (i as f64 * 2.0, 0.0), time);
+        }
+
+        // 2 s pause with the button held, then the stroke continues.
+        let time = model.cap_time(2.05);
+        assert!(
+            time - model.last_time <= MAX_INPUT_GAP + 1e-9,
+            "the pause must be compressed, got a fed gap of {}",
+            time - model.last_time
+        );
+        let points = model.feed(ModelerInputEventType::Move, (12.0, 0.0), time);
+        assert!(!points.is_empty(), "stroke must keep producing points after a pause");
+
+        // Later events stay on the compressed timeline (no re-frozen stroke).
+        let time = model.cap_time(2.06);
+        let points = model.feed(ModelerInputEventType::Move, (14.0, 0.0), time);
+        assert!(!points.is_empty(), "stroke must still work on the event after the pause");
     }
 
     fn a4_page() -> Page {
