@@ -1,11 +1,15 @@
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
+use uuid::Uuid;
 
 use crate::engine::OpenDocument;
+use crate::engine::autosave::{self, AutosaveMeta};
 use crate::engine::document::{
     A4, Color, DEFAULT_PATTERN_SPACING, Document, FILE_EXTENSION, PagePattern, ShapeKind,
 };
@@ -36,6 +40,10 @@ struct Tab {
     saved_snapshot: Option<Document>,
     zoom: f64,
     label: String,
+    /// Stable identity of this tab's crash-recovery autosave file.
+    autosave_id: Uuid,
+    /// Snapshot as of the last autosave, so unchanged tabs skip the disk write.
+    autosaved_snapshot: Option<Document>,
 }
 
 impl Tab {
@@ -56,8 +64,15 @@ impl Tab {
             save_path: None,
             zoom: 1.0,
             label: "Unbenannt".to_string(),
+            autosave_id: Uuid::new_v4(),
+            autosaved_snapshot: None,
         }
     }
+}
+
+/// Where crash-recovery autosaves live (per user, outside the config dir).
+fn autosave_dir() -> PathBuf {
+    glib::user_data_dir().join("inkpdf").join("autosave")
 }
 
 #[derive(Clone)]
@@ -68,6 +83,9 @@ pub struct WindowUi {
     tab_bar: gtk::Box,
     tabs: Rc<RefCell<Vec<Tab>>>,
     active_tab: Rc<Cell<usize>>,
+    /// Set while a background autosave write is still running; a tick that
+    /// finds it set skips this round instead of piling up threads.
+    autosave_busy: Arc<AtomicBool>,
 }
 
 impl WindowUi {
@@ -186,11 +204,14 @@ impl WindowUi {
     }
 
     /// Snapshot of the current tool defaults, for persisting across restarts.
-    fn current_settings(&self, dark_mode: bool) -> AppSettings {
+    fn current_settings(&self, dark_mode: bool, autosave_minutes: u32) -> AppSettings {
         AppSettings {
             dark_mode,
+            autosave_minutes,
             pen_color: self.canvas.pen_color(),
             pen_width: self.canvas.pen_width(),
+            marker_color: self.canvas.marker_color(),
+            marker_width: self.canvas.marker_width(),
             shape_kind: self.canvas.shape_kind(),
             shape_color: self.canvas.shape_color(),
             shape_width: self.canvas.shape_width(),
@@ -337,6 +358,10 @@ impl WindowUi {
 
     fn close_tab_now(&self, idx: usize) {
         let active = self.active_tab.get();
+        {
+            let tabs = self.tabs.borrow();
+            autosave::remove(&autosave_dir(), tabs[idx].autosave_id);
+        }
         self.tabs.borrow_mut().remove(idx);
         let count = self.tabs.borrow().len();
 
@@ -404,6 +429,98 @@ impl WindowUi {
 
             self.tab_bar.append(&chip);
         }
+    }
+
+    /// One autosave tick: snapshots every tab with unsaved changes to the
+    /// autosave dir (in a background thread - documents can embed large PDFs),
+    /// and drops the autosave of any tab that has been saved meanwhile.
+    fn autosave_all(&self) {
+        if self.autosave_busy.swap(true, Ordering::SeqCst) {
+            return; // previous write still running; try again next tick
+        }
+        let dir = autosave_dir();
+        let active = self.active_tab.get();
+        let live = self.canvas.document();
+
+        let mut jobs: Vec<(Uuid, Document, AutosaveMeta)> = Vec::new();
+        {
+            let mut tabs = self.tabs.borrow_mut();
+            for (i, tab) in tabs.iter_mut().enumerate() {
+                let model = if i == active { live.clone() } else { Some(tab.model.clone()) };
+                let Some(model) = model else { continue };
+
+                if tab.saved_snapshot.as_ref() == Some(&model) {
+                    // Saved state on disk is current - a leftover autosave
+                    // would only produce a bogus recovery prompt.
+                    if tab.autosaved_snapshot.take().is_some() {
+                        autosave::remove(&dir, tab.autosave_id);
+                    }
+                    continue;
+                }
+                if tab.autosaved_snapshot.as_ref() == Some(&model) {
+                    continue; // unchanged since the last autosave
+                }
+                tab.autosaved_snapshot = Some(model.clone());
+                let meta = AutosaveMeta {
+                    original_path: tab.save_path.clone(),
+                    label: tab.label.clone(),
+                };
+                jobs.push((tab.autosave_id, model, meta));
+            }
+        }
+
+        if jobs.is_empty() {
+            self.autosave_busy.store(false, Ordering::SeqCst);
+            return;
+        }
+        let busy = self.autosave_busy.clone();
+        std::thread::spawn(move || {
+            for (id, doc, meta) in jobs {
+                if let Err(err) = autosave::write(&dir, id, &doc, &meta) {
+                    eprintln!("autosave failed: {err:#}");
+                }
+            }
+            busy.store(false, Ordering::SeqCst);
+        });
+    }
+
+    /// Deletes every tab's autosave file - the user is closing deliberately
+    /// (unsaved changes were already confirmed away), so nothing to recover.
+    fn remove_all_autosaves(&self) {
+        let dir = autosave_dir();
+        for tab in self.tabs.borrow().iter() {
+            autosave::remove(&dir, tab.autosave_id);
+        }
+    }
+
+    /// Reopens one crash autosave: loads the snapshot file, then points the
+    /// tab back at the document's real path (plain save goes there, not to
+    /// the autosave file) and marks it unsaved. The tab adopts the autosave's
+    /// id, so later autosave ticks overwrite the same file and a clean close
+    /// removes it.
+    fn recover_autosave(&self, rec: &autosave::Recovered) {
+        let open = match OpenDocument::from_inkpdf_path(&rec.file) {
+            Ok(open) => open,
+            Err(err) => {
+                show_error(
+                    &self.window,
+                    &format!("Wiederherstellung von {} fehlgeschlagen: {err:#}", rec.file.display()),
+                );
+                return;
+            }
+        };
+        if !self.active_tab_is_untouched() {
+            self.new_tab();
+        }
+        let model = open.model.clone();
+        self.canvas.set_open_document(open);
+        self.with_active_tab(|t| {
+            t.save_path = rec.meta.original_path.clone();
+            t.saved_snapshot = None; // recovered = unsaved by definition
+            t.autosave_id = rec.id;
+            t.autosaved_snapshot = Some(model.clone());
+        });
+        self.show_title(rec.meta.original_path.as_deref());
     }
 }
 
@@ -654,6 +771,7 @@ pub fn build(app: &adw::Application) -> WindowUi {
         tab_bar,
         tabs: Rc::new(RefCell::new(vec![Tab::blank()])),
         active_tab: Rc::new(Cell::new(0)),
+        autosave_busy: Arc::new(AtomicBool::new(false)),
     };
 
     // Start on the first (blank) tab.
@@ -671,6 +789,8 @@ pub fn build(app: &adw::Application) -> WindowUi {
     theme_button.set_active(!saved_settings.dark_mode);
     canvas.set_pen_color(saved_settings.pen_color);
     canvas.set_pen_width(saved_settings.pen_width);
+    canvas.set_marker_color(saved_settings.marker_color);
+    canvas.set_marker_width(saved_settings.marker_width);
     canvas.set_shape_kind(saved_settings.shape_kind);
     canvas.set_shape_color(saved_settings.shape_color);
     canvas.set_shape_width(saved_settings.shape_width);
@@ -681,6 +801,52 @@ pub fn build(app: &adw::Application) -> WindowUi {
     canvas.set_blank_pattern(saved_settings.blank_pattern);
     canvas.set_pattern_spacing(saved_settings.blank_pattern_spacing);
 
+    // Crash-recovery autosave: a periodic timer snapshots unsaved tabs; the
+    // interval is adjustable in the settings popover (0 = off) and re-arms
+    // the timer on every change.
+    let autosave_minutes = Rc::new(Cell::new(saved_settings.autosave_minutes));
+    let arm_autosave: Rc<dyn Fn(u32)> = {
+        let ui = ui.clone();
+        let source: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+        Rc::new(move |minutes: u32| {
+            if let Some(old) = source.borrow_mut().take() {
+                old.remove();
+            }
+            if minutes > 0 {
+                let ui = ui.clone();
+                *source.borrow_mut() =
+                    Some(glib::timeout_add_seconds_local(minutes * 60, move || {
+                        ui.autosave_all();
+                        glib::ControlFlow::Continue
+                    }));
+            }
+        })
+    };
+    arm_autosave(saved_settings.autosave_minutes);
+    {
+        let (row, label, minus, plus) = value_stepper();
+        let show = |label: &gtk::Label, minutes: u32| {
+            label.set_text(&if minutes == 0 { "Aus".to_string() } else { format!("{minutes} min") });
+        };
+        show(&label, autosave_minutes.get());
+        let step_autosave = |delta: i64| {
+            let minutes = autosave_minutes.clone();
+            let label = label.clone();
+            let arm = arm_autosave.clone();
+            move |_: &gtk::Button| {
+                let v = (minutes.get() as i64 + delta).clamp(0, 60) as u32;
+                minutes.set(v);
+                show(&label, v);
+                arm(v);
+            }
+        };
+        minus.connect_clicked(step_autosave(-1));
+        plus.connect_clicked(step_autosave(1));
+        settings_menu.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+        settings_menu.append(&caption("Autosave (0 = aus)"));
+        settings_menu.append(&row);
+    }
+
     // Asks first if any tab has unsaved changes, then persists the current
     // tool defaults when the window actually closes. `confirmed` tracks
     // "user already said yes" across the second, re-triggered close
@@ -688,6 +854,7 @@ pub fn build(app: &adw::Application) -> WindowUi {
     {
         let ui = ui.clone();
         let theme_button = theme_button.clone();
+        let autosave_minutes = autosave_minutes.clone();
         let confirmed = Rc::new(Cell::new(false));
         window.connect_close_request(move |window| {
             if !confirmed.get() && ui.any_tab_dirty() {
@@ -710,10 +877,13 @@ pub fn build(app: &adw::Application) -> WindowUi {
                 return glib::Propagation::Stop;
             }
 
-            let current = ui.current_settings(!theme_button.is_active());
+            let current = ui.current_settings(!theme_button.is_active(), autosave_minutes.get());
             if let Err(err) = settings::save(&current) {
                 eprintln!("failed to save settings: {err:#}");
             }
+            // Deliberate close (any unsaved changes were confirmed away above):
+            // leftover autosaves would only trigger a bogus recovery prompt.
+            ui.remove_all_autosaves();
             glib::Propagation::Proceed
         });
     }
@@ -807,7 +977,84 @@ pub fn build(app: &adw::Application) -> WindowUi {
     }
 
     window.present();
+
+    // Crash recovery: leftover autosaves mean the last session never reached
+    // its clean-close cleanup. Escape/dismiss keeps the files for next start;
+    // only an explicit "Verwerfen" deletes them.
+    let recovered = autosave::scan(&autosave_dir());
+    if !recovered.is_empty() {
+        let dialog = gtk::AlertDialog::builder()
+            .message("Ungespeicherte Änderungen gefunden")
+            .detail(format!(
+                "inkpdf wurde offenbar beendet, ohne dass {} Dokument(e) gespeichert wurden. Wiederherstellen?",
+                recovered.len()
+            ))
+            .buttons(["Verwerfen", "Wiederherstellen"])
+            .cancel_button(-1)
+            .default_button(1)
+            .modal(true)
+            .build();
+        let ui_for_recovery = ui.clone();
+        dialog.choose(
+            Some(&window),
+            gio::Cancellable::NONE,
+            move |response| match response {
+                Ok(1) => {
+                    for rec in &recovered {
+                        ui_for_recovery.recover_autosave(rec);
+                    }
+                }
+                Ok(0) => {
+                    let dir = autosave_dir();
+                    for rec in &recovered {
+                        autosave::remove(&dir, rec.id);
+                    }
+                }
+                _ => {}
+            },
+        );
+    }
+
     ui
+}
+
+/// Opens an image picker and inserts the chosen file as an image annotation
+/// on the current page (the encoded bytes are embedded verbatim).
+fn insert_image_dialog(anchor: &gtk::Button, canvas: &Canvas) {
+    let filter = gtk::FileFilter::new();
+    filter.set_name(Some("Bilder"));
+    filter.add_mime_type("image/png");
+    filter.add_mime_type("image/jpeg");
+    filter.add_suffix("png");
+    filter.add_suffix("jpg");
+    filter.add_suffix("jpeg");
+
+    let filters = gio::ListStore::new::<gtk::FileFilter>();
+    filters.append(&filter);
+
+    let dialog = gtk::FileDialog::builder()
+        .title("Bild einfügen")
+        .filters(&filters)
+        .modal(true)
+        .build();
+
+    let canvas = canvas.clone();
+    let window = anchor.root().and_downcast::<adw::ApplicationWindow>();
+    let parent = window.clone();
+    dialog.open(window.as_ref(), gio::Cancellable::NONE, move |result| {
+        let Ok(file) = result else {
+            return;
+        };
+        let Some(path) = file.path() else {
+            return;
+        };
+        let inserted = std::fs::read(&path)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| canvas.insert_image_bytes(bytes));
+        if let (Err(err), Some(window)) = (&inserted, &parent) {
+            show_error(window, &format!("{err:#}"));
+        }
+    });
 }
 
 /// Wires Ctrl+O / Ctrl+S / Ctrl+Shift+S to open, save, and save-as.
@@ -1048,8 +1295,9 @@ fn build_tool_strip(canvas: &Canvas, details: &gtk::Stack) -> gtk::Box {
     options.append(details);
     options.set_visible(false);
 
-    let tools: [(&str, &str, Tool, &str); 8] = [
+    let tools: [(&str, &str, Tool, &str); 9] = [
         ("inkpdf-pen-symbolic", "Pen", Tool::Pen, "pen"),
+        ("inkpdf-marker-symbolic", "Marker", Tool::Marker, "marker"),
         ("inkpdf-shapes-symbolic", "Shapes", Tool::Shape, "shapes"),
         ("inkpdf-text-symbolic", "Text", Tool::Text, "text"),
         (
@@ -1117,6 +1365,13 @@ fn build_tool_strip(canvas: &Canvas, details: &gtk::Stack) -> gtk::Box {
     strip.append(&options);
     strip.append(&gtk::Separator::new(gtk::Orientation::Vertical));
 
+    let insert_image = flat_icon_button("inkpdf-image-symbolic", "Bild einfügen (oder Strg+V)");
+    {
+        let canvas = canvas.clone();
+        insert_image.connect_clicked(move |btn| insert_image_dialog(btn, &canvas));
+    }
+    strip.append(&insert_image);
+
     let undo = flat_icon_button("inkpdf-undo-symbolic", "Rückgängig (Strg+Z)");
     {
         let canvas = canvas.clone();
@@ -1148,6 +1403,7 @@ fn build_details_panel(canvas: &Canvas) -> (gtk::Stack, gtk::Button, gtk::Button
     let (pages_page, add_page_button, remove_page_button) = page_pages(canvas);
     stack.add_named(&pages_page, Some("pages"));
     stack.add_named(&page_pen(canvas), Some("pen"));
+    stack.add_named(&page_marker(canvas), Some("marker"));
     stack.add_named(&page_shapes(canvas), Some("shapes"));
     stack.add_named(&page_text(canvas), Some("text"));
     stack.add_named(&page_lasso(canvas), Some("lasso"));
@@ -1440,6 +1696,28 @@ fn page_pen(canvas: &Canvas) -> gtk::Box {
         let canvas = canvas.clone();
         page.append(&size_stepper(3.0, 0.5, 20.0, 0.5, 1, move |v| {
             canvas.set_pen_width(v)
+        }));
+    }
+    page
+}
+
+/// Marker (highlighter) options: color swatch (translucent yellow default) and
+/// stroke width. The swatch's dialog keeps alpha enabled, since translucency is
+/// the whole point of the tool.
+fn page_marker(canvas: &Canvas) -> gtk::Box {
+    let page = detail_row();
+
+    let color = swatch_button(gdk::RGBA::new(1.0, 0.85, 0.2, 0.35));
+    {
+        let canvas = canvas.clone();
+        color.connect_rgba_notify(move |btn| canvas.set_marker_color(color_from_rgba(&btn.rgba())));
+    }
+    page.append(&color);
+
+    {
+        let canvas = canvas.clone();
+        page.append(&size_stepper(12.0, 2.0, 40.0, 1.0, 0, move |v| {
+            canvas.set_marker_width(v)
         }));
     }
     page

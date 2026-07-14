@@ -171,6 +171,20 @@ pub struct LatexAnnotation {
     pub source: String,
 }
 
+/// An embedded raster image. `bytes` keeps the original encoded file (PNG,
+/// JPEG, ...) exactly as read from disk or clipboard - decoding happens at
+/// render time - so saving never re-encodes and the document stays
+/// self-contained (same idea as `PdfSource.bytes`). `width`/`height` are the
+/// display size in page points.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ImageAnnotation {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub bytes: std::sync::Arc<[u8]>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum AnnotationKind {
     Text(TextAnnotation),
@@ -178,6 +192,7 @@ pub enum AnnotationKind {
     Shape(ShapeAnnotation),
     Markdown(MarkdownAnnotation),
     Latex(LatexAnnotation),
+    Image(ImageAnnotation),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

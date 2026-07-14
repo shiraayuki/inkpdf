@@ -14,9 +14,9 @@ use uuid::Uuid;
 
 use crate::engine::OpenDocument;
 use crate::engine::document::{
-    A4, Annotation, AnnotationKind, Color, DEFAULT_PATTERN_SPACING, Document, LatexAnnotation,
-    MarkdownAnnotation, Page, PageKind, PagePattern, ShapeAnnotation, ShapeKind, StrokeAnnotation,
-    TextAnnotation, TextRun, TextStyle,
+    A4, Annotation, AnnotationKind, Color, DEFAULT_PATTERN_SPACING, Document, ImageAnnotation,
+    LatexAnnotation, MarkdownAnnotation, Page, PageKind, PagePattern, ShapeAnnotation, ShapeKind,
+    StrokeAnnotation, TextAnnotation, TextRun, TextStyle,
 };
 use crate::engine::pdf::PdfDocument;
 
@@ -30,6 +30,10 @@ const MIN_BOX_WIDTH: f64 = 4.0;
 const DRAG_THRESHOLD_SQ: f64 = 9.0;
 const LATEX_MIN_SIZE: f64 = 4.0;
 const LATEX_MAX_SIZE: f64 = 300.0;
+/// Smallest side an image can be resized down to (page points).
+const IMAGE_MIN_SIDE: f64 = 8.0;
+/// Largest fraction of the page a freshly inserted image may cover.
+const IMAGE_INSERT_MAX_FRACTION: f64 = 0.6;
 // Canvas backdrop behind the pages, per theme (r, g, b).
 const CANVAS_BG_DARK: (f64, f64, f64) = (0.11, 0.11, 0.13);
 const CANVAS_BG_LIGHT: (f64, f64, f64) = (0.89, 0.89, 0.92);
@@ -301,6 +305,9 @@ enum DragKind {
 const PEN_WIDTH: f64 = 3.0;
 const SHAPE_WIDTH: f64 = 3.0;
 const ERASER_WIDTH: f64 = 10.0;
+const MARKER_WIDTH: f64 = 12.0;
+/// Default highlighter color: translucent yellow, drawn over the page content.
+const MARKER_COLOR: Color = Color { r: 1.0, g: 0.85, b: 0.2, a: 0.35 };
 /// Smallest allowed page dimension in points.
 const MIN_PAGE: f64 = 50.0;
 
@@ -468,6 +475,8 @@ struct State {
     draw_origin: (f64, f64),
     pen_color: Color,
     pen_width: f64,
+    marker_color: Color,
+    marker_width: f64,
     shape_kind: ShapeKind,
     shape_color: Color,
     shape_width: f64,
@@ -504,6 +513,8 @@ pub enum Tool {
     Select,
     Text,
     Pen,
+    /// Highlighter: like the pen, but with translucent strokes (own color/width defaults).
+    Marker,
     Eraser,
     Shape,
     /// Rectangle multi-select: drag a marquee to select strokes/shapes/text,
@@ -578,6 +589,8 @@ impl Canvas {
             draw_origin: (0.0, 0.0),
             pen_color: Color::BLACK,
             pen_width: PEN_WIDTH,
+            marker_color: MARKER_COLOR,
+            marker_width: MARKER_WIDTH,
             shape_kind: ShapeKind::Rectangle,
             shape_color: Color::BLACK,
             shape_width: SHAPE_WIDTH,
@@ -888,6 +901,38 @@ impl Canvas {
 
     pub fn pen_width(&self) -> f64 {
         self.state.borrow().pen_width
+    }
+
+    pub fn set_marker_color(&self, color: Color) {
+        self.state.borrow_mut().marker_color = color;
+        self.apply_to_selected_if(
+            |k| matches!(k, AnnotationKind::Stroke(_)),
+            move |k| {
+                if let AnnotationKind::Stroke(s) = k {
+                    s.color = color;
+                }
+            },
+        );
+    }
+
+    pub fn marker_color(&self) -> Color {
+        self.state.borrow().marker_color
+    }
+
+    pub fn set_marker_width(&self, width: f64) {
+        self.state.borrow_mut().marker_width = width;
+        self.apply_to_selected_if(
+            |k| matches!(k, AnnotationKind::Stroke(_)),
+            move |k| {
+                if let AnnotationKind::Stroke(s) = k {
+                    s.width = width;
+                }
+            },
+        );
+    }
+
+    pub fn marker_width(&self) -> f64 {
+        self.state.borrow().marker_width
     }
 
     pub fn set_shape_kind(&self, kind: ShapeKind) {
@@ -1333,7 +1378,7 @@ impl Canvas {
         self.area.grab_focus();
 
         // Drawing/erasing tools act via the drag gesture, not clicks.
-        if matches!(self.state.borrow().tool, Tool::Pen | Tool::Shape | Tool::Eraser) {
+        if matches!(self.state.borrow().tool, Tool::Pen | Tool::Marker | Tool::Shape | Tool::Eraser) {
             return;
         }
 
@@ -1557,9 +1602,26 @@ impl Canvas {
     /// Inserts the clipboard's text at the cursor (replacing any selection),
     /// preserving embedded newlines/tabs so multi-line pastes land as actual
     /// line breaks rather than being silently stripped like other control
-    /// characters. Clipboard reads are async in GTK4, so this only queues the
-    /// insert - it lands once the read completes.
+    /// characters. Without an active text edit, an image on the clipboard is
+    /// pasted as a new image annotation instead. Clipboard reads are async in
+    /// GTK4, so this only queues the insert - it lands once the read completes.
     fn paste_from_clipboard(&self) {
+        if self.state.borrow().editing.is_none() {
+            let this = self.clone();
+            self.area.clipboard().read_texture_async(gio::Cancellable::NONE, move |result| {
+                let Ok(Some(texture)) = result else {
+                    return;
+                };
+                // Clipboard images arrive as a decoded texture; PNG keeps the
+                // paste lossless in the (compressed) stored bytes.
+                let png = texture.save_to_png_bytes();
+                if let Err(err) = this.insert_image_bytes(png.to_vec()) {
+                    eprintln!("clipboard image paste failed: {err:#}");
+                }
+            });
+            return;
+        }
+
         let this = self.clone();
         self.area.clipboard().read_text_async(gio::Cancellable::NONE, move |result| {
             let Ok(Some(text)) = result else {
@@ -1741,7 +1803,7 @@ impl Canvas {
 
         // Drawing/erasing tools start their gesture here.
         let tool = self.state.borrow().tool;
-        if matches!(tool, Tool::Pen | Tool::Shape | Tool::Eraser) {
+        if matches!(tool, Tool::Pen | Tool::Marker | Tool::Shape | Tool::Eraser) {
             self.begin_draw(tool, x, y);
             return;
         }
@@ -1869,14 +1931,28 @@ impl Canvas {
                     ds.annotation.kind = translate_annotation(&ds.orig, dx, dy);
                 }
                 DragKind::Resize { start, orig_dist, orig_size } => {
-                    if let AnnotationKind::Latex(l) = &ds.orig {
-                        let (bx, by, _, _) = annotation_bounds(&ds.orig);
-                        let (sx, sy) = start;
-                        let (nx, ny) = (sx + offset_x / zoom, sy + offset_y / zoom);
-                        let new_dist = ((nx - bx).powi(2) + (ny - by).powi(2)).sqrt().max(1.0);
-                        let mut l = l.clone();
-                        l.size = (orig_size * (new_dist / orig_dist)).clamp(LATEX_MIN_SIZE, LATEX_MAX_SIZE);
-                        ds.annotation.kind = AnnotationKind::Latex(l);
+                    let (bx, by, _, _) = annotation_bounds(&ds.orig);
+                    let (sx, sy) = start;
+                    let (nx, ny) = (sx + offset_x / zoom, sy + offset_y / zoom);
+                    let new_dist = ((nx - bx).powi(2) + (ny - by).powi(2)).sqrt().max(1.0);
+                    let factor = new_dist / orig_dist;
+                    match &ds.orig {
+                        AnnotationKind::Latex(l) => {
+                            let mut l = l.clone();
+                            l.size = (orig_size * factor).clamp(LATEX_MIN_SIZE, LATEX_MAX_SIZE);
+                            ds.annotation.kind = AnnotationKind::Latex(l);
+                        }
+                        AnnotationKind::Image(img) => {
+                            // Uniform scale anchored at the top-left corner, so the
+                            // aspect ratio can never drift.
+                            let factor = factor
+                                .clamp(IMAGE_MIN_SIDE / img.width.min(img.height), 20.0);
+                            let mut img = img.clone();
+                            img.width *= factor;
+                            img.height *= factor;
+                            ds.annotation.kind = AnnotationKind::Image(img);
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1903,7 +1979,7 @@ impl Canvas {
         // while a drawing/erasing/lasso tool owns the gesture, and not while
         // editing or about to place a new box.
         let tool = self.state.borrow().tool;
-        if matches!(tool, Tool::Pen | Tool::Shape | Tool::Eraser | Tool::Lasso) {
+        if matches!(tool, Tool::Pen | Tool::Marker | Tool::Shape | Tool::Eraser | Tool::Lasso) {
             return;
         }
         if self.state.borrow().editing.is_some() || self.state.borrow().place_kind.is_some() {
@@ -1916,15 +1992,20 @@ impl Canvas {
             let st = self.state.borrow();
             st.doc.as_ref().and_then(|doc| doc.pages.get(page)).and_then(|p| {
                 p.annotations.iter().enumerate().rev().find_map(|(index, a)| {
-                    let AnnotationKind::Latex(l) = &a.kind else {
-                        return None;
+                    // Only kinds with a meaningful uniform scale are resizable;
+                    // for images the factor works on width/height directly, so
+                    // `orig_size` is unused (0.0).
+                    let orig_size = match &a.kind {
+                        AnnotationKind::Latex(l) => l.size,
+                        AnnotationKind::Image(_) => 0.0,
+                        _ => return None,
                     };
                     let (bx, by, bw, bh) = annotation_bounds(&a.kind);
                     if lx < bx || lx > bx + bw || ly < by || ly > by + bh {
                         return None;
                     }
                     let orig_dist = ((lx - bx).powi(2) + (ly - by).powi(2)).sqrt().max(1.0);
-                    Some((index, orig_dist, l.size))
+                    Some((index, orig_dist, orig_size))
                 })
             })
         };
@@ -2281,10 +2362,15 @@ impl Canvas {
             st.draw_origin = (x, y);
             st.selected = None;
             let op = match tool {
-                Tool::Pen => {
+                Tool::Pen | Tool::Marker => {
+                    let (color, width) = if tool == Tool::Marker {
+                        (st.marker_color, st.marker_width)
+                    } else {
+                        (st.pen_color, st.pen_width)
+                    };
                     let mut model = Box::new(PenModel::new((lx, ly)));
                     let points = model.feed(ModelerInputEventType::Down, (lx, ly), 0.0);
-                    Draw::Stroke { page, points, color: st.pen_color, width: st.pen_width, model }
+                    Draw::Stroke { page, points, color, width, model }
                 }
                 Tool::Shape => Draw::Shape {
                     page,
@@ -2435,6 +2521,65 @@ impl Canvas {
         st.cache.remove(&page);
     }
 
+    /// Inserts encoded image bytes (PNG/JPEG/... kept verbatim) as a new
+    /// annotation centered on the current page: natural size (px -> pt at
+    /// 96 dpi), capped to a fraction of the page, selected for immediate
+    /// moving/resizing.
+    pub fn insert_image_bytes(&self, bytes: Vec<u8>) -> anyhow::Result<()> {
+        let bytes: std::sync::Arc<[u8]> = bytes.into();
+        let pixbuf = cached_pixbuf(&bytes)
+            .ok_or_else(|| anyhow::anyhow!("Das Bild konnte nicht dekodiert werden."))?;
+
+        let (page, pw, ph) = {
+            let st = self.state.borrow();
+            let current = st.current;
+            let (pw, ph) = st
+                .doc
+                .as_ref()
+                .and_then(|d| d.pages.get(current))
+                .map(|p| (p.width, p.height))
+                .ok_or_else(|| anyhow::anyhow!("Kein Dokument geöffnet."))?;
+            (current, pw, ph)
+        };
+
+        // CSS pixel -> PDF point (96 dpi -> 72 pt/inch).
+        let (mut w, mut h) = (pixbuf.width() as f64 * 0.75, pixbuf.height() as f64 * 0.75);
+        if w <= 0.0 || h <= 0.0 {
+            anyhow::bail!("Das Bild ist leer.");
+        }
+        let scale = (IMAGE_INSERT_MAX_FRACTION * pw / w)
+            .min(IMAGE_INSERT_MAX_FRACTION * ph / h)
+            .min(1.0);
+        w *= scale;
+        h *= scale;
+
+        self.record_change();
+        self.push_annotation(
+            page,
+            AnnotationKind::Image(ImageAnnotation {
+                x: (pw - w) / 2.0,
+                y: (ph - h) / 2.0,
+                width: w,
+                height: h,
+                bytes,
+            }),
+        );
+        {
+            let mut st = self.state.borrow_mut();
+            let id = st
+                .doc
+                .as_ref()
+                .and_then(|d| d.pages.get(page))
+                .and_then(|p| p.annotations.last())
+                .map(|a| a.id);
+            if let Some(id) = id {
+                st.selected = Some((page, id));
+            }
+        }
+        self.area.queue_draw();
+        Ok(())
+    }
+
     /// Sets the pointer cursor to match the active tool (sized to the tool where it
     /// makes sense: text caret to font size, eraser ring to eraser size).
     fn update_cursor(&self) {
@@ -2445,7 +2590,7 @@ impl Canvas {
         let cursor = match tool {
             Tool::Text => text_cursor((text_line_height(text_size) * z).round() as i32),
             Tool::Eraser => circle_cursor((eraser_width * z).round() as i32),
-            Tool::Pen | Tool::Shape => plus_cursor(),
+            Tool::Pen | Tool::Marker | Tool::Shape => plus_cursor(),
             Tool::Select | Tool::Lasso | Tool::Markdown | Tool::Latex | Tool::Pages => None,
         };
         self.area.set_cursor(cursor.as_ref());
@@ -3610,7 +3755,67 @@ fn draw_annotation(c: &cairo::Context, kind: &AnnotationKind) {
         AnnotationKind::Latex(l) => {
             let _ = layout_and_draw_latex(c, l.x, l.y, l.size, &l.source, true);
         }
+        AnnotationKind::Image(img) => draw_image(c, img),
     }
+}
+
+/// Decodes an image annotation's bytes, memoized per `Arc` allocation - the
+/// bytes are immutable and shared across document clones (tabs, undo
+/// snapshots), so the pointer identifies the content for the Arc's lifetime.
+fn cached_pixbuf(bytes: &std::sync::Arc<[u8]>) -> Option<gtk::gdk_pixbuf::Pixbuf> {
+    use gtk::gdk_pixbuf::{Pixbuf, PixbufLoader};
+    thread_local! {
+        static CACHE: RefCell<HashMap<usize, Option<Pixbuf>>> = RefCell::new(HashMap::new());
+    }
+    let key = bytes.as_ptr() as usize;
+    CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        // Unbounded growth would pin every pasted image's decode forever;
+        // dropping the whole map just costs a re-decode on the next draw.
+        if cache.len() > 32 {
+            cache.clear();
+        }
+        cache
+            .entry(key)
+            .or_insert_with(|| {
+                let loader = PixbufLoader::new();
+                let pixbuf = loader
+                    .write(bytes)
+                    .and_then(|()| loader.close())
+                    .ok()
+                    .and_then(|()| loader.pixbuf());
+                if pixbuf.is_none() {
+                    eprintln!("failed to decode embedded image ({} bytes)", bytes.len());
+                }
+                pixbuf
+            })
+            .clone()
+    })
+}
+
+fn draw_image(c: &cairo::Context, img: &ImageAnnotation) {
+    let Some(pixbuf) = cached_pixbuf(&img.bytes) else {
+        // Undecodable bytes: draw a crossed placeholder box instead of nothing,
+        // so the annotation stays visible/selectable.
+        c.set_source_rgba(0.5, 0.5, 0.5, 0.6);
+        c.set_line_width(1.0);
+        c.rectangle(img.x, img.y, img.width, img.height);
+        c.move_to(img.x, img.y);
+        c.line_to(img.x + img.width, img.y + img.height);
+        let _ = c.stroke();
+        return;
+    };
+    let (nw, nh) = (pixbuf.width() as f64, pixbuf.height() as f64);
+    if nw <= 0.0 || nh <= 0.0 || img.width <= 0.0 || img.height <= 0.0 {
+        return;
+    }
+    let _ = c.save();
+    c.translate(img.x, img.y);
+    c.scale(img.width / nw, img.height / nh);
+    use gtk::gdk::prelude::GdkCairoContextExt;
+    c.set_source_pixbuf(&pixbuf, 0.0, 0.0);
+    let _ = c.paint();
+    let _ = c.restore();
 }
 
 /// Removes and returns the annotation at `(page, index)`, or `None` if either
@@ -3644,6 +3849,7 @@ fn annotation_bounds(kind: &AnnotationKind) -> (f64, f64, f64, f64) {
             let (w, h) = measure_latex(l.size, &l.source);
             (l.x, l.y, w, h)
         }
+        AnnotationKind::Image(img) => (img.x, img.y, img.width, img.height),
     }
 }
 
@@ -3697,6 +3903,12 @@ fn translate_annotation(kind: &AnnotationKind, dx: f64, dy: f64) -> AnnotationKi
             l.x += dx;
             l.y += dy;
             AnnotationKind::Latex(l)
+        }
+        AnnotationKind::Image(img) => {
+            let mut img = img.clone();
+            img.x += dx;
+            img.y += dy;
+            AnnotationKind::Image(img)
         }
     }
 }
@@ -3822,7 +4034,10 @@ fn draw_shape(c: &cairo::Context, s: &ShapeAnnotation) {
 /// geometry. Text is ignored - it has its own selection/delete.
 fn eraser_hits(kind: &AnnotationKind, px: f64, py: f64, radius: f64) -> bool {
     match kind {
-        AnnotationKind::Text(_) | AnnotationKind::Markdown(_) | AnnotationKind::Latex(_) => false,
+        AnnotationKind::Text(_)
+        | AnnotationKind::Markdown(_)
+        | AnnotationKind::Latex(_)
+        | AnnotationKind::Image(_) => false,
         AnnotationKind::Stroke(s) => {
             point_near_polyline(&s.points, false, px, py, radius + s.width / 2.0)
         }
@@ -4390,6 +4605,52 @@ mod tests {
         assert!(non_white > 0, "text should render as dark pixels on the white page");
     }
 
+    /// A tiny valid PNG (solid dark square), generated via cairo so the test
+    /// needs no fixture file.
+    fn tiny_png() -> Vec<u8> {
+        let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, 8, 8).unwrap();
+        {
+            let c = cairo::Context::new(&surface).unwrap();
+            c.set_source_rgb(0.1, 0.1, 0.1);
+            let _ = c.paint();
+        }
+        let mut png = Vec::new();
+        surface.write_to_png(&mut png).unwrap();
+        png
+    }
+
+    #[test]
+    fn image_annotation_renders_pixels_and_roundtrips() {
+        let mut page = a4_page();
+        page.annotations.push(Annotation {
+            id: Uuid::new_v4(),
+            kind: AnnotationKind::Image(ImageAnnotation {
+                x: 10.0,
+                y: 10.0,
+                width: 100.0,
+                height: 100.0,
+                bytes: tiny_png().into(),
+            }),
+        });
+
+        let mut cache = HashMap::new();
+        let (pw, ph) = (A4.0.ceil() as i32, A4.1.ceil() as i32);
+        let mut surface = page_surface(None, &mut cache, 0, &page, 1.0, pw, ph).unwrap();
+        drop(cache);
+        surface.flush();
+        let data = surface.data().unwrap();
+        let non_white = data.iter().filter(|&&b| b != 0xFF).count();
+        assert!(non_white > 0, "the embedded image should render as dark pixels");
+
+        // The encoded bytes survive a save/load cycle verbatim.
+        let doc = Document { source: None, pages: vec![page] };
+        let path = std::env::temp_dir().join(format!("inkpdf-image-test-{}.inkpdf", Uuid::new_v4()));
+        crate::engine::storage::save(&doc, &path).unwrap();
+        let loaded = crate::engine::storage::load(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(doc, loaded);
+    }
+
     #[test]
     fn text_box_that_is_only_math_still_renders_visibly() {
         // Regression: render_math_tokens never sets a color itself, so a box
@@ -4819,6 +5080,19 @@ mod tests {
         let text = AnnotationKind::Text(TextAnnotation { x: 5.0, y: 7.0, size: 16.0, runs: vec![] });
         let (x, y, _, _) = annotation_bounds(&text);
         assert_eq!((x, y), (5.0, 7.0));
+
+        let image = AnnotationKind::Image(ImageAnnotation {
+            x: 3.0,
+            y: 4.0,
+            width: 20.0,
+            height: 10.0,
+            bytes: Vec::new().into(),
+        });
+        assert_eq!(annotation_bounds(&image), (3.0, 4.0, 20.0, 10.0));
+        let moved = translate_annotation(&image, 2.0, -1.0);
+        assert_eq!(annotation_bounds(&moved), (5.0, 3.0, 20.0, 10.0));
+        // Images are deliberately not erasable (like text boxes).
+        assert!(!eraser_hits(&image, 4.0, 5.0, 50.0));
     }
 
     #[test]

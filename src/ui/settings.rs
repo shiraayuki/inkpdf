@@ -17,6 +17,8 @@ pub struct AppSettings {
     pub dark_mode: bool,
     pub pen_color: Color,
     pub pen_width: f64,
+    pub marker_color: Color,
+    pub marker_width: f64,
     pub shape_kind: ShapeKind,
     pub shape_color: Color,
     pub shape_width: f64,
@@ -26,6 +28,8 @@ pub struct AppSettings {
     pub text_font: String,
     pub blank_pattern: PagePattern,
     pub blank_pattern_spacing: f64,
+    /// Minutes between crash-recovery autosaves; 0 disables them.
+    pub autosave_minutes: u32,
 }
 
 impl Default for AppSettings {
@@ -35,6 +39,8 @@ impl Default for AppSettings {
             dark_mode: true,
             pen_color: Color::BLACK,
             pen_width: 3.0,
+            marker_color: Color { r: 1.0, g: 0.85, b: 0.2, a: 0.35 },
+            marker_width: 12.0,
             shape_kind: ShapeKind::Rectangle,
             shape_color: Color::BLACK,
             shape_width: 3.0,
@@ -44,6 +50,7 @@ impl Default for AppSettings {
             text_font: text_style.font,
             blank_pattern: PagePattern::Plain,
             blank_pattern_spacing: DEFAULT_PATTERN_SPACING,
+            autosave_minutes: 2,
         }
     }
 }
